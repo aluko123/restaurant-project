@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: restaurant
+      POSTGRES_USER: restaurant
+      POSTGRES_PASSWORD: restaurant
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U restaurant -d restaurant"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - restaurant-postgres:/var/lib/postgresql/data
+
+volumes:
+  restaurant-postgres:

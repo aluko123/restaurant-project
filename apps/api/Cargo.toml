@@ -1,0 +1,18 @@
+[package]
+name = "restaurant-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8.9"
+dotenvy = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring", "uuid"] }
+tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18", features = ["serde", "v7"] }

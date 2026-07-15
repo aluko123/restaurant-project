@@ -1,0 +1,151 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #18312b;
+  background: #f7f4ed;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+
+button, input { font: inherit; }
+
+button:focus-visible, a:focus-visible {
+  outline: 3px solid #e39545;
+  outline-offset: 3px;
+}
+
+.welcome-shell, .shell { min-height: 100vh; padding: 0 20px; }
+
+.topbar {
+  width: min(1120px, 100%);
+  min-height: 76px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.brand {
+  color: #173f35;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 750;
+  text-decoration: none;
+}
+
+.brand-mark {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  color: #fffaf1;
+  background: #173f35;
+}
+
+.hero {
+  width: min(1060px, 100%);
+  margin: 9vh auto 0;
+  display: grid;
+  gap: 56px;
+  align-items: center;
+}
+
+.eyebrow {
+  margin: 0 0 14px;
+  color: #9a4f16;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+h1 {
+  max-width: 760px;
+  margin: 0;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(2.5rem, 8vw, 5.2rem);
+  line-height: 0.98;
+  letter-spacing: -0.045em;
+}
+
+.lede {
+  max-width: 680px;
+  margin: 24px 0 0;
+  color: #52645f;
+  font-size: clamp(1.05rem, 2vw, 1.25rem);
+  line-height: 1.65;
+}
+
+.button-row { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 32px; }
+
+.button {
+  min-height: 46px;
+  padding: 0 18px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.button:disabled { cursor: not-allowed; opacity: 0.58; }
+.button-primary { color: white; background: #b95f1e; }
+.button-primary:hover:not(:disabled) { background: #974815; }
+.button-secondary { color: #173f35; background: transparent; border-color: #97a49f; }
+.button-secondary:hover { background: #ebe8df; }
+.button-quiet { color: #173f35; background: transparent; }
+.button-quiet:hover { background: #ebe8df; }
+
+.setup-note {
+  max-width: 620px;
+  margin-top: 30px;
+  padding: 16px;
+  display: grid;
+  gap: 5px;
+  border: 1px solid #d5c9b8;
+  border-radius: 12px;
+  color: #624b39;
+  background: #fffaf1;
+  line-height: 1.5;
+}
+
+.preview-card, .action-card {
+  border: 1px solid #d8d4ca;
+  border-radius: 24px;
+  background: #fffdf8;
+  box-shadow: 0 22px 70px rgb(30 55 48 / 10%);
+}
+
+.preview-card { padding: 26px 22px; transform: rotate(1deg); }
+.preview-card h2 { margin: 6px 0 22px; font-size: 1.45rem; }
+.preview-date { margin: 0; color: #71807b; font-size: 0.9rem; }
+.action-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 12px; }
+.action-list li { display: flex; gap: 14px; padding: 14px; border-radius: 15px; background: #f4f0e7; }
+.action-list strong, .action-list small { display: block; }
+.action-list small { margin-top: 4px; color: #60706b; line-height: 1.4; }
+.number { flex: 0 0 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; color: white; background: #33715f; font-weight: 800; }
+
+.today { width: min(860px, 100%); margin: 8vh auto 0; }
+.today h1 { font-size: clamp(2.3rem, 6vw, 4.2rem); }
+.action-card { margin-top: 36px; padding: 24px; display: grid; gap: 24px; }
+.action-card h2 { margin: 5px 0 8px; }
+.action-card p { margin: 0; color: #5b6b66; line-height: 1.55; }
+.action-card .action-label { color: #9a4f16; font-size: 0.78rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.1em; }
+.api-status { width: min(860px, 100%); margin: 22px auto; font-size: 0.82rem; color: #667570; }
+.api-status-ready { color: #276854; }
+.api-status-unavailable { color: #9b3f30; }
+.status-page { min-height: 100vh; display: grid; place-items: center; color: #52645f; }
+
+@media (min-width: 840px) {
+  .hero { grid-template-columns: minmax(0, 1.4fr) minmax(310px, 0.6fr); }
+  .action-card { grid-template-columns: 1fr auto; align-items: center; padding: 28px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+}

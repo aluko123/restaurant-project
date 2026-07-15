@@ -1,0 +1,9 @@
+.git
+.agents
+**/.env
+**/.env.*
+!**/.env.example
+**/node_modules
+**/dist
+target
+*.log
