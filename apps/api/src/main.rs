@@ -1,4 +1,6 @@
 mod auth;
+mod invoices;
+mod storage;
 
 use std::{env, net::SocketAddr};
 
@@ -6,13 +8,14 @@ use anyhow::{Context, Result};
 use auth::JwtVerifier;
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
+use storage::ObjectStorage;
 use tokio::net::TcpListener;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
@@ -25,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 struct AppState {
     pool: PgPool,
     verifier: JwtVerifier,
+    storage: ObjectStorage,
 }
 
 #[derive(Serialize)]
@@ -86,6 +90,9 @@ async fn main() -> Result<()> {
         required_env("WORKOS_JWKS_URL")?,
     )
     .context("failed to configure WorkOS JWT verifier")?;
+    let storage = ObjectStorage::from_env()
+        .await
+        .context("failed to configure private Cloudflare R2 storage")?;
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -99,7 +106,11 @@ async fn main() -> Result<()> {
         .context("failed to run database migrations")?;
 
     let app = router(
-        AppState { pool, verifier },
+        AppState {
+            pool,
+            verifier,
+            storage,
+        },
         web_origin
             .parse::<HeaderValue>()
             .context("WEB_ORIGIN must be a valid HTTP header value")?,
@@ -132,6 +143,13 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/health/ready", get(ready))
         .route("/v1/me", get(me))
         .route("/v1/restaurants", post(create_restaurant))
+        .route(
+            "/v1/invoices",
+            get(invoices::list)
+                .post(invoices::create)
+                .layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
+        )
+        .route("/v1/invoices/{id}/file", get(invoices::file_url))
         .with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

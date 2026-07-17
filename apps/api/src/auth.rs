@@ -168,7 +168,7 @@ fn validate_token(token: &str, key: &DecodingKey, issuer: &str) -> Result<String
 }
 
 #[cfg(test)]
-mod tests{
+mod tests {
     use super::*;
 
     #[test]

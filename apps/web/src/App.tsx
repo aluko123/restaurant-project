@@ -6,6 +6,7 @@ type AppProps = {
 };
 
 type Restaurant = { id: string; name: string; city: string; serviceStyle: ServiceStyle; role: string };
+type Invoice = { id: string; supplierName: string; invoiceDate: string; originalFilename: string; contentType: string; sizeBytes: number; status: string; createdAt: string };
 type ServiceStyle = "counter_service" | "full_service" | "fast_casual" | "cafe_bakery" | "bar";
 type AppState = { status: "loading" } | { status: "error"; message: string } | { status: "ready"; restaurant: Restaurant | null };
 
@@ -13,7 +14,7 @@ const serviceStyles: { value: ServiceStyle; label: string }[] = [
   { value: "counter_service", label: "Counter service" },
   { value: "full_service", label: "Full service" },
   { value: "fast_casual", label: "Fast casual" },
-  { value: "cafe_bakery", label: "Cafe / bakery" },
+  { value: "cafe_bakery", label: "Cafe/Bakery" },
   { value: "bar", label: "Bar" },
 ];
 
@@ -35,9 +36,12 @@ function AuthenticatedApp() {
 
   const request = useCallback(async <T,>(path: string, init?: RequestInit): Promise<T> => {
     const token = await getAccessToken();
+    const headers = new Headers(init?.headers);
+    if (!(init?.body instanceof FormData)) headers.set("Content-Type", "application/json");
+    headers.set("Authorization", `Bearer ${token}`);
     const response = await fetch(`${apiUrl}${path}`, {
       ...init,
-      headers: { "Content-Type": "application/json", ...init?.headers, Authorization: `Bearer ${token}` },
+      headers,
     });
     const body = await response.json().catch(() => null) as { error?: string } | null;
     if (!response.ok) throw new Error(body?.error ?? "Daybook couldn't reach the kitchen. Please try again.");
@@ -73,54 +77,86 @@ function AuthenticatedApp() {
   return (
     <main className="app-shell">
       <AppHeader restaurantName={restaurant.name} onSignOut={() => signOut()} />
-      <section className="app-workspace" aria-labelledby="today-heading">
-        <aside className="shift-rail" aria-label="Shift details">
-          <span className="shift-rail-label">Opening brief</span>
-          <span className="shift-rail-number">01</span>
-          <span className="shift-rail-rule" aria-hidden="true" />
-          <span>{restaurant.city}<br />{formatServiceStyle(restaurant.serviceStyle)}</span>
-        </aside>
-
-        <div className="today-brief">
-          <header className="brief-heading">
-            <div>
-              <p className="section-code">DB—SETUP / TODAY</p>
-              <h1 id="today-heading">Good morning, <em>{user.firstName ?? user.email}</em></h1>
-            </div>
-            <div className="date-block" aria-label="Friday, July 17">
-              <strong>17</strong>
-              <span>JUL<br />FRI</span>
-            </div>
-          </header>
-
-          <p className="brief-intro"><strong>{restaurant.name}</strong> is ready. Your first brief will grow from real supplier and shift data—not placeholder analytics.</p>
-
-          <div className="setup-action">
-            <span className="setup-action-number">01</span>
-            <div className="setup-action-copy">
-              <p className="task-overline">First move · about 2 minutes</p>
-              <h2>Upload your first invoice</h2>
-              <p>No invoices yet. Upload your first supplier invoice to start tracking price changes for {restaurant.city}.</p>
-            </div>
-            <button className="ledger-button" type="button" disabled>
-              Upload coming next <span aria-hidden="true">→</span>
-            </button>
-          </div>
-
-          <div className="coming-up" aria-label="What comes after setup">
-            <p>Then, your first service brief</p>
-            <ul>
-              <li>Supplier price movement</li>
-              <li>Stockout risk</li>
-              <li>Prep and order priorities</li>
-            </ul>
-          </div>
-          <p className="restaurant-meta">{formatServiceStyle(restaurant.serviceStyle)} · {restaurant.city} · {restaurant.role}</p>
-        </div>
-      </section>
+      <InvoiceWorkspace restaurant={restaurant} request={request} />
     </main>
   );
 }
+
+function InvoiceWorkspace({ restaurant, request }: { restaurant: Restaurant; request: <T>(path: string, init?: RequestInit) => Promise<T> }) {
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [listError, setListError] = useState("");
+  const [supplier, setSupplier] = useState("");
+  const [date, setDate] = useState(() => new Date().toLocaleDateString("en-CA"));
+  const [file, setFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [uploadError, setUploadError] = useState("");
+  const [openingId, setOpeningId] = useState("");
+
+  const loadInvoices = useCallback(() => {
+    setLoading(true); setListError("");
+    void request<Invoice[]>("/v1/invoices")
+      .then(setInvoices)
+      .catch((error: unknown) => setListError(error instanceof Error ? error.message : "Invoices couldn't load. Please try again."))
+      .finally(() => setLoading(false));
+  }, [request]);
+  useEffect(loadInvoices, [loadInvoices]);
+
+  async function upload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setNotice(""); setUploadError("");
+    const form = event.currentTarget;
+    if (!supplier.trim() || !date || !file) { setUploadError("Add the supplier, invoice date, and a PDF or photo."); return; }
+    if (file.size > 10 * 1024 * 1024) { setUploadError("Choose a file smaller than 10 MiB."); return; }
+    const body = new FormData(); body.append("supplierName", supplier); body.append("invoiceDate", date); body.append("file", file);
+    setUploading(true);
+    try {
+      const invoice = await request<Invoice>("/v1/invoices", { method: "POST", body });
+      setInvoices((current) => [invoice, ...current]); setSupplier(""); setFile(null);
+      setNotice("Invoice uploaded successfully.");
+      form.reset(); setDate(new Date().toLocaleDateString("en-CA"));
+    } catch (error) { setUploadError(error instanceof Error ? error.message : "Invoice upload failed. Please try again."); }
+    finally { setUploading(false); }
+  }
+
+  async function openOriginal(invoice: Invoice) {
+    setOpeningId(invoice.id); setListError("");
+    const popup = window.open("", "_blank");
+    if (popup) popup.opener = null;
+    try {
+      const { url } = await request<{ url: string }>(`/v1/invoices/${invoice.id}/file`);
+      if (popup) popup.location.href = url; else window.open(url, "_blank", "noopener,noreferrer");
+    } catch (error) { popup?.close(); setListError(error instanceof Error ? error.message : "The original couldn't open. Please try again."); }
+    finally { setOpeningId(""); }
+  }
+
+  return <section className="invoice-workspace" aria-labelledby="invoices-heading">
+    <header className="invoice-heading"><p className="section-code">DB—INVOICES</p><h1>{restaurant.name}</h1><p>{restaurant.city} · {formatServiceStyle(restaurant.serviceStyle)}</p></header>
+    <div className="invoice-grid">
+      <form className="invoice-form" onSubmit={upload} noValidate>
+        <h2>Upload an invoice</h2><p>Save one supplier PDF or photo. Maximum 10 MiB.</p>
+        <div className="ledger-field"><label htmlFor="supplier-name">Supplier name</label><input id="supplier-name" value={supplier} onChange={(event) => setSupplier(event.target.value)} maxLength={120} required /></div>
+        <div className="ledger-field"><label htmlFor="invoice-date">Invoice date</label><input id="invoice-date" type="date" value={date} max={new Date().toLocaleDateString("en-CA")} onChange={(event) => setDate(event.target.value)} required /></div>
+        <div className="file-actions">
+          <input className="visually-hidden" id="invoice-camera" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => setFile(event.target.files?.[0] ?? null)} /><label className="file-button" htmlFor="invoice-camera">Take a photo</label>
+          <input className="visually-hidden" id="invoice-file" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" onChange={(event) => setFile(event.target.files?.[0] ?? null)} /><label className="file-button" htmlFor="invoice-file">Choose a file</label>
+        </div>
+        {file && <p className="selected-file"><strong>Selected:</strong> {file.name} · {formatBytes(file.size)}</p>}
+        {uploadError && <p className="form-error" role="alert">{uploadError}</p>}
+        {notice && <p className="success-notice" role="status">{notice}</p>}
+        <button className="ledger-button" type="submit" disabled={uploading}>{uploading ? "Uploading invoice…" : "Upload invoice"}<span aria-hidden="true">→</span></button>
+      </form>
+      <div className="invoice-list"><div className="list-heading"><h2 id="invoices-heading">Recent invoices</h2>{!loading && <button className="text-button" type="button" onClick={loadInvoices}>Refresh</button>}</div>
+        {listError && <p className="form-error" role="alert">{listError}</p>}
+        {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload your first supplier invoice.</p> :
+          <div className="invoice-cards">{invoices.map((invoice) => <article className="invoice-card" key={invoice.id}><div><p className="invoice-status">{invoice.status.replace("_", " ")}</p><h3>{invoice.supplierName}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void openOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></article>)}</div>}
+      </div>
+    </div>
+  </section>;
+}
+
+function formatBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
+function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`)); }
 
 function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string; city: string; serviceStyle: ServiceStyle }) => Promise<void>; onSignOut: () => void }) {
   const [name, setName] = useState("");

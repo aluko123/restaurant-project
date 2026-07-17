@@ -7,13 +7,16 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1.0"
-axum = "0.8.9"
+aws-credential-types = "=1.2.3"
+aws-sdk-s3 = "=1.96.0"
+axum = { version = "0.8.9", features = ["multipart"] }
+chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 jsonwebtoken = "9.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sqlx = { version = "0.8.6", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring", "uuid"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["chrono", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring", "uuid"] }
 tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 tracing = "0.1"
