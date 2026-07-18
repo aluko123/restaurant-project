@@ -3,8 +3,9 @@ use axum::{
     extract::{Multipart, Path, State},
     http::{HeaderMap, StatusCode},
 };
+use bigdecimal::BigDecimal;
 use chrono::{NaiveDate, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{ApiError, AppState, authenticated_subject};
@@ -29,6 +30,20 @@ pub(crate) struct Invoice {
     size_bytes: i64,
     status: String,
     created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReviewHeader {
+    invoice_id: Uuid,
+    supplier_name: String,
+    invoice_number: Option<String>,
+    invoice_date: Option<NaiveDate>,
+    currency: String,
+    subtotal: Option<String>,
+    tax: Option<String>,
+    fees: Option<String>,
+    discount: Option<String>,
+    total: Option<String>,
 }
 
 struct Upload {
@@ -67,24 +82,34 @@ pub(crate) async fn create(
             )
         })?;
 
-    let result = sqlx::query_as::<_, Invoice>(
-        "INSERT INTO invoices
+    let result = async {
+        let mut tx = state.pool.begin().await?;
+        let invoice = sqlx::query_as::<_, Invoice>(
+            "INSERT INTO invoices
          (id, restaurant_id, uploaded_by, supplier_name, invoice_date, original_filename,
-          content_type, size_bytes, object_key)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          content_type, size_bytes, object_key, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing')
          RETURNING id, supplier_name, invoice_date, original_filename, content_type,
                    size_bytes, status, created_at",
-    )
-    .bind(id)
-    .bind(membership.restaurant_id)
-    .bind(membership.user_id)
-    .bind(upload.supplier_name)
-    .bind(upload.invoice_date)
-    .bind(upload.original_filename)
-    .bind(upload.content_type)
-    .bind(size_bytes)
-    .bind(&key)
-    .fetch_one(&state.pool)
+        )
+        .bind(id)
+        .bind(membership.restaurant_id)
+        .bind(membership.user_id)
+        .bind(upload.supplier_name)
+        .bind(upload.invoice_date)
+        .bind(upload.original_filename)
+        .bind(upload.content_type)
+        .bind(size_bytes)
+        .bind(&key)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO invoice_extraction_jobs (invoice_id) VALUES ($1)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(invoice)
+    }
     .await;
 
     match result {
@@ -172,6 +197,257 @@ async fn membership(state: &AppState, headers: &HeaderMap) -> Result<Membership,
         StatusCode::FORBIDDEN,
         "An owner restaurant membership is required.",
     ))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Review {
+    invoice_id: Uuid,
+    supplier_name: String,
+    invoice_number: Option<String>,
+    invoice_date: Option<NaiveDate>,
+    currency: String,
+    subtotal: Option<String>,
+    tax: Option<String>,
+    fees: Option<String>,
+    discount: Option<String>,
+    total: Option<String>,
+    line_items: Vec<ReviewLine>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+struct ReviewLine {
+    id: Uuid,
+    sku: Option<String>,
+    description: String,
+    quantity: Option<String>,
+    unit: Option<String>,
+    unit_price: Option<String>,
+    line_total: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ReviewInput {
+    supplier_name: String,
+    invoice_number: Option<String>,
+    invoice_date: Option<String>,
+    currency: String,
+    subtotal: Option<String>,
+    tax: Option<String>,
+    fees: Option<String>,
+    discount: Option<String>,
+    total: Option<String>,
+    line_items: Vec<ReviewLineInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReviewLineInput {
+    sku: Option<String>,
+    description: String,
+    quantity: Option<String>,
+    unit: Option<String>,
+    unit_price: Option<String>,
+    line_total: Option<String>,
+}
+
+pub(crate) async fn get_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Review>, ApiError> {
+    let member = membership(&state, &headers).await?;
+    let header = sqlx::query_as::<_, ReviewHeader>("SELECT e.invoice_id,e.supplier_name,e.invoice_number,e.invoice_date,e.currency,
+        e.subtotal::text subtotal,e.tax::text tax,e.fees::text fees,e.discount::text discount,e.total::text total
+        FROM invoice_extractions e JOIN invoices i ON i.id=e.invoice_id WHERE e.invoice_id=$1 AND i.restaurant_id=$2 AND i.status IN ('needs_review','ready')")
+        .bind(id).bind(member.restaurant_id).fetch_optional(&state.pool).await.map_err(crate::database_error)?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "Invoice review is not available."))?;
+    let line_items = sqlx::query_as::<_, ReviewLine>("SELECT id,sku,description,quantity::text quantity,unit,unit_price::text unit_price,line_total::text line_total FROM invoice_line_items WHERE invoice_id=$1 ORDER BY position")
+        .bind(id).fetch_all(&state.pool).await.map_err(crate::database_error)?;
+    let review = Review {
+        invoice_id: header.invoice_id,
+        supplier_name: header.supplier_name,
+        invoice_number: header.invoice_number,
+        invoice_date: header.invoice_date,
+        currency: header.currency,
+        subtotal: header.subtotal,
+        tax: header.tax,
+        fees: header.fees,
+        discount: header.discount,
+        total: header.total,
+        line_items,
+    };
+    Ok(Json(review))
+}
+
+pub(crate) async fn put_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(input): Json<ReviewInput>,
+) -> Result<Json<Review>, ApiError> {
+    let member = membership(&state, &headers).await?;
+    let input = validate_review(input)?;
+    let mut tx = state.pool.begin().await.map_err(crate::database_error)?;
+    let invoice_date = input
+        .invoice_date
+        .as_deref()
+        .map(parse_review_date)
+        .transpose()?;
+    let changed = sqlx::query("UPDATE invoices SET supplier_name=$3,invoice_date=COALESCE($4,invoice_date),status='ready',updated_at=NOW() WHERE id=$1 AND restaurant_id=$2 AND status='needs_review'")
+        .bind(id).bind(member.restaurant_id).bind(&input.supplier_name).bind(invoice_date)
+        .execute(&mut *tx).await.map_err(crate::database_error)?.rows_affected();
+    if changed == 0 {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "This invoice is not waiting for review.",
+        ));
+    }
+    sqlx::query("UPDATE invoice_extractions SET supplier_name=$2,invoice_number=$3,invoice_date=$4,currency=$5,subtotal=$6,tax=$7,fees=$8,discount=$9,total=$10,reviewed_by=$11,reviewed_at=NOW(),updated_at=NOW() WHERE invoice_id=$1")
+        .bind(id).bind(&input.supplier_name).bind(&input.invoice_number).bind(invoice_date).bind(&input.currency)
+        .bind(parse_decimal(&input.subtotal, 4)?).bind(parse_decimal(&input.tax, 4)?).bind(parse_decimal(&input.fees, 4)?).bind(parse_decimal(&input.discount, 4)?).bind(parse_decimal(&input.total, 4)?).bind(member.user_id)
+        .execute(&mut *tx).await.map_err(crate::database_error)?;
+    sqlx::query("DELETE FROM invoice_line_items WHERE invoice_id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::database_error)?;
+    for (position, line) in input.line_items.iter().enumerate() {
+        sqlx::query("INSERT INTO invoice_line_items (id,invoice_id,position,sku,description,quantity,unit,unit_price,line_total) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+            .bind(Uuid::now_v7()).bind(id).bind(position as i32).bind(&line.sku).bind(&line.description).bind(parse_decimal(&line.quantity,6)?).bind(&line.unit).bind(parse_decimal(&line.unit_price,4)?).bind(parse_decimal(&line.line_total,4)?)
+            .execute(&mut *tx).await.map_err(crate::database_error)?;
+    }
+    tx.commit().await.map_err(crate::database_error)?;
+    get_review(State(state), headers, Path(id)).await
+}
+
+pub(crate) async fn retry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let member = membership(&state, &headers).await?;
+    let mut tx = state.pool.begin().await.map_err(crate::database_error)?;
+    let changed = sqlx::query("UPDATE invoices SET status='processing',updated_at=NOW() WHERE id=$1 AND restaurant_id=$2 AND status='failed'").bind(id).bind(member.restaurant_id).execute(&mut *tx).await.map_err(crate::database_error)?.rows_affected();
+    if changed == 0 {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Only a failed invoice can be retried.",
+        ));
+    }
+    sqlx::query("INSERT INTO invoice_extraction_jobs (invoice_id) VALUES ($1) ON CONFLICT (invoice_id) DO UPDATE SET status='queued',attempts=0,available_at=NOW(),locked_at=NULL,lock_token=NULL,last_error=NULL,updated_at=NOW() WHERE invoice_extraction_jobs.status='failed'")
+        .bind(id).execute(&mut *tx).await.map_err(crate::database_error)?;
+    tx.commit().await.map_err(crate::database_error)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+fn validate_review(mut i: ReviewInput) -> Result<ReviewInput, ApiError> {
+    i.supplier_name = i.supplier_name.trim().to_owned();
+    i.currency = i.currency.trim().to_ascii_uppercase();
+    if i.supplier_name.is_empty()
+        || i.supplier_name.chars().count() > 120
+        || i.currency.len() != 3
+        || !i.currency.bytes().all(|c| c.is_ascii_uppercase())
+        || i.line_items.len() > 200
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Check the supplier, currency, and line item count.",
+        ));
+    }
+    for line in &mut i.line_items {
+        line.description = line.description.trim().to_owned();
+        line.sku = trim_optional(line.sku.take());
+        line.unit = trim_optional(line.unit.take());
+        if line.description.is_empty()
+            || line.description.chars().count() > 500
+            || line
+                .sku
+                .as_ref()
+                .is_some_and(|value| value.chars().count() > 120)
+            || line
+                .unit
+                .as_ref()
+                .is_some_and(|value| value.chars().count() > 40)
+        {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Check each line's description, SKU, and unit.",
+            ));
+        }
+        parse_decimal(&line.quantity, 6)?;
+        parse_decimal(&line.unit_price, 4)?;
+        parse_decimal(&line.line_total, 4)?;
+    }
+    i.invoice_number = trim_optional(i.invoice_number.take());
+    if i.invoice_number
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 120)
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invoice number must be no more than 120 characters.",
+        ));
+    }
+    for value in [&i.subtotal, &i.tax, &i.fees, &i.discount, &i.total] {
+        parse_decimal(value, 4)?;
+    }
+    if let Some(date) = &i.invoice_date {
+        parse_review_date(date)?;
+    }
+    Ok(i)
+}
+fn parse_review_date(v: &str) -> Result<NaiveDate, ApiError> {
+    NaiveDate::parse_from_str(v, "%Y-%m-%d").map_err(|_| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Use a valid invoice date.",
+        )
+    })
+}
+fn parse_decimal(v: &Option<String>, scale: i64) -> Result<Option<BigDecimal>, ApiError> {
+    let Some(v) = v.as_deref() else {
+        return Ok(None);
+    };
+    if v.is_empty() {
+        return Ok(None);
+    }
+    let n = strict_decimal(v, scale as usize).map_err(|_| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Use plain decimal values within the allowed size and decimal places.",
+        )
+    })?;
+    Ok(Some(n))
+}
+
+pub(crate) fn strict_decimal(value: &str, scale: usize) -> Result<BigDecimal, &'static str> {
+    let unsigned = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if value.is_empty()
+        || value.len() > 32
+        || integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > scale
+        || integer.trim_start_matches('0').len().max(1) > 18 - scale
+        || unsigned.matches('.').count() > 1
+    {
+        return Err("invalid decimal");
+    }
+    value.parse().map_err(|_| "invalid decimal")
+}
+
+fn trim_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
 }
 
 async fn parse_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
@@ -322,5 +598,16 @@ mod tests {
             object_key(restaurant, invoice, "pdf"),
             format!("restaurants/{restaurant}/invoices/{invoice}/original.pdf")
         );
+    }
+
+    #[test]
+    fn validates_decimal_scale_and_format() {
+        assert!(parse_decimal(&Some("12.3456".into()), 4).is_ok());
+        assert!(parse_decimal(&Some("12.34567".into()), 4).is_err());
+        assert!(parse_decimal(&Some("$12.00".into()), 4).is_err());
+        assert!(parse_decimal(&Some("1e3".into()), 4).is_err());
+        assert!(parse_decimal(&Some("1_000".into()), 4).is_err());
+        assert!(parse_decimal(&Some("1000000000000".into()), 6).is_err());
+        assert!(parse_decimal(&None, 4).unwrap().is_none());
     }
 }

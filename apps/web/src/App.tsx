@@ -7,6 +7,8 @@ type AppProps = {
 
 type Restaurant = { id: string; name: string; city: string; serviceStyle: ServiceStyle; role: string };
 type Invoice = { id: string; supplierName: string; invoiceDate: string; originalFilename: string; contentType: string; sizeBytes: number; status: string; createdAt: string };
+type ReviewLine = { id?: string; sku: string | null; description: string; quantity: string | null; unit: string | null; unitPrice: string | null; lineTotal: string | null };
+type Review = { invoiceId: string; supplierName: string; invoiceNumber: string | null; invoiceDate: string | null; currency: string; subtotal: string | null; tax: string | null; fees: string | null; discount: string | null; total: string | null; lineItems: ReviewLine[] };
 type ServiceStyle = "counter_service" | "full_service" | "fast_casual" | "cafe_bakery" | "bar";
 type AppState = { status: "loading" } | { status: "error"; message: string } | { status: "ready"; restaurant: Restaurant | null };
 
@@ -93,6 +95,8 @@ function InvoiceWorkspace({ restaurant, request }: { restaurant: Restaurant; req
   const [notice, setNotice] = useState("");
   const [uploadError, setUploadError] = useState("");
   const [openingId, setOpeningId] = useState("");
+  const [reviewId, setReviewId] = useState("");
+  const [retryingId, setRetryingId] = useState("");
 
   const loadInvoices = useCallback(() => {
     setLoading(true); setListError("");
@@ -102,6 +106,11 @@ function InvoiceWorkspace({ restaurant, request }: { restaurant: Restaurant; req
       .finally(() => setLoading(false));
   }, [request]);
   useEffect(loadInvoices, [loadInvoices]);
+  useEffect(() => {
+    if (!invoices.some((invoice) => invoice.status === "processing")) return;
+    const timer = window.setInterval(loadInvoices, 5000);
+    return () => window.clearInterval(timer);
+  }, [invoices, loadInvoices]);
 
   async function upload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setNotice(""); setUploadError("");
@@ -130,6 +139,15 @@ function InvoiceWorkspace({ restaurant, request }: { restaurant: Restaurant; req
     finally { setOpeningId(""); }
   }
 
+  async function retry(invoice: Invoice) {
+    setRetryingId(invoice.id); setListError("");
+    try { await request(`/v1/invoices/${invoice.id}/retry`, { method: "POST" }); loadInvoices(); }
+    catch (error) { setListError(error instanceof Error ? error.message : "The invoice couldn't be retried."); }
+    finally { setRetryingId(""); }
+  }
+
+  if (reviewId) return <ReviewInvoice invoiceId={reviewId} request={request} onBack={() => { setReviewId(""); loadInvoices(); }} onViewOriginal={() => { const invoice=invoices.find((item)=>item.id===reviewId); if(invoice) void openOriginal(invoice); }} />;
+
   return <section className="invoice-workspace" aria-labelledby="invoices-heading">
     <header className="invoice-heading"><p className="section-code">DB—INVOICES</p><h1>{restaurant.name}</h1><p>{restaurant.city} · {formatServiceStyle(restaurant.serviceStyle)}</p></header>
     <div className="invoice-grid">
@@ -149,10 +167,24 @@ function InvoiceWorkspace({ restaurant, request }: { restaurant: Restaurant; req
       <div className="invoice-list"><div className="list-heading"><h2 id="invoices-heading">Recent invoices</h2>{!loading && <button className="text-button" type="button" onClick={loadInvoices}>Refresh</button>}</div>
         {listError && <p className="form-error" role="alert">{listError}</p>}
         {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload your first supplier invoice.</p> :
-          <div className="invoice-cards">{invoices.map((invoice) => <article className="invoice-card" key={invoice.id}><div><p className="invoice-status">{invoice.status.replace("_", " ")}</p><h3>{invoice.supplierName}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void openOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></article>)}</div>}
+          <div className="invoice-cards">{invoices.map((invoice) => <article className="invoice-card" key={invoice.id}><div><p className="invoice-status">{statusText(invoice.status)}</p><h3>{invoice.supplierName}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><div className="card-actions">{invoice.status === "needs_review" && <button className="ledger-button" type="button" onClick={() => setReviewId(invoice.id)}>Review invoice</button>}{invoice.status === "failed" && <button className="ledger-button" type="button" disabled={retryingId===invoice.id} onClick={() => void retry(invoice)}>{retryingId===invoice.id ? "Trying again…" : "Try again"}</button>}{invoice.status === "ready" && <span className="reviewed-label">Reviewed</span>}<button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void openOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></div></article>)}</div>}
       </div>
     </div>
   </section>;
+}
+
+function statusText(status: string) { return status === "needs_review" ? "Review invoice" : status === "ready" ? "Ready" : status === "failed" ? "Couldn’t read invoice" : "Processing"; }
+
+function ReviewInvoice({ invoiceId, request, onBack, onViewOriginal }: { invoiceId:string; request:<T>(path:string, init?:RequestInit)=>Promise<T>; onBack:()=>void; onViewOriginal:()=>void }) {
+  const [review,setReview]=useState<Review|null>(null); const [error,setError]=useState(""); const [saving,setSaving]=useState(false);
+  useEffect(()=>{ void request<Review>(`/v1/invoices/${invoiceId}/review`).then(setReview).catch((e:unknown)=>setError(e instanceof Error?e.message:"Review couldn't load.")); },[invoiceId,request]);
+  function field(name:keyof Review,value:string){setReview((r)=>r?{...r,[name]:value||null}:r)}
+  function line(index:number,name:keyof ReviewLine,value:string){setReview((r)=>r?{...r,lineItems:r.lineItems.map((item,i)=>i===index?{...item,[name]:value||null}:item)}:r)}
+  async function submit(event:FormEvent){event.preventDefault();if(!review)return;setSaving(true);setError("");try{const {invoiceId:_,...rest}=review;void _;const payload={...rest,lineItems:rest.lineItems.map(({id,...line})=>{void id;return line})};await request(`/v1/invoices/${invoiceId}/review`,{method:"PUT",body:JSON.stringify(payload)});onBack();}catch(e){setError(e instanceof Error?e.message:"Review couldn't be saved. Check the values and try again.");setSaving(false)}}
+  if(!review)return <section className="review-shell"><button className="text-button" onClick={onBack}>Back to invoices</button><p role={error?"alert":"status"}>{error||"Loading invoice…"}</p></section>;
+  const textFields:[keyof Review,string][]=[["supplierName","Supplier"],["invoiceDate","Invoice date"],["invoiceNumber","Invoice number"],["currency","Currency"]];
+  const totals:[keyof Review,string][]=[["subtotal","Subtotal"],["tax","Tax"],["fees","Fees"],["discount","Discount"],["total","Total"]];
+  return <section className="review-shell" aria-labelledby="review-heading"><div className="review-heading"><button className="text-button" type="button" onClick={onBack}>Back to invoices</button><button className="file-button" type="button" onClick={onViewOriginal}>View original</button></div><h1 id="review-heading">Review invoice</h1><p>Check every value against the original before approving.</p><form onSubmit={submit} className="review-form"> <div className="review-fields">{textFields.map(([name,label])=><label key={name}>{label}<input type={name==="invoiceDate"?"date":"text"} value={(review[name] as string|null)??""} onChange={(e)=>field(name,e.target.value)} required={name==="supplierName"||name==="currency"}/></label>)}</div><fieldset><legend>Line items</legend>{review.lineItems.map((item,index)=><div className="line-card" key={item.id??index}><label>Description<input value={item.description} onChange={(e)=>line(index,"description",e.target.value)} required/></label>{(["sku","quantity","unit","unitPrice","lineTotal"] as (keyof ReviewLine)[]).map((name)=><label key={name}>{name.replace(/([A-Z])/g," $1")}<input inputMode={name==="quantity"||name==="unitPrice"||name==="lineTotal"?"decimal":undefined} value={(item[name] as string|null)??""} onChange={(e)=>line(index,name,e.target.value)}/></label>)}<button className="text-button" type="button" onClick={()=>setReview({...review,lineItems:review.lineItems.filter((_,i)=>i!==index)})}>Remove row</button></div>)}<button className="file-button" type="button" onClick={()=>setReview({...review,lineItems:[...review.lineItems,{sku:null,description:"",quantity:null,unit:null,unitPrice:null,lineTotal:null}]})}>Add row</button></fieldset><div className="review-fields totals">{totals.map(([name,label])=><label key={name}>{label}<input inputMode="decimal" value={(review[name] as string|null)??""} onChange={(e)=>field(name,e.target.value)}/></label>)}</div>{error&&<p className="form-error" role="alert">{error}</p>}<button className="ledger-button" disabled={saving}>{saving?"Approving…":"Approve invoice"}</button></form></section>;
 }
 
 function formatBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }

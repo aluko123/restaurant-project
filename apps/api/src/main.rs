@@ -1,4 +1,5 @@
 mod auth;
+mod extraction;
 mod invoices;
 mod storage;
 
@@ -105,6 +106,13 @@ async fn main() -> Result<()> {
         .await
         .context("failed to run database migrations")?;
 
+    let gemini = extraction::GeminiClient::from_env().context("failed to configure Gemini")?;
+    tokio::spawn(extraction::run_worker(
+        pool.clone(),
+        storage.clone(),
+        gemini,
+    ));
+
     let app = router(
         AppState {
             pool,
@@ -132,7 +140,7 @@ async fn main() -> Result<()> {
 fn router(state: AppState, web_origin: HeaderValue) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::exact(web_origin))
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::PUT])
         .allow_headers([
             axum::http::header::AUTHORIZATION,
             axum::http::header::CONTENT_TYPE,
@@ -150,6 +158,11 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
                 .layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
         )
         .route("/v1/invoices/{id}/file", get(invoices::file_url))
+        .route(
+            "/v1/invoices/{id}/review",
+            get(invoices::get_review).put(invoices::put_review),
+        )
+        .route("/v1/invoices/{id}/retry", post(invoices::retry))
         .with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

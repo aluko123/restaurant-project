@@ -58,6 +58,24 @@ impl ObjectStorage {
         Ok(())
     }
 
+    pub(crate) async fn get(&self, key: &str) -> Result<Vec<u8>> {
+        let object = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .context("R2 get object failed")?;
+        Ok(object
+            .body
+            .collect()
+            .await
+            .context("R2 object download failed")?
+            .into_bytes()
+            .to_vec())
+    }
+
     pub(crate) async fn signed_get_url(&self, key: &str) -> Result<String> {
         let config = PresigningConfig::expires_in(Duration::from_secs(300))
             .context("invalid signed URL expiry")?;

@@ -405,6 +405,19 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .invoice-card p { margin: 4px 0; }
 .invoice-status { color: var(--herb); font-family: var(--mono); font-size: 0.62rem; font-weight: 800; text-transform: uppercase; }
 .invoice-filename { overflow-wrap: anywhere; font-family: var(--mono); font-size: 0.65rem; }
+.card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.reviewed-label { font-family: var(--mono); font-size: .68rem; font-weight: 800; text-transform: uppercase; }
+.review-shell { width: min(900px, 100%); margin: 0 auto; padding: clamp(28px, 6vw, 72px) clamp(20px, 5vw, 60px); }
+.review-heading { display: flex; justify-content: space-between; gap: 16px; }
+.review-shell h1 { margin: 28px 0 8px; font-size: clamp(2.5rem, 8vw, 5rem); line-height: .9; text-transform: uppercase; }
+.review-shell > p { font-family: var(--serif); }
+.review-form { margin-top: 28px; display: grid; gap: 28px; }
+.review-fields { display: grid; gap: 14px; }
+.review-form label { display: grid; gap: 6px; font-family: var(--mono); font-size: .68rem; font-weight: 800; text-transform: uppercase; }
+.review-form input { width: 100%; min-height: 48px; padding: 10px; border: 1px solid var(--ink); border-radius: 0; background: var(--paper-light); }
+.review-form fieldset { margin: 0; padding: 18px; border: 1px solid var(--ink); }
+.review-form legend { padding: 0 8px; font-size: 1.2rem; font-weight: 900; text-transform: uppercase; }
+.line-card { margin-bottom: 18px; padding: 16px; display: grid; gap: 12px; border: 1px solid var(--rule); background: rgba(247,240,226,.55); }
 .error-notice { width: min(90vw, 560px); padding: 28px; border: 1px solid var(--paper-light); color: var(--paper-light); text-align: left; }
 .error-notice h1 { font-size: clamp(2rem, 8vw, 4rem); line-height: 0.9; text-transform: uppercase; }
 .error-notice > p:not(.section-code) { font-family: var(--serif); font-size: 1rem; line-height: 1.5; text-transform: none; }
@@ -417,6 +430,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .status-page { min-height: 100vh; display: grid; place-items: center; color: var(--paper-light); background: var(--ink); font-family: var(--mono); font-size: 0.7rem; text-transform: uppercase; }
 
 @media (min-width: 720px) {
+  .review-fields { grid-template-columns: repeat(2, 1fr); }
+  .line-card { grid-template-columns: repeat(3, 1fr); }
+  .line-card label:first-child { grid-column: 1 / -1; }
   .landing-footer { grid-template-columns: 1fr 2fr 1fr; }
   .setup-action { grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; }
   .invoice-grid { grid-template-columns: minmax(300px, 0.75fr) minmax(360px, 1.25fr); }

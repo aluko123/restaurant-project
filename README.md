@@ -60,6 +60,10 @@ WorkOS AuthKit SPA access tokens use a client-specific issuer and do not include
 
 Create a private Cloudflare R2 bucket and an R2 API token with object read/write access to that bucket. Set `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_BUCKET` in `apps/api/.env`. These values are required when the API starts; do not commit them. Browser CORS is not needed because uploads go through the API, and originals are opened with five-minute signed URLs.
 
+### Invoice extraction
+
+Set `GEMINI_API_KEY` and optionally `GEMINI_MODEL` (default: the stable `gemini-3.5-flash` model). Use a **paid Gemini API tier for real invoices**: Google states that free-tier content may be used to improve its products. The API sends private R2 bytes directly to Gemini, records the configured model and token usage, and runs a bounded, durable PostgreSQL-backed worker. Ambiguous network failures can be retried because exactly-once provider calls are not possible; stored results and line items are idempotently replaced.
+
 ## Verification
 
 ```sh
