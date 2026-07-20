@@ -163,6 +163,10 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             get(invoices::get_review).put(invoices::put_review),
         )
         .route("/v1/invoices/{id}/retry", post(invoices::retry))
+        .route(
+            "/v1/invoices/{id}/price-changes",
+            get(invoices::price_changes),
+        )
         .with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

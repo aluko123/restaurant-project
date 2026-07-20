@@ -418,6 +418,15 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .review-form fieldset { margin: 0; padding: 18px; border: 1px solid var(--ink); }
 .review-form legend { padding: 0 8px; font-size: 1.2rem; font-weight: 900; text-transform: uppercase; }
 .line-card { margin-bottom: 18px; padding: 16px; display: grid; gap: 12px; border: 1px solid var(--rule); background: rgba(247,240,226,.55); }
+.price-change-shell .section-code { margin-top: 36px; }
+.price-change-list { margin-top: 28px; display: grid; gap: 18px; }
+.price-change-card, .price-empty { padding: clamp(20px, 5vw, 34px); border: 1px solid var(--ink); background: var(--paper-light); }
+.price-change-card h2, .price-empty h2 { margin: 8px 0 18px; font-size: clamp(1.5rem, 6vw, 2.5rem); line-height: 1; text-transform: uppercase; }
+.price-comparison { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.price-comparison strong { font-size: 1.7rem; }
+.price-comparison span, .price-action { font-family: var(--serif); }
+.price-action { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--rule); }
+.price-empty { margin-top: 28px; }
 .error-notice { width: min(90vw, 560px); padding: 28px; border: 1px solid var(--paper-light); color: var(--paper-light); text-align: left; }
 .error-notice h1 { font-size: clamp(2rem, 8vw, 4rem); line-height: 0.9; text-transform: uppercase; }
 .error-notice > p:not(.section-code) { font-family: var(--serif); font-size: 1rem; line-height: 1.5; text-transform: none; }

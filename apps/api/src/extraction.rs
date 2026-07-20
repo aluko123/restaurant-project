@@ -1,10 +1,13 @@
-use std::{env, time::Duration};
+use std::{
+    env,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bigdecimal::BigDecimal;
 use chrono::NaiveDate;
-use reqwest::Client;
+use reqwest::{Client, header::RETRY_AFTER};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -12,8 +15,10 @@ use uuid::Uuid;
 
 use crate::{invoices::strict_decimal, storage::ObjectStorage};
 
-const MAX_ATTEMPTS: i32 = 3;
+const MAX_ATTEMPTS: i32 = 6;
 const STALE_MINUTES: i32 = 10;
+const INITIAL_RETRY_SECS: u64 = 30;
+const MAX_RETRY_SECS: u64 = 15 * 60;
 
 #[derive(Clone)]
 pub(crate) struct GeminiClient {
@@ -56,7 +61,10 @@ pub(crate) struct ProviderResult {
 }
 
 enum ProviderError {
-    Retryable(anyhow::Error),
+    Retryable {
+        error: anyhow::Error,
+        retry_after: Option<Duration>,
+    },
     Terminal(anyhow::Error),
 }
 
@@ -113,9 +121,19 @@ impl GeminiClient {
             .json(&body)
             .send()
             .await
-            .map_err(|error| ProviderError::Retryable(error.into()))?;
+            .map_err(|error| ProviderError::Retryable {
+                error: error.into(),
+                retry_after: None,
+            })?;
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = parse_retry_after(
+                response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                SystemTime::now(),
+            );
             let details = response
                 .text()
                 .await
@@ -123,7 +141,7 @@ impl GeminiClient {
             let details = details.chars().take(500).collect::<String>();
             let error = anyhow!("Gemini request failed with status {status}: {details}");
             return if status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error() {
-                Err(ProviderError::Retryable(error))
+                Err(ProviderError::Retryable { error, retry_after })
             } else {
                 Err(ProviderError::Terminal(error))
             };
@@ -134,6 +152,33 @@ impl GeminiClient {
             .map_err(|error| ProviderError::Terminal(error.into()))?;
         parse_response(raw).map_err(ProviderError::Terminal)
     }
+}
+
+fn parse_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
+    let value = value?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(now)
+        .ok()
+}
+
+fn base_retry_delay(attempts: i32) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(31) as u32;
+    Duration::from_secs(
+        INITIAL_RETRY_SECS
+            .saturating_mul(2_u64.pow(exponent))
+            .min(MAX_RETRY_SECS),
+    )
+}
+
+fn retry_delay(attempts: i32, retry_after: Option<Duration>) -> Duration {
+    let base = base_retry_delay(attempts);
+    let minimum = retry_after.unwrap_or_default().max(base);
+    let jitter = fastrand::u64(0..=base.as_secs() / 4);
+    minimum.saturating_add(Duration::from_secs(jitter))
 }
 
 fn parse_response(raw: Value) -> Result<ProviderResult> {
@@ -237,31 +282,37 @@ async fn process(pool: &PgPool, storage: &ObjectStorage, gemini: &GeminiClient, 
     let bytes = match storage.get(&job.object_key).await {
         Ok(bytes) => bytes,
         Err(error) => {
-            handle_failure(pool, &job, error, false).await;
+            handle_failure(pool, &job, error, false, None).await;
             return;
         }
     };
     let result = match gemini.extract(&bytes, &job.content_type).await {
         Ok(result) => result,
-        Err(ProviderError::Retryable(error)) => {
-            handle_failure(pool, &job, error, false).await;
+        Err(ProviderError::Retryable { error, retry_after }) => {
+            handle_failure(pool, &job, error, false, retry_after).await;
             return;
         }
         Err(ProviderError::Terminal(error)) => {
-            handle_failure(pool, &job, error, true).await;
+            handle_failure(pool, &job, error, true, None).await;
             return;
         }
     };
     if let Err(error) = validate_provider(&result.extracted) {
-        handle_failure(pool, &job, error, true).await;
+        handle_failure(pool, &job, error, true, None).await;
         return;
     }
     if let Err(error) = persist(pool, &job, &gemini.model, result).await {
-        handle_failure(pool, &job, error, false).await;
+        handle_failure(pool, &job, error, false, None).await;
     }
 }
 
-async fn handle_failure(pool: &PgPool, job: &ClaimedJob, error: anyhow::Error, terminal: bool) {
+async fn handle_failure(
+    pool: &PgPool,
+    job: &ClaimedJob,
+    error: anyhow::Error,
+    terminal: bool,
+    retry_after: Option<Duration>,
+) {
     tracing::warn!(invoice_id=%job.invoice_id, terminal, %error, "invoice extraction attempt failed");
     if let Err(db_error) = fail_or_retry(
         pool,
@@ -269,6 +320,7 @@ async fn handle_failure(pool: &PgPool, job: &ClaimedJob, error: anyhow::Error, t
         job.lock_token,
         &error.to_string(),
         terminal,
+        retry_after,
     )
     .await
     {
@@ -372,6 +424,7 @@ async fn fail_or_retry(
     lock_token: Uuid,
     error: &str,
     terminal: bool,
+    retry_after: Option<Duration>,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
     let attempts = sqlx::query_scalar::<_, i32>("SELECT attempts FROM invoice_extraction_jobs WHERE invoice_id=$1 AND status='processing' AND lock_token=$2 FOR UPDATE")
@@ -388,8 +441,10 @@ async fn fail_or_retry(
             .execute(&mut *tx)
             .await?;
     } else {
-        sqlx::query("UPDATE invoice_extraction_jobs SET status='queued',locked_at=NULL,lock_token=NULL,last_error=$3,available_at=NOW()+make_interval(secs => (30 * power(2, attempts - 1))::int),updated_at=NOW() WHERE invoice_id=$1 AND lock_token=$2")
-            .bind(id).bind(lock_token).bind(safe_error).execute(&mut *tx).await?;
+        let delay = retry_delay(attempts, retry_after);
+        sqlx::query("UPDATE invoice_extraction_jobs SET status='queued',locked_at=NULL,lock_token=NULL,last_error=$3,available_at=NOW()+make_interval(secs => $4::double precision),updated_at=NOW() WHERE invoice_id=$1 AND lock_token=$2")
+            .bind(id).bind(lock_token).bind(safe_error).bind(delay.as_secs() as i64).execute(&mut *tx).await?;
+        tracing::info!(invoice_id=%id, attempts, retry_in_seconds=delay.as_secs(), "invoice extraction retry scheduled");
     }
     tx.commit().await?;
     Ok(())
@@ -398,6 +453,8 @@ async fn fail_or_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
+
     #[test]
     fn parses_structured_response_and_usage() {
         let document = json!({"supplier_name":"Acme","invoice_number":null,"invoice_date":"2026-07-17","currency":"USD","subtotal":"10.00","tax":null,"fees":null,"discount":null,"total":"10.00","line_items":[]});
@@ -426,5 +483,36 @@ mod tests {
             line_items: vec![],
         };
         assert!(validate_provider(&invalid).is_err());
+    }
+
+    #[test]
+    fn calculates_capped_exponential_retry_delays() {
+        let delays = (1..=7)
+            .map(|attempt| base_retry_delay(attempt).as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, vec![30, 60, 120, 240, 480, 900, 900]);
+    }
+
+    #[test]
+    fn parses_retry_after_seconds_and_http_date() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let later = now + Duration::from_secs(120);
+        assert_eq!(
+            parse_retry_after(Some("75"), now),
+            Some(Duration::from_secs(75))
+        );
+        assert_eq!(
+            parse_retry_after(Some(&httpdate::fmt_http_date(later)), now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(parse_retry_after(Some("not-a-delay"), now), None);
+    }
+
+    #[test]
+    fn provider_retry_after_is_a_minimum_delay() {
+        let requested = Duration::from_secs(1_800);
+        let delay = retry_delay(1, Some(requested));
+        assert!(delay >= requested);
+        assert!(delay <= requested + Duration::from_secs(7));
     }
 }

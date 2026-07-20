@@ -6,6 +6,7 @@ use axum::{
 use bigdecimal::BigDecimal;
 use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{ApiError, AppState, authenticated_subject};
@@ -227,6 +228,32 @@ struct ReviewLine {
     line_total: Option<String>,
 }
 
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PriceChange {
+    id: Uuid,
+    description: String,
+    unit: Option<String>,
+    currency: String,
+    previous_unit_price: String,
+    current_unit_price: String,
+    percentage_change: String,
+    previous_invoice_date: NaiveDate,
+}
+
+struct ReviewedLine {
+    line_id: Uuid,
+    position: i32,
+    sku: Option<String>,
+    description: String,
+    quantity: Option<BigDecimal>,
+    unit: Option<String>,
+    unit_price: Option<BigDecimal>,
+    line_total: Option<BigDecimal>,
+    comparison_key: Option<String>,
+    comparison_unit: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ReviewInput {
@@ -287,15 +314,22 @@ pub(crate) async fn put_review(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
     Json(input): Json<ReviewInput>,
-) -> Result<Json<Review>, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let member = membership(&state, &headers).await?;
     let input = validate_review(input)?;
-    let mut tx = state.pool.begin().await.map_err(crate::database_error)?;
     let invoice_date = input
         .invoice_date
         .as_deref()
         .map(parse_review_date)
         .transpose()?;
+    let subtotal = parse_decimal(&input.subtotal, 4)?;
+    let tax = parse_decimal(&input.tax, 4)?;
+    let fees = parse_decimal(&input.fees, 4)?;
+    let discount = parse_decimal(&input.discount, 4)?;
+    let total = parse_decimal(&input.total, 4)?;
+    let lines = reviewed_lines(&input.line_items)?;
+
+    let mut tx = state.pool.begin().await.map_err(crate::database_error)?;
     let changed = sqlx::query("UPDATE invoices SET supplier_name=$3,invoice_date=COALESCE($4,invoice_date),status='ready',updated_at=NOW() WHERE id=$1 AND restaurant_id=$2 AND status='needs_review'")
         .bind(id).bind(member.restaurant_id).bind(&input.supplier_name).bind(invoice_date)
         .execute(&mut *tx).await.map_err(crate::database_error)?.rows_affected();
@@ -307,20 +341,111 @@ pub(crate) async fn put_review(
     }
     sqlx::query("UPDATE invoice_extractions SET supplier_name=$2,invoice_number=$3,invoice_date=$4,currency=$5,subtotal=$6,tax=$7,fees=$8,discount=$9,total=$10,reviewed_by=$11,reviewed_at=NOW(),updated_at=NOW() WHERE invoice_id=$1")
         .bind(id).bind(&input.supplier_name).bind(&input.invoice_number).bind(invoice_date).bind(&input.currency)
-        .bind(parse_decimal(&input.subtotal, 4)?).bind(parse_decimal(&input.tax, 4)?).bind(parse_decimal(&input.fees, 4)?).bind(parse_decimal(&input.discount, 4)?).bind(parse_decimal(&input.total, 4)?).bind(member.user_id)
+        .bind(subtotal).bind(tax).bind(fees).bind(discount).bind(total).bind(member.user_id)
         .execute(&mut *tx).await.map_err(crate::database_error)?;
     sqlx::query("DELETE FROM invoice_line_items WHERE invoice_id=$1")
         .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(crate::database_error)?;
-    for (position, line) in input.line_items.iter().enumerate() {
-        sqlx::query("INSERT INTO invoice_line_items (id,invoice_id,position,sku,description,quantity,unit,unit_price,line_total) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
-            .bind(Uuid::now_v7()).bind(id).bind(position as i32).bind(&line.sku).bind(&line.description).bind(parse_decimal(&line.quantity,6)?).bind(&line.unit).bind(parse_decimal(&line.unit_price,4)?).bind(parse_decimal(&line.line_total,4)?)
-            .execute(&mut *tx).await.map_err(crate::database_error)?;
+    if !lines.is_empty() {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO invoice_line_items
+             (id,invoice_id,position,sku,description,quantity,unit,unit_price,line_total,
+              comparison_key,comparison_unit) ",
+        );
+        query.push_values(&lines, |mut row, line| {
+            row.push_bind(line.line_id)
+                .push_bind(id)
+                .push_bind(line.position)
+                .push_bind(&line.sku)
+                .push_bind(&line.description)
+                .push_bind(&line.quantity)
+                .push_bind(&line.unit)
+                .push_bind(&line.unit_price)
+                .push_bind(&line.line_total)
+                .push_bind(&line.comparison_key)
+                .push_bind(&line.comparison_unit);
+        });
+        query
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::database_error)?;
     }
     tx.commit().await.map_err(crate::database_error)?;
-    get_review(State(state), headers, Path(id)).await
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn price_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<PriceChange>>, ApiError> {
+    let member = membership(&state, &headers).await?;
+    let changes = sqlx::query_as::<_, PriceChange>(
+        "WITH current_invoice AS (
+            SELECT invoice.id,invoice.restaurant_id,invoice.supplier_name,invoice.invoice_date,
+                   invoice.created_at,extraction.currency
+            FROM invoices invoice
+            JOIN invoice_extractions extraction ON extraction.invoice_id=invoice.id
+            WHERE invoice.id=$1 AND invoice.restaurant_id=$2 AND invoice.status='ready'
+         ), current_keys AS (
+            SELECT DISTINCT line.comparison_key,line.comparison_unit
+            FROM invoice_line_items line
+            JOIN current_invoice ON current_invoice.id=line.invoice_id
+            WHERE line.comparison_key IS NOT NULL AND line.comparison_unit IS NOT NULL
+              AND line.unit_price>0
+         ), candidate_lines AS (
+            SELECT line.id,line.invoice_id,line.position,line.description,line.unit,line.unit_price,
+                   line.comparison_key,line.comparison_unit,invoice.invoice_date,
+                   invoice.created_at,extraction.currency,
+                   COUNT(*) OVER (
+                       PARTITION BY line.invoice_id,line.comparison_key,line.comparison_unit
+                   ) AS matching_lines
+            FROM current_invoice current
+            JOIN invoices invoice ON invoice.restaurant_id=current.restaurant_id
+              AND invoice.status='ready'
+              AND LOWER(BTRIM(invoice.supplier_name))=LOWER(BTRIM(current.supplier_name))
+              AND (invoice.invoice_date,invoice.created_at,invoice.id)
+                  <=(current.invoice_date,current.created_at,current.id)
+            JOIN invoice_extractions extraction ON extraction.invoice_id=invoice.id
+              AND extraction.currency=current.currency
+            JOIN invoice_line_items line ON line.invoice_id=invoice.id AND line.unit_price>0
+            JOIN current_keys key ON key.comparison_key=line.comparison_key
+              AND key.comparison_unit=line.comparison_unit
+         ), history AS (
+            SELECT id,invoice_id,position,description,unit,unit_price,currency,invoice_date,
+                   LAG(unit_price) OVER item_history AS previous_unit_price,
+                   LAG(invoice_date) OVER item_history AS previous_invoice_date
+            FROM candidate_lines
+            WHERE matching_lines=1
+            WINDOW item_history AS (
+                PARTITION BY comparison_key,comparison_unit
+                ORDER BY invoice_date,created_at,invoice_id
+            )
+         ), changes AS (
+            SELECT id,position,description,unit,currency,previous_unit_price,unit_price,
+                   ROUND(((unit_price-previous_unit_price)/previous_unit_price)*100,2)
+                       AS percentage_change,
+                   previous_invoice_date
+            FROM history
+            WHERE invoice_id=$1 AND previous_unit_price IS NOT NULL
+              AND ABS(unit_price-previous_unit_price)*100>=previous_unit_price*5
+         )
+         SELECT id,description,unit,currency,
+                previous_unit_price::text AS previous_unit_price,
+                unit_price::text AS current_unit_price,
+                percentage_change::text AS percentage_change,previous_invoice_date
+         FROM changes
+         ORDER BY ABS(percentage_change) DESC,position",
+    )
+    .bind(id)
+    .bind(member.restaurant_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(crate::database_error)?;
+    Ok(Json(changes))
 }
 
 pub(crate) async fn retry(
@@ -441,6 +566,44 @@ pub(crate) fn strict_decimal(value: &str, scale: usize) -> Result<BigDecimal, &'
         return Err("invalid decimal");
     }
     value.parse().map_err(|_| "invalid decimal")
+}
+
+fn comparison_key(sku: Option<&str>, description: &str) -> Option<String> {
+    if let Some(sku) = sku.and_then(normalized_value) {
+        Some(format!("sku:{sku}"))
+    } else {
+        normalized_value(description).map(|description| format!("description:{description}"))
+    }
+}
+
+fn normalized_value(value: &str) -> Option<String> {
+    let normalized = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn reviewed_lines(lines: &[ReviewLineInput]) -> Result<Vec<ReviewedLine>, ApiError> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(position, line)| {
+            Ok(ReviewedLine {
+                line_id: Uuid::now_v7(),
+                position: position as i32,
+                sku: line.sku.clone(),
+                description: line.description.clone(),
+                quantity: parse_decimal(&line.quantity, 6)?,
+                unit: line.unit.clone(),
+                unit_price: parse_decimal(&line.unit_price, 4)?,
+                line_total: parse_decimal(&line.line_total, 4)?,
+                comparison_key: comparison_key(line.sku.as_deref(), &line.description),
+                comparison_unit: line.unit.as_deref().and_then(normalized_value),
+            })
+        })
+        .collect()
 }
 
 fn trim_optional(value: Option<String>) -> Option<String> {
@@ -609,5 +772,22 @@ mod tests {
         assert!(parse_decimal(&Some("1_000".into()), 4).is_err());
         assert!(parse_decimal(&Some("1000000000000".into()), 6).is_err());
         assert!(parse_decimal(&None, 4).unwrap().is_none());
+    }
+
+    #[test]
+    fn builds_conservative_item_comparison_keys() {
+        assert_eq!(
+            comparison_key(Some(" CHK-42 "), "Chicken").as_deref(),
+            Some("sku:chk42")
+        );
+        assert_eq!(
+            comparison_key(None, "Chicken Breast, 10 KG").as_deref(),
+            Some("description:chickenbreast10kg")
+        );
+        assert_eq!(
+            normalized_value(" Case / 10 lb ").as_deref(),
+            Some("case10lb")
+        );
+        assert_eq!(comparison_key(None, "鶏肉"), None);
     }
 }

@@ -2177,6 +2177,8 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "dotenvy",
+ "fastrand",
+ "httpdate",
  "jsonwebtoken",
  "reqwest",
  "serde",

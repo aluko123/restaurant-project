@@ -7,3 +7,4 @@ target/
 *.tsbuildinfo
 .DS_Store
 *.log
+sample-invoices/
