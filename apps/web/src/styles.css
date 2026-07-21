@@ -355,6 +355,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .app-header { color: var(--ink); border-bottom-color: var(--ink); }
 .restaurant-label { margin-left: auto; }
 .restaurant-label span { display: block; opacity: 0.55; }
+.workspace-nav { min-height: 54px; padding: 0 clamp(20px, 5vw, 64px); display: flex; align-items: stretch; gap: 24px; border-bottom: 1px solid var(--ink); }
+.workspace-nav button { min-height: 54px; padding: 0; border: 0; border-bottom: 4px solid transparent; color: var(--ink); background: transparent; font-family: var(--mono); font-size: .68rem; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
+.workspace-nav button[aria-current="page"] { border-bottom-color: var(--tomato); }
 .app-workspace { min-height: calc(100vh - 92px); display: grid; }
 .shift-rail { display: none; }
 .today-brief { width: min(100%, 1000px); padding: clamp(42px, 7vw, 92px) clamp(20px, 6vw, 84px); }
@@ -382,6 +385,19 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .form-error { margin: 0; padding: 12px; border-left: 4px solid var(--tomato); font-family: var(--serif); }
 .restaurant-meta { margin-top: 44px; font-family: var(--mono); font-size: 0.62rem; font-weight: 700; text-transform: uppercase; }
 .invoice-workspace { width: min(1180px, 100%); margin: 0 auto; padding: clamp(36px, 6vw, 76px) clamp(20px, 5vw, 64px); }
+.menu-workspace { width: min(1080px, 100%); margin: 0 auto; padding: clamp(36px, 6vw, 76px) clamp(20px, 5vw, 64px); }
+.menu-grid { margin-top: 32px; display: grid; gap: 44px; }
+.menu-price-fields { display: grid; grid-template-columns: minmax(0, 2fr) minmax(90px, 1fr); gap: 12px; }
+.optional-label { font-family: var(--serif); font-size: .75rem; font-style: italic; font-weight: 400; text-transform: none; }
+.menu-list h2 { margin: 0; font-size: 1.7rem; text-transform: uppercase; }
+.menu-cards { display: grid; gap: 12px; padding-top: 18px; }
+.menu-card { min-height: 96px; padding: 18px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid var(--ink); background: rgba(247,240,226,.55); }
+.menu-card-copy { min-width: 0; }
+.menu-card h3 { margin: 6px 0 0; overflow-wrap: anywhere; font-size: 1.2rem; text-transform: uppercase; }
+.menu-card strong { white-space: nowrap; font-size: 1.25rem; }
+.menu-import-form { margin-top: 18px; }
+.import-heading { margin-top: 42px; }
+.line-card input[type="checkbox"] { width: 24px; min-height: 24px; }
 .invoice-heading { padding-bottom: 24px; border-bottom: 4px solid var(--ink); }
 .invoice-heading h1 { margin: 12px 0 8px; font-size: clamp(2.5rem, 7vw, 5.5rem); line-height: 0.9; letter-spacing: -0.07em; text-transform: uppercase; }
 .invoice-heading > p:last-child { margin: 0; font-family: var(--mono); font-size: 0.68rem; text-transform: uppercase; }
@@ -445,6 +461,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .landing-footer { grid-template-columns: 1fr 2fr 1fr; }
   .setup-action { grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; }
   .invoice-grid { grid-template-columns: minmax(300px, 0.75fr) minmax(360px, 1.25fr); }
+  .menu-grid { grid-template-columns: minmax(300px, .8fr) minmax(360px, 1.2fr); }
   .invoice-card { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
 }
 

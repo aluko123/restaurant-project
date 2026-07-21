@@ -6,6 +6,7 @@ use aws_sdk_s3::{
     presigning::PresigningConfig,
     primitives::ByteStream,
 };
+use bytes::Bytes;
 use std::{env, time::Duration};
 
 #[derive(Clone)]
@@ -34,7 +35,7 @@ impl ObjectStorage {
         })
     }
 
-    pub(crate) async fn put(&self, key: &str, content_type: &str, body: Vec<u8>) -> Result<()> {
+    pub(crate) async fn put(&self, key: &str, content_type: &str, body: Bytes) -> Result<()> {
         self.client
             .put_object()
             .bucket(&self.bucket)
@@ -58,7 +59,7 @@ impl ObjectStorage {
         Ok(())
     }
 
-    pub(crate) async fn get(&self, key: &str) -> Result<Vec<u8>> {
+    pub(crate) async fn get(&self, key: &str) -> Result<Bytes> {
         let object = self
             .client
             .get_object()
@@ -72,8 +73,7 @@ impl ObjectStorage {
             .collect()
             .await
             .context("R2 object download failed")?
-            .into_bytes()
-            .to_vec())
+            .into_bytes())
     }
 
     pub(crate) async fn signed_get_url(&self, key: &str) -> Result<String> {

@@ -6,10 +6,13 @@ type AppProps = {
 };
 
 type Restaurant = { id: string; name: string; city: string; serviceStyle: ServiceStyle; role: string };
-type Invoice = { id: string; supplierName: string; invoiceDate: string; originalFilename: string; contentType: string; sizeBytes: number; status: string; createdAt: string };
+type Invoice = { id: string; supplierName: string; invoiceDate: string; originalFilename: string; contentType: string; sizeBytes: number; status: string; delayed: boolean; createdAt: string };
 type ReviewLine = { id?: string; sku: string | null; description: string; quantity: string | null; unit: string | null; unitPrice: string | null; lineTotal: string | null };
 type Review = { invoiceId: string; supplierName: string; invoiceNumber: string | null; invoiceDate: string | null; currency: string; subtotal: string | null; tax: string | null; fees: string | null; discount: string | null; total: string | null; lineItems: ReviewLine[] };
 type PriceChange = { id: string; description: string; unit: string | null; currency: string; previousUnitPrice: string; currentUnitPrice: string; percentageChange: string; previousInvoiceDate: string };
+type MenuItem = { id: string; name: string; category: string | null; sellingPrice: string; currency: string; active: boolean };
+type MenuImport = { id: string; originalFilename: string; status: string; delayed: boolean; createdAt: string };
+type MenuImportItem = { id: string; name: string; category: string | null; sellingPrice: string | null; currency: string | null; selected?: boolean };
 type ServiceStyle = "counter_service" | "full_service" | "fast_casual" | "cafe_bakery" | "bar";
 type AppState = { status: "loading" } | { status: "error"; message: string } | { status: "ready"; restaurant: Restaurant | null };
 
@@ -28,6 +31,7 @@ export function App({ authConfigured }: AppProps) {
 function AuthenticatedApp() {
   const { isLoading, user, signIn, signUp, signOut, getAccessToken } = useAuth();
   const [appState, setAppState] = useState<AppState>({ status: "loading" });
+  const [workspace, setWorkspace] = useState<"invoices" | "menu">("invoices");
   const apiUrl = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
 
   useEffect(() => {
@@ -80,9 +84,68 @@ function AuthenticatedApp() {
   return (
     <main className="app-shell">
       <AppHeader restaurantName={restaurant.name} onSignOut={() => signOut()} />
-      <InvoiceWorkspace restaurant={restaurant} request={request} />
+      <nav className="workspace-nav" aria-label="Daybook sections">
+        <button type="button" aria-current={workspace === "invoices" ? "page" : undefined} onClick={() => setWorkspace("invoices")}>Invoices</button>
+        <button type="button" aria-current={workspace === "menu" ? "page" : undefined} onClick={() => setWorkspace("menu")}>Menu</button>
+      </nav>
+      <div hidden={workspace !== "invoices"}><InvoiceWorkspace restaurant={restaurant} request={request} /></div>
+      <div hidden={workspace !== "menu"}><MenuWorkspace restaurant={restaurant} request={request} /></div>
     </main>
   );
+}
+
+function MenuWorkspace({ restaurant, request }: { restaurant: Restaurant; request: <T>(path: string, init?: RequestInit) => Promise<T> }) {
+  const [items, setItems] = useState<MenuItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [name, setName] = useState("");
+  const [category, setCategory] = useState("");
+  const [price, setPrice] = useState("");
+  const [currency, setCurrency] = useState("USD");
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [imports, setImports] = useState<MenuImport[]>([]);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [review, setReview] = useState<{ import: MenuImport; items: MenuImportItem[] } | null>(null);
+  const [retryingId, setRetryingId] = useState("");
+  const [openingId, setOpeningId] = useState("");
+
+  const loadMenu = useCallback(() => {
+    setLoading(true);
+    setError("");
+    void request<MenuItem[]>("/v1/menu-items")
+      .then(setItems)
+      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Your menu couldn't load."))
+      .finally(() => setLoading(false));
+  }, [request]);
+
+  const loadImports = useCallback(() => {
+    void request<MenuImport[]>("/v1/menu-imports")
+      .then(setImports)
+      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Menu imports couldn't load."));
+  }, [request]);
+
+  useEffect(loadMenu, [loadMenu]);
+  useEffect(loadImports, [loadImports]);
+  useEffect(() => {
+    if (!imports.some((menuImport) => menuImport.status === "processing")) return;
+    const timer = window.setInterval(loadImports, 5000);
+    return () => window.clearInterval(timer);
+  }, [imports, loadImports]);
+  async function submit(event:FormEvent<HTMLFormElement>){event.preventDefault();setError("");setNotice("");if(!name.trim()||!price.trim()){setError("Add the menu item name and selling price.");return}setSaving(true);try{const item=await request<MenuItem>("/v1/menu-items",{method:"POST",body:JSON.stringify({name,category:category||null,sellingPrice:price,currency})});setItems((current)=>[...current,item].sort((a,b)=>(a.category??"zzz").localeCompare(b.category??"zzz")||a.name.localeCompare(b.name)));setName("");setCategory("");setPrice("");setNotice(`${item.name} added to the menu.`);}catch(reason){setError(reason instanceof Error?reason.message:"The menu item couldn't be saved.");}finally{setSaving(false)}}
+  async function uploadMenu(e:FormEvent<HTMLFormElement>){e.preventDefault();setError("");setNotice("");if(!importFile){setError("Choose one menu photo or PDF.");return}if(importFile.size>10*1024*1024){setError("Choose a file smaller than 10 MiB.");return}const body=new FormData();body.append("file",importFile);setUploading(true);try{const value=await request<MenuImport>("/v1/menu-imports",{method:"POST",body});setImports(v=>[value,...v]);setImportFile(null);setNotice("Menu uploaded. Extraction is processing.");(e.currentTarget as HTMLFormElement).reset()}catch(reason){setError(reason instanceof Error?reason.message:"Menu upload failed. Try again.")}finally{setUploading(false)}}
+  async function openReview(id:string){setError("");try{const value=await request<{import:MenuImport;items:MenuImportItem[]}>(`/v1/menu-imports/${id}`);setReview({...value,items:value.items.map(v=>({...v,selected:Boolean(v.name.trim()&&v.sellingPrice&&v.currency)}))})}catch(reason){setError(reason instanceof Error?reason.message:"Review couldn't open.")}}
+  async function retryMenu(menuImport:MenuImport){setRetryingId(menuImport.id);setError("");try{await request(`/v1/menu-imports/${menuImport.id}/retry`,{method:"POST"});loadImports()}catch(reason){setError(reason instanceof Error?reason.message:"The menu couldn't be retried.")}finally{setRetryingId("")}}
+  async function openOriginal(menuImport:MenuImport){setOpeningId(menuImport.id);setError("");const popup=window.open("","_blank");if(popup)popup.opener=null;try{const {url}=await request<{url:string}>(`/v1/menu-imports/${menuImport.id}/file`);if(popup)popup.location.href=url;else window.open(url,"_blank","noopener,noreferrer")}catch(reason){popup?.close();setError(reason instanceof Error?reason.message:"The original couldn't open. Please try again.")}finally{setOpeningId("")}}
+  async function approve(){if(!review)return;setError("");const selected=review.items.filter(v=>v.selected);if(!selected.length){setError("Select at least one valid item.");return}if(selected.some(v=>!isValidMenuImportItem(v))){setError("Check each selected item's name, positive price, and three-letter currency.");return}setSaving(true);try{const counts=await request<{imported:number;skipped:number}>(`/v1/menu-imports/${review.import.id}`,{method:"PUT",body:JSON.stringify({items:selected.map(({id,name,category,sellingPrice,currency})=>({id,name,category,sellingPrice,currency}))})});setNotice(`${counts.imported} items imported${counts.skipped?`; ${counts.skipped} duplicates skipped`:""}.`);setReview(null);loadMenu();loadImports()}catch(reason){setError(reason instanceof Error?reason.message:"Items couldn't be imported.")}finally{setSaving(false)}}
+  if(review)return <section className="review-shell"><button className="text-button" type="button" onClick={()=>{setError("");setReview(null)}}>← Back to menu</button><h1>Review menu</h1><p>Edit and select items with a clear selling price. Nothing is added until you import.</p><div className="review-form">{review.items.map((row,index)=><article className="line-card" key={row.id}><label><input type="checkbox" checked={Boolean(row.selected)} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,selected:e.target.checked}:x)}))}/> Import this item</label><label>Name<input value={row.name} maxLength={50} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,name:e.target.value}:x)}))}/></label><label>Category<input value={row.category??""} maxLength={20} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,category:e.target.value||null}:x)}))}/></label><label>Price<input inputMode="decimal" value={row.sellingPrice??""} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,sellingPrice:e.target.value||null}:x)}))}/></label><label>Currency<input maxLength={3} value={row.currency??""} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,currency:e.target.value.toUpperCase()||null}:x)}))}/></label><button className="text-button" type="button" onClick={()=>setReview(v=>v&&({...v,items:v.items.filter((_,i)=>i!==index)}))}>Remove row</button></article>)}{error&&<p className="form-error" role="alert">{error}</p>}<button className="ledger-button" type="button" disabled={saving} onClick={approve}>{saving?"Importing…":"Import selected items"}</button></div></section>;
+  return <section className="menu-workspace" aria-labelledby="menu-heading"><header className="invoice-heading"><p className="section-code">DB—MENU / TOP ITEMS</p><h1 id="menu-heading">{restaurant.name} menu</h1><p>Add items by hand or review one menu photo or PDF.</p></header><div className="menu-grid"><div><form className="invoice-form menu-form" onSubmit={submit} noValidate><h2>Add a menu item</h2><p>Record the name customers see and its current selling price.</p><div className="ledger-field"><label htmlFor="menu-name">Menu item</label><input id="menu-name" value={name} onChange={e=>setName(e.target.value)} maxLength={50} required/></div><div className="ledger-field"><label htmlFor="menu-category">Category <span className="optional-label">Optional</span></label><input id="menu-category" value={category} onChange={e=>setCategory(e.target.value)} maxLength={20}/></div><div className="menu-price-fields"><div className="ledger-field"><label htmlFor="menu-price">Selling price</label><input id="menu-price" inputMode="decimal" value={price} onChange={e=>setPrice(e.target.value)} required/></div><div className="ledger-field"><label htmlFor="menu-currency">Currency</label><select id="menu-currency" value={currency} onChange={e=>setCurrency(e.target.value)}><option>USD</option><option>CAD</option><option>GBP</option><option>EUR</option></select></div></div><button className="ledger-button" disabled={saving}>{saving?"Adding item…":"Add to menu"}</button></form><form className="invoice-form menu-import-form" onSubmit={uploadMenu}><h2>Import from photo</h2><p>Upload one PDF or photo. You'll review every item before it is added.</p><label className="file-button" htmlFor="menu-file">Choose photo or PDF</label><input className="visually-hidden" id="menu-file" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" onChange={e=>setImportFile(e.target.files?.[0]??null)}/>{importFile&&<span className="selected-file">{importFile.name}</span>}<button className="ledger-button" disabled={uploading}>{uploading?"Uploading…":"Upload menu"}</button></form>{error&&<p className="form-error" role="alert">{error}</p>}{notice&&<p className="success-notice" role="status">{notice}</p>}</div><div className="menu-list"><div className="list-heading"><h2>Active menu items</h2><button className="text-button" type="button" onClick={loadMenu}>Refresh</button></div>{loading?<p role="status">Loading menu…</p>:items.length===0?<p className="empty-state">No menu items yet.</p>:<div className="menu-cards">{items.map(item=><article className="menu-card" key={item.id}><div><p className="invoice-status">{item.category??"Uncategorized"}</p><h3>{item.name}</h3></div><strong>{formatMoney(item.sellingPrice,item.currency)}</strong></article>)}</div>}<div className="list-heading import-heading"><h2>Menu imports</h2></div>{imports.length===0?<p className="empty-state">No menu imports yet.</p>:<div className="menu-cards">{imports.map(value=><article className="menu-card" key={value.id}><div className="menu-card-copy"><p className="invoice-status">{importStatusLabel(value.status, value.delayed, "menu")}</p><h3>{value.originalFilename}</h3></div><div className="card-actions">{value.status==="needs_review"&&<button className="file-button" type="button" onClick={()=>void openReview(value.id)}>Review menu</button>}{value.status==="failed"&&<button className="file-button" type="button" disabled={retryingId===value.id} onClick={()=>void retryMenu(value)}>{retryingId===value.id?"Trying again…":"Retry"}</button>}<button className="text-button" type="button" disabled={openingId===value.id} onClick={()=>void openOriginal(value)}>{openingId===value.id?"Opening…":"Original"}</button></div></article>)}</div>}</div></div></section>;
+}
+
+function isValidMenuImportItem(item: MenuImportItem) {
+  const price = item.sellingPrice?.trim() ?? "";
+  return Boolean(item.name.trim()) && /^\d+(?:\.\d{1,4})?$/.test(price) && Number(price) > 0 && /^[A-Z]{3}$/.test(item.currency?.trim() ?? "");
 }
 
 function InvoiceWorkspace({ restaurant, request }: { restaurant: Restaurant; request: <T>(path: string, init?: RequestInit) => Promise<T> }) {
@@ -170,13 +233,20 @@ function InvoiceWorkspace({ restaurant, request }: { restaurant: Restaurant; req
       <div className="invoice-list"><div className="list-heading"><h2 id="invoices-heading">Recent invoices</h2>{!loading && <button className="text-button" type="button" onClick={loadInvoices}>Refresh</button>}</div>
         {listError && <p className="form-error" role="alert">{listError}</p>}
         {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload your first supplier invoice.</p> :
-          <div className="invoice-cards">{invoices.map((invoice) => <article className="invoice-card" key={invoice.id}><div><p className="invoice-status">{statusText(invoice.status)}</p><h3>{invoice.supplierName}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><div className="card-actions">{invoice.status === "needs_review" && <button className="ledger-button" type="button" onClick={() => setReviewId(invoice.id)}>Review invoice</button>}{invoice.status === "failed" && <button className="ledger-button" type="button" disabled={retryingId===invoice.id} onClick={() => void retry(invoice)}>{retryingId===invoice.id ? "Trying again…" : "Try again"}</button>}{invoice.status === "ready" && <button className="ledger-button" type="button" onClick={() => setPriceChangeId(invoice.id)}>Price changes</button>}<button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void openOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></div></article>)}</div>}
+          <div className="invoice-cards">{invoices.map((invoice) => <article className="invoice-card" key={invoice.id}><div><p className="invoice-status">{importStatusLabel(invoice.status, invoice.delayed, "invoice")}</p><h3>{invoice.supplierName}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><div className="card-actions">{invoice.status === "needs_review" && <button className="ledger-button" type="button" onClick={() => setReviewId(invoice.id)}>Review invoice</button>}{invoice.status === "failed" && <button className="ledger-button" type="button" disabled={retryingId===invoice.id} onClick={() => void retry(invoice)}>{retryingId===invoice.id ? "Trying again…" : "Try again"}</button>}{invoice.status === "ready" && <button className="ledger-button" type="button" onClick={() => setPriceChangeId(invoice.id)}>Price changes</button>}<button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void openOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></div></article>)}</div>}
       </div>
     </div>
   </section>;
 }
 
-function statusText(status: string) { return status === "needs_review" ? "Review invoice" : status === "ready" ? "Ready" : status === "failed" ? "Couldn’t read invoice" : "Processing"; }
+function importStatusLabel(status: string, delayed: boolean, document: "invoice" | "menu") {
+  if (status === "processing") return delayed ? "Taking longer than usual" : `Reading ${document}…`;
+  if (status === "failed") return "Couldn’t finish import";
+  if (status === "needs_review") return "Ready to review";
+  if (status === "ready") return "Ready";
+  if (status === "imported") return "Imported";
+  return status.replaceAll("_", " ");
+}
 
 function ReviewInvoice({ invoiceId, request, onBack, onApproved, onViewOriginal }: { invoiceId:string; request:<T>(path:string, init?:RequestInit)=>Promise<T>; onBack:()=>void; onApproved:()=>void; onViewOriginal:()=>void }) {
   const [review,setReview]=useState<Review|null>(null); const [error,setError]=useState(""); const [saving,setSaving]=useState(false);

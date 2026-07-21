@@ -1,7 +1,10 @@
 mod auth;
 mod extraction;
 mod invoices;
+mod menu;
+mod menu_imports;
 mod storage;
+mod uploads;
 
 use std::{env, net::SocketAddr};
 
@@ -110,6 +113,11 @@ async fn main() -> Result<()> {
     tokio::spawn(extraction::run_worker(
         pool.clone(),
         storage.clone(),
+        gemini.clone(),
+    ));
+    tokio::spawn(menu_imports::run_worker(
+        pool.clone(),
+        storage.clone(),
         gemini,
     ));
 
@@ -167,6 +175,19 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             "/v1/invoices/{id}/price-changes",
             get(invoices::price_changes),
         )
+        .route("/v1/menu-items", get(menu::list).post(menu::create))
+        .route(
+            "/v1/menu-imports",
+            get(menu_imports::list)
+                .post(menu_imports::create)
+                .layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/menu-imports/{id}",
+            get(menu_imports::review).put(menu_imports::approve),
+        )
+        .route("/v1/menu-imports/{id}/file", get(menu_imports::file_url))
+        .route("/v1/menu-imports/{id}/retry", post(menu_imports::retry))
         .with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

@@ -10,8 +10,8 @@ anyhow = "1.0"
 aws-credential-types = "=1.2.3"
 aws-sdk-s3 = "=1.96.0"
 axum = { version = "0.8.9", features = ["multipart"] }
-base64 = "0.22"
 bigdecimal = { version = "0.4", features = ["serde"] }
+bytes = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 fastrand = "2.3"

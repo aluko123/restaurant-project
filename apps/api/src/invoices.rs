@@ -4,20 +4,23 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use bigdecimal::BigDecimal;
+use bytes::Bytes;
 use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{ApiError, AppState, authenticated_subject};
+use crate::{
+    ApiError, AppState, authenticated_subject,
+    uploads::{UploadedFile, multipart_error},
+};
 
-const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SUPPLIER_CHARS: usize = 120;
 
 #[derive(sqlx::FromRow)]
-struct Membership {
-    restaurant_id: Uuid,
-    user_id: Uuid,
+pub(crate) struct Membership {
+    pub(crate) restaurant_id: Uuid,
+    pub(crate) user_id: Uuid,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -30,6 +33,7 @@ pub(crate) struct Invoice {
     content_type: String,
     size_bytes: i64,
     status: String,
+    delayed: bool,
     created_at: chrono::DateTime<Utc>,
 }
 
@@ -53,7 +57,7 @@ struct Upload {
     original_filename: String,
     content_type: &'static str,
     extension: &'static str,
-    bytes: Vec<u8>,
+    bytes: Bytes,
 }
 
 #[derive(Serialize)]
@@ -91,7 +95,7 @@ pub(crate) async fn create(
           content_type, size_bytes, object_key, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing')
          RETURNING id, supplier_name, invoice_date, original_filename, content_type,
-                   size_bytes, status, created_at",
+                   size_bytes, status, FALSE AS delayed, created_at",
         )
         .bind(id)
         .bind(membership.restaurant_id)
@@ -135,7 +139,9 @@ pub(crate) async fn list(
     let membership = membership(&state, &headers).await?;
     let invoices = sqlx::query_as::<_, Invoice>(
         "SELECT id, supplier_name, invoice_date, original_filename, content_type,
-                size_bytes, status, created_at
+                size_bytes, status,
+                status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes' AS delayed,
+                created_at
          FROM invoices WHERE restaurant_id = $1
          ORDER BY created_at DESC, id DESC LIMIT 100",
     )
@@ -180,7 +186,10 @@ pub(crate) async fn file_url(
     Ok(Json(FileUrl { url }))
 }
 
-async fn membership(state: &AppState, headers: &HeaderMap) -> Result<Membership, ApiError> {
+pub(crate) async fn membership(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Membership, ApiError> {
     let subject = authenticated_subject(state, headers).await?;
     sqlx::query_as::<_, Membership>(
         "SELECT m.restaurant_id, u.id AS user_id FROM users u
@@ -623,7 +632,7 @@ async fn parse_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
             Some("invoiceDate") => date = Some(field.text().await.map_err(multipart_error)?),
             Some("file") => {
                 let filename = field.file_name().unwrap_or("").to_owned();
-                let bytes = field.bytes().await.map_err(multipart_error)?.to_vec();
+                let bytes = field.bytes().await.map_err(multipart_error)?;
                 file = Some((filename, bytes));
             }
             _ => {}
@@ -635,24 +644,14 @@ async fn parse_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
         StatusCode::UNPROCESSABLE_ENTITY,
         "Choose an invoice file.",
     ))?;
-    validate_filename(&original_filename)?;
-    if bytes.is_empty() || bytes.len() > MAX_FILE_BYTES {
-        return Err(ApiError(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Invoice files must be between 1 byte and 10 MiB.",
-        ));
-    }
-    let (content_type, extension) = detect_file_type(&bytes).ok_or(ApiError(
-        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "Upload a PDF, JPEG, PNG, or WebP invoice.",
-    ))?;
+    let file = UploadedFile::validate(original_filename, bytes)?;
     Ok(Upload {
         supplier_name,
         invoice_date,
-        original_filename,
-        content_type,
-        extension,
-        bytes,
+        original_filename: file.original_filename,
+        content_type: file.content_type,
+        extension: file.extension,
+        bytes: file.bytes,
     })
 }
 
@@ -684,64 +683,13 @@ fn validate_date(value: &str) -> Result<NaiveDate, ApiError> {
     Ok(date)
 }
 
-fn validate_filename(value: &str) -> Result<(), ApiError> {
-    if value.trim().is_empty() || value.chars().count() > 255 || value.chars().any(char::is_control)
-    {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "The original filename is missing or too long.",
-        ));
-    }
-    Ok(())
-}
-
-fn detect_file_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
-    if bytes.starts_with(b"%PDF-") {
-        Some(("application/pdf", "pdf"))
-    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some(("image/jpeg", "jpg"))
-    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some(("image/png", "png"))
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some(("image/webp", "webp"))
-    } else {
-        None
-    }
-}
-
 fn object_key(restaurant_id: Uuid, invoice_id: Uuid, extension: &str) -> String {
     format!("restaurants/{restaurant_id}/invoices/{invoice_id}/original.{extension}")
-}
-
-fn multipart_error(error: axum::extract::multipart::MultipartError) -> ApiError {
-    tracing::debug!(%error, "invalid invoice multipart request");
-    ApiError(StatusCode::BAD_REQUEST, "The upload request was invalid.")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_supported_signatures_and_rejects_extension_only() {
-        assert_eq!(
-            detect_file_type(b"%PDF-1.7"),
-            Some(("application/pdf", "pdf"))
-        );
-        assert_eq!(
-            detect_file_type(&[0xff, 0xd8, 0xff, 0x00]),
-            Some(("image/jpeg", "jpg"))
-        );
-        assert_eq!(
-            detect_file_type(b"\x89PNG\r\n\x1a\nrest"),
-            Some(("image/png", "png"))
-        );
-        assert_eq!(
-            detect_file_type(b"RIFF0000WEBPrest"),
-            Some(("image/webp", "webp"))
-        );
-        assert_eq!(detect_file_type(b"invoice.pdf"), None);
-    }
 
     #[test]
     fn validates_supplier_and_date() {
