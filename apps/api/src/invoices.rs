@@ -34,6 +34,7 @@ pub(crate) struct Invoice {
     size_bytes: i64,
     status: String,
     delayed: bool,
+    price_change_count: i64,
     created_at: chrono::DateTime<Utc>,
 }
 
@@ -96,7 +97,8 @@ pub(crate) async fn create(
           content_type, size_bytes, object_key, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing')
          RETURNING id, supplier_name, invoice_date, original_filename, content_type,
-                   size_bytes, status, FALSE AS delayed, created_at",
+                   size_bytes, status, FALSE AS delayed, 0::bigint AS price_change_count,
+                   created_at",
         )
         .bind(id)
         .bind(membership.restaurant_id)
@@ -139,12 +141,44 @@ pub(crate) async fn list(
 ) -> Result<Json<Vec<Invoice>>, ApiError> {
     let membership = membership(&state, &headers).await?;
     let invoices = sqlx::query_as::<_, Invoice>(
-        "SELECT id, supplier_name, invoice_date, original_filename, content_type,
-                size_bytes, status,
-                status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes' AS delayed,
-                created_at
-         FROM invoices WHERE restaurant_id = $1
-         ORDER BY created_at DESC, id DESC LIMIT 100",
+        "WITH comparable_lines AS (
+            SELECT invoice.id AS invoice_id,invoice.restaurant_id,invoice.supplier_name,
+                   invoice.invoice_date,invoice.created_at,line.unit_price,line.comparison_key,
+                   line.comparison_unit,extraction.currency,
+                   COUNT(*) OVER (
+                       PARTITION BY line.invoice_id,line.comparison_key,line.comparison_unit
+                   ) AS matching_lines
+            FROM invoices invoice
+            JOIN invoice_extractions extraction ON extraction.invoice_id=invoice.id
+            JOIN invoice_line_items line ON line.invoice_id=invoice.id
+            WHERE invoice.restaurant_id=$1 AND invoice.status='ready' AND line.unit_price>0
+              AND line.comparison_key IS NOT NULL AND line.comparison_unit IS NOT NULL
+         ), history AS (
+            SELECT invoice_id,unit_price,
+                   LAG(unit_price) OVER (
+                       PARTITION BY restaurant_id,LOWER(BTRIM(supplier_name)),currency,
+                                    comparison_key,comparison_unit
+                       ORDER BY invoice_date,created_at,invoice_id
+                   ) AS previous_unit_price
+            FROM comparable_lines
+            WHERE matching_lines=1
+         ), change_counts AS (
+            SELECT invoice_id,COUNT(*) AS price_change_count
+            FROM history
+            WHERE previous_unit_price IS NOT NULL
+              AND ABS(unit_price-previous_unit_price)*100>=previous_unit_price*5
+            GROUP BY invoice_id
+         )
+         SELECT invoice.id,invoice.supplier_name,invoice.invoice_date,
+                invoice.original_filename,invoice.content_type,invoice.size_bytes,invoice.status,
+                invoice.status = 'processing'
+                    AND invoice.updated_at < NOW() - INTERVAL '5 minutes' AS delayed,
+                COALESCE(change_counts.price_change_count,0) AS price_change_count,
+                invoice.created_at
+         FROM invoices invoice
+         LEFT JOIN change_counts ON change_counts.invoice_id=invoice.id
+         WHERE invoice.restaurant_id=$1
+         ORDER BY invoice.created_at DESC,invoice.id DESC LIMIT 100",
     )
     .bind(membership.restaurant_id)
     .fetch_all(&state.pool)
@@ -253,6 +287,68 @@ pub(crate) struct PriceChange {
     previous_invoice_date: NaiveDate,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Approval {
+    price_changes: Vec<PriceChange>,
+}
+
+const PRICE_CHANGES_SQL: &str = "WITH current_invoice AS (
+        SELECT invoice.id,invoice.restaurant_id,invoice.supplier_name,invoice.invoice_date,
+               invoice.created_at,extraction.currency
+        FROM invoices invoice
+        JOIN invoice_extractions extraction ON extraction.invoice_id=invoice.id
+        WHERE invoice.id=$1 AND invoice.restaurant_id=$2 AND invoice.status='ready'
+     ), current_keys AS (
+        SELECT DISTINCT line.comparison_key,line.comparison_unit
+        FROM invoice_line_items line
+        JOIN current_invoice ON current_invoice.id=line.invoice_id
+        WHERE line.comparison_key IS NOT NULL AND line.comparison_unit IS NOT NULL
+          AND line.unit_price>0
+     ), candidate_lines AS (
+        SELECT line.id,line.invoice_id,line.position,line.description,line.unit,line.unit_price,
+               line.comparison_key,line.comparison_unit,invoice.invoice_date,
+               invoice.created_at,extraction.currency,
+               COUNT(*) OVER (
+                   PARTITION BY line.invoice_id,line.comparison_key,line.comparison_unit
+               ) AS matching_lines
+        FROM current_invoice current
+        JOIN invoices invoice ON invoice.restaurant_id=current.restaurant_id
+          AND invoice.status='ready'
+          AND LOWER(BTRIM(invoice.supplier_name))=LOWER(BTRIM(current.supplier_name))
+          AND (invoice.invoice_date,invoice.created_at,invoice.id)
+              <=(current.invoice_date,current.created_at,current.id)
+        JOIN invoice_extractions extraction ON extraction.invoice_id=invoice.id
+          AND extraction.currency=current.currency
+        JOIN invoice_line_items line ON line.invoice_id=invoice.id AND line.unit_price>0
+        JOIN current_keys key ON key.comparison_key=line.comparison_key
+          AND key.comparison_unit=line.comparison_unit
+     ), history AS (
+        SELECT id,invoice_id,position,description,unit,unit_price,currency,invoice_date,
+               LAG(unit_price) OVER item_history AS previous_unit_price,
+               LAG(invoice_date) OVER item_history AS previous_invoice_date
+        FROM candidate_lines
+        WHERE matching_lines=1
+        WINDOW item_history AS (
+            PARTITION BY comparison_key,comparison_unit
+            ORDER BY invoice_date,created_at,invoice_id
+        )
+     ), changes AS (
+        SELECT id,position,description,unit,currency,previous_unit_price,unit_price,
+               ROUND(((unit_price-previous_unit_price)/previous_unit_price)*100,2)
+                   AS percentage_change,
+               previous_invoice_date
+        FROM history
+        WHERE invoice_id=$1 AND previous_unit_price IS NOT NULL
+          AND ABS(unit_price-previous_unit_price)*100>=previous_unit_price*5
+     )
+     SELECT id,description,unit,currency,
+            previous_unit_price::text AS previous_unit_price,
+            unit_price::text AS current_unit_price,
+            percentage_change::text AS percentage_change,previous_invoice_date
+     FROM changes
+     ORDER BY ABS(percentage_change) DESC,position";
+
 struct ReviewedLine {
     line_id: Uuid,
     position: i32,
@@ -327,7 +423,7 @@ pub(crate) async fn put_review(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
     Json(input): Json<ReviewInput>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<Approval>, ApiError> {
     let member = membership(&state, &headers).await?;
     let input = validate_review(input)?;
     let invoice_date = input
@@ -386,8 +482,14 @@ pub(crate) async fn put_review(
             .await
             .map_err(crate::database_error)?;
     }
+    let price_changes = sqlx::query_as::<_, PriceChange>(PRICE_CHANGES_SQL)
+        .bind(id)
+        .bind(member.restaurant_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(crate::database_error)?;
     tx.commit().await.map_err(crate::database_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(Approval { price_changes }))
 }
 
 pub(crate) async fn price_changes(
@@ -396,68 +498,12 @@ pub(crate) async fn price_changes(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<PriceChange>>, ApiError> {
     let member = membership(&state, &headers).await?;
-    let changes = sqlx::query_as::<_, PriceChange>(
-        "WITH current_invoice AS (
-            SELECT invoice.id,invoice.restaurant_id,invoice.supplier_name,invoice.invoice_date,
-                   invoice.created_at,extraction.currency
-            FROM invoices invoice
-            JOIN invoice_extractions extraction ON extraction.invoice_id=invoice.id
-            WHERE invoice.id=$1 AND invoice.restaurant_id=$2 AND invoice.status='ready'
-         ), current_keys AS (
-            SELECT DISTINCT line.comparison_key,line.comparison_unit
-            FROM invoice_line_items line
-            JOIN current_invoice ON current_invoice.id=line.invoice_id
-            WHERE line.comparison_key IS NOT NULL AND line.comparison_unit IS NOT NULL
-              AND line.unit_price>0
-         ), candidate_lines AS (
-            SELECT line.id,line.invoice_id,line.position,line.description,line.unit,line.unit_price,
-                   line.comparison_key,line.comparison_unit,invoice.invoice_date,
-                   invoice.created_at,extraction.currency,
-                   COUNT(*) OVER (
-                       PARTITION BY line.invoice_id,line.comparison_key,line.comparison_unit
-                   ) AS matching_lines
-            FROM current_invoice current
-            JOIN invoices invoice ON invoice.restaurant_id=current.restaurant_id
-              AND invoice.status='ready'
-              AND LOWER(BTRIM(invoice.supplier_name))=LOWER(BTRIM(current.supplier_name))
-              AND (invoice.invoice_date,invoice.created_at,invoice.id)
-                  <=(current.invoice_date,current.created_at,current.id)
-            JOIN invoice_extractions extraction ON extraction.invoice_id=invoice.id
-              AND extraction.currency=current.currency
-            JOIN invoice_line_items line ON line.invoice_id=invoice.id AND line.unit_price>0
-            JOIN current_keys key ON key.comparison_key=line.comparison_key
-              AND key.comparison_unit=line.comparison_unit
-         ), history AS (
-            SELECT id,invoice_id,position,description,unit,unit_price,currency,invoice_date,
-                   LAG(unit_price) OVER item_history AS previous_unit_price,
-                   LAG(invoice_date) OVER item_history AS previous_invoice_date
-            FROM candidate_lines
-            WHERE matching_lines=1
-            WINDOW item_history AS (
-                PARTITION BY comparison_key,comparison_unit
-                ORDER BY invoice_date,created_at,invoice_id
-            )
-         ), changes AS (
-            SELECT id,position,description,unit,currency,previous_unit_price,unit_price,
-                   ROUND(((unit_price-previous_unit_price)/previous_unit_price)*100,2)
-                       AS percentage_change,
-                   previous_invoice_date
-            FROM history
-            WHERE invoice_id=$1 AND previous_unit_price IS NOT NULL
-              AND ABS(unit_price-previous_unit_price)*100>=previous_unit_price*5
-         )
-         SELECT id,description,unit,currency,
-                previous_unit_price::text AS previous_unit_price,
-                unit_price::text AS current_unit_price,
-                percentage_change::text AS percentage_change,previous_invoice_date
-         FROM changes
-         ORDER BY ABS(percentage_change) DESC,position",
-    )
-    .bind(id)
-    .bind(member.restaurant_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(crate::database_error)?;
+    let changes = sqlx::query_as::<_, PriceChange>(PRICE_CHANGES_SQL)
+        .bind(id)
+        .bind(member.restaurant_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(crate::database_error)?;
     Ok(Json(changes))
 }
 

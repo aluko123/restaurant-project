@@ -422,6 +422,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .invoice-status { color: var(--herb); font-family: var(--mono); font-size: 0.62rem; font-weight: 800; text-transform: uppercase; }
 .invoice-filename { overflow-wrap: anywhere; font-family: var(--mono); font-size: 0.65rem; }
 .card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.price-change-alert { min-height: 48px; padding: 10px 14px; display: inline-flex; align-items: center; gap: 8px; border: 2px solid var(--tomato); color: var(--ink); background: rgba(202,61,37,.08); font-family: var(--mono); font-size: .67rem; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; cursor: pointer; }
+.price-change-alert span { width: 22px; height: 22px; display: inline-grid; place-items: center; border-radius: 50%; color: var(--paper-light); background: var(--tomato); }
+.price-change-alert:hover { color: var(--paper-light); background: var(--tomato); }
 .reviewed-label { font-family: var(--mono); font-size: .68rem; font-weight: 800; text-transform: uppercase; }
 .review-shell { width: min(900px, 100%); margin: 0 auto; padding: clamp(28px, 6vw, 72px) clamp(20px, 5vw, 60px); }
 .review-heading { display: flex; justify-content: space-between; gap: 16px; }
