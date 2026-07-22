@@ -434,6 +434,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .review-form fieldset { margin: 0; padding: 18px; border: 1px solid var(--ink); }
 .review-form legend { padding: 0 8px; font-size: 1.2rem; font-weight: 900; text-transform: uppercase; }
 .line-card { margin-bottom: 18px; padding: 16px; display: grid; gap: 12px; border: 1px solid var(--rule); background: rgba(247,240,226,.55); }
+.needs-attention { border: 1px solid var(--tomato); padding: 12px; }
+.review-warning { margin: 0; padding: 10px 12px; border-left: 4px solid var(--tomato); background: rgba(202,61,37,.08); font-family: var(--serif); font-weight: 700; }
+.line-card .review-warning { grid-column: 1 / -1; }
 .price-change-shell .section-code { margin-top: 36px; }
 .price-change-list { margin-top: 28px; display: grid; gap: 18px; }
 .price-change-card, .price-empty { padding: clamp(20px, 5vw, 34px); border: 1px solid var(--ink); background: var(--paper-light); }
@@ -454,7 +457,56 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .api-status-unavailable span { background: var(--tomato); }
 .status-page { min-height: 100vh; display: grid; place-items: center; color: var(--paper-light); background: var(--ink); font-family: var(--mono); font-size: 0.7rem; text-transform: uppercase; }
 
+.inventory-workspace { width: min(1120px, 100%); margin: 0 auto; padding: 36px 20px 72px; }
+.inventory-heading { padding-bottom: 24px; border-bottom: 4px solid var(--ink); }
+.inventory-heading h1 { margin: 12px 0 8px; font-size: clamp(2.5rem, 10vw, 5.5rem); line-height: .88; letter-spacing: -.07em; text-transform: uppercase; }
+.inventory-heading > p:not(.section-code) { margin: 0 0 20px; font-family: var(--serif); font-size: 1.05rem; }
+.inventory-message { margin-top: 20px; }
+.inventory-item-form { margin: 28px 0 46px; padding: 20px; display: grid; gap: 20px; border: 1px solid var(--ink); background: var(--paper-light); }
+.inventory-item-form h2, .inventory-list h2, .archived-section > h2 { margin: 0; font-size: 1.7rem; text-transform: uppercase; }
+.inventory-form-fields { display: grid; gap: 14px; }
+.inventory-form-fields label { display: grid; gap: 6px; font-family: var(--mono); font-size: .68rem; font-weight: 800; text-transform: uppercase; }
+.inventory-form-fields label > span { font-family: var(--serif); font-weight: 400; text-transform: none; }
+.inventory-form-fields input, .inventory-form-fields select { width: 100%; min-height: 48px; padding: 10px 12px; border: 1px solid var(--ink); border-radius: 0; background: var(--paper-light); }
+.active-toggle { min-height: 44px; display: flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: .7rem; font-weight: 800; text-transform: uppercase; }
+.active-toggle input { width: 24px; height: 24px; }
+.inventory-category { margin-top: 28px; }
+.inventory-category > h3 { margin: 0 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--rule); font-family: var(--mono); font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; }
+.inventory-cards { display: grid; gap: 14px; }
+.inventory-card { padding: 18px; border: 1px solid var(--ink); background: rgba(247,240,226,.58); }
+.inventory-card.low-stock { border-left: 7px solid var(--tomato); }
+.inventory-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.inventory-card h4 { margin: 0; font-size: 1.25rem; line-height: 1; text-transform: uppercase; }
+.low-stock-label { margin-top: 8px; display: inline-block; color: var(--tomato-dark); font-family: var(--mono); font-size: .65rem; letter-spacing: .05em; text-transform: uppercase; }
+.current-quantity { margin: 0; font-size: 1.25rem; font-weight: 900; text-align: right; }
+.inventory-metrics { margin: 18px 0; padding: 14px 0; display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+.inventory-metrics p { margin: 0; }
+.inventory-metrics p:last-child { grid-column: 1 / -1; }
+.inventory-metrics span { display: block; margin-bottom: 5px; font-family: var(--mono); font-size: .58rem; font-weight: 800; text-transform: uppercase; opacity: .65; }
+.archived-section { margin-top: 56px; padding-top: 24px; border-top: 4px solid var(--ink); }
+.archived-section > p { font-family: var(--serif); }
+.count-workspace { max-width: 860px; }
+.count-workspace > .inventory-heading { margin-top: 24px; }
+.count-category { margin-top: 34px; }
+.count-category h2 { margin: 0; padding-bottom: 10px; border-bottom: 3px solid var(--ink); font-size: 1.55rem; text-transform: uppercase; }
+.count-row { min-height: 88px; padding: 14px 0; display: grid; grid-template-columns: minmax(0,1fr) minmax(140px,45%); align-items: center; gap: 14px; border-bottom: 1px solid var(--rule); }
+.count-row strong, .count-row small { display: block; }
+.count-row strong { font-size: 1.05rem; text-transform: uppercase; }
+.count-row small { margin-top: 5px; font-family: var(--serif); }
+.quantity-field { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; border: 1px solid var(--ink); background: var(--paper-light); }
+.quantity-field input { width: 100%; min-width: 0; min-height: 56px; padding: 8px 10px; border: 0; border-radius: 0; background: transparent; font-size: 1.35rem; font-weight: 900; text-align: right; }
+.quantity-field b { padding: 0 10px; font-family: var(--mono); font-size: .65rem; text-transform: uppercase; }
+.count-actions { position: sticky; bottom: 0; margin-top: 30px; padding: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; border: 1px solid var(--ink); background: var(--paper); box-shadow: 0 -8px 18px rgba(32,29,24,.09); }
+.missing-list { margin-top: 28px; padding: 22px; border: 1px solid var(--ink); background: var(--paper-light); }
+.missing-list h2 { margin: 0; text-transform: uppercase; }
+.missing-list ul { padding-left: 20px; line-height: 1.8; }
+
 @media (min-width: 720px) {
+  .inventory-workspace { padding: 56px clamp(32px,5vw,64px) 92px; }
+  .inventory-form-fields { grid-template-columns: repeat(2, 1fr); }
+  .inventory-cards { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  .inventory-metrics { grid-template-columns: repeat(3,1fr); }
+  .inventory-metrics p:last-child { grid-column: auto; }
   .review-fields { grid-template-columns: repeat(2, 1fr); }
   .line-card { grid-template-columns: repeat(3, 1fr); }
   .line-card label:first-child { grid-column: 1 / -1; }

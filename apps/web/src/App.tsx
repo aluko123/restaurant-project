@@ -7,12 +7,16 @@ type AppProps = {
 
 type Restaurant = { id: string; name: string; city: string; serviceStyle: ServiceStyle; role: string };
 type Invoice = { id: string; supplierName: string; invoiceDate: string; originalFilename: string; contentType: string; sizeBytes: number; status: string; delayed: boolean; createdAt: string };
-type ReviewLine = { id?: string; sku: string | null; description: string; quantity: string | null; unit: string | null; unitPrice: string | null; lineTotal: string | null };
-type Review = { invoiceId: string; supplierName: string; invoiceNumber: string | null; invoiceDate: string | null; currency: string; subtotal: string | null; tax: string | null; fees: string | null; discount: string | null; total: string | null; lineItems: ReviewLine[] };
+type ReviewLine = { id?: string; sku: string | null; description: string; quantity: string | null; unit: string | null; unitPrice: string | null; lineTotal: string | null; hasWarnings: boolean };
+type Review = { invoiceId: string; supplierName: string; invoiceNumber: string | null; invoiceDate: string | null; currency: string; subtotal: string | null; tax: string | null; fees: string | null; discount: string | null; total: string | null; hasWarnings: boolean; lineItems: ReviewLine[] };
 type PriceChange = { id: string; description: string; unit: string | null; currency: string; previousUnitPrice: string; currentUnitPrice: string; percentageChange: string; previousInvoiceDate: string };
 type MenuItem = { id: string; name: string; category: string | null; sellingPrice: string; currency: string; active: boolean };
 type MenuImport = { id: string; originalFilename: string; status: string; delayed: boolean; createdAt: string };
-type MenuImportItem = { id: string; name: string; category: string | null; sellingPrice: string | null; currency: string | null; selected?: boolean };
+type MenuImportItem = { id?: string; name: string; category: string | null; sellingPrice: string | null; currency: string | null; hasWarnings: boolean; selected?: boolean };
+type InventoryItem = { id: string; name: string; category: string | null; countUnit: string; parLevel: string | null; active: boolean; latestQuantity: string | null; previousQuantity: string | null; change: string | null; lastCountedAt: string | null; lowStock: boolean };
+type InventoryCountEntry = { id: string; inventoryItemId: string; name: string; category: string | null; countUnit: string; quantity: string | null };
+type InventoryCount = { id: string; status: string; revision: number; createdAt: string; updatedAt: string; completedAt: string | null; entries: InventoryCountEntry[] };
+type InventoryDraftResponse = { count: InventoryCount | null };
 type ServiceStyle = "counter_service" | "full_service" | "fast_casual" | "cafe_bakery" | "bar";
 type AppState = { status: "loading" } | { status: "error"; message: string } | { status: "ready"; restaurant: Restaurant | null };
 
@@ -31,7 +35,9 @@ export function App({ authConfigured }: AppProps) {
 function AuthenticatedApp() {
   const { isLoading, user, signIn, signUp, signOut, getAccessToken } = useAuth();
   const [appState, setAppState] = useState<AppState>({ status: "loading" });
-  const [workspace, setWorkspace] = useState<"invoices" | "menu">("invoices");
+  type Workspace = "invoices" | "menu" | "inventory";
+  const workspaceForPath = (): Workspace => window.location.pathname === "/menu" ? "menu" : window.location.pathname === "/inventory" ? "inventory" : "invoices";
+  const [workspace, setWorkspace] = useState<Workspace>(workspaceForPath);
   const apiUrl = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
 
   useEffect(() => {
@@ -64,6 +70,17 @@ function AuthenticatedApp() {
   }, [request, user]);
 
   useEffect(loadApp, [loadApp]);
+  useEffect(() => {
+    const onPopState = () => setWorkspace(workspaceForPath());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  function openWorkspace(next: Workspace) {
+    const path = `/${next}`;
+    if (window.location.pathname !== path) window.history.pushState({}, "", path);
+    setWorkspace(next);
+  }
 
   if (isLoading) {
     return <StatusPage message="Checking your session…" />;
@@ -85,16 +102,112 @@ function AuthenticatedApp() {
     <main className="app-shell">
       <AppHeader restaurantName={restaurant.name} onSignOut={() => signOut()} />
       <nav className="workspace-nav" aria-label="Daybook sections">
-        <button type="button" aria-current={workspace === "invoices" ? "page" : undefined} onClick={() => setWorkspace("invoices")}>Invoices</button>
-        <button type="button" aria-current={workspace === "menu" ? "page" : undefined} onClick={() => setWorkspace("menu")}>Menu</button>
+        <button type="button" aria-current={workspace === "invoices" ? "page" : undefined} onClick={() => openWorkspace("invoices")}>Invoices</button>
+        <button type="button" aria-current={workspace === "menu" ? "page" : undefined} onClick={() => openWorkspace("menu")}>Menu</button>
+        <button type="button" aria-current={workspace === "inventory" ? "page" : undefined} onClick={() => openWorkspace("inventory")}>Inventory</button>
       </nav>
-      <div hidden={workspace !== "invoices"}><InvoiceWorkspace restaurant={restaurant} request={request} /></div>
-      <div hidden={workspace !== "menu"}><MenuWorkspace restaurant={restaurant} request={request} /></div>
+      <div hidden={workspace !== "invoices"}><InvoiceWorkspace restaurant={restaurant} request={request} active={workspace === "invoices"} /></div>
+      <div hidden={workspace !== "menu"}><MenuWorkspace restaurant={restaurant} request={request} active={workspace === "menu"} /></div>
+      <div hidden={workspace !== "inventory"}><InventoryWorkspace restaurant={restaurant} request={request} /></div>
     </main>
   );
 }
 
-function MenuWorkspace({ restaurant, request }: { restaurant: Restaurant; request: <T>(path: string, init?: RequestInit) => Promise<T> }) {
+const inventoryUnits = ["each", "lb", "oz", "kg", "g", "case", "bag", "bottle", "can", "gal", "L"];
+type ItemFields = { name: string; category: string; countUnit: string; parLevel: string; active: boolean };
+const blankItem: ItemFields = { name: "", category: "", countUnit: "each", parLevel: "", active: true };
+
+function InventoryWorkspace({ restaurant, request }: { restaurant: Restaurant; request: <T>(path: string, init?: RequestInit) => Promise<T> }) {
+  const manager = restaurant.role === "owner" || restaurant.role === "manager";
+  const [items, setItems] = useState<InventoryItem[]>([]);
+  const [count, setCount] = useState<InventoryCount | null>(null);
+  const [mode, setMode] = useState<"overview" | "count" | "review">("overview");
+  const [quantities, setQuantities] = useState<Record<string, string>>( {} );
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [fields, setFields] = useState<ItemFields>(blankItem);
+  const [editing, setEditing] = useState<InventoryItem | null>(null);
+
+  const adoptCount = (value: InventoryCount) => {
+    setCount(value);
+    setQuantities(Object.fromEntries(value.entries.map(entry => [entry.id, entry.quantity ?? ""])));
+  };
+  const loadOverview = useCallback(async () => {
+    setLoading(true); setError("");
+    try {
+      const [nextItems, draft] = await Promise.all([request<InventoryItem[]>("/v1/inventory-items"), request<InventoryDraftResponse>("/v1/inventory-counts/draft")]);
+      setItems(nextItems); setCount(draft.count);
+      if (draft.count) setQuantities(Object.fromEntries(draft.count.entries.map(entry => [entry.id, entry.quantity ?? ""])));
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Inventory couldn't load. Try again."); }
+    finally { setLoading(false); }
+  }, [request]);
+  useEffect(() => { void loadOverview(); }, [loadOverview]);
+
+  async function startOrResume() {
+    setError(""); setNotice("");
+    if (count) { setMode("count"); return; }
+    setBusy(true);
+    try { const value = await request<InventoryCount>("/v1/inventory-counts", { method: "POST", body: "{}" }); adoptCount(value); setMode("count"); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "The count couldn't start."); }
+    finally { setBusy(false); }
+  }
+  function payload(active = fields.active) { return { name: fields.name, category: fields.category || null, countUnit: fields.countUnit, parLevel: fields.parLevel || null, active }; }
+  async function saveItem(event: FormEvent) {
+    event.preventDefault(); setError(""); setNotice("");
+    if (!fields.name.trim() || !fields.countUnit.trim()) { setError("Add an item name and count unit."); return; }
+    setBusy(true);
+    try {
+      await request(editing ? `/v1/inventory-items/${editing.id}` : "/v1/inventory-items", { method: editing ? "PUT" : "POST", body: JSON.stringify(payload()) });
+      setNotice(editing ? `${fields.name.trim()} updated.` : `${fields.name.trim()} added.`); setFields(blankItem); setEditing(null); await loadOverview();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "The item couldn't be saved."); }
+    finally { setBusy(false); }
+  }
+  function edit(item: InventoryItem) { setEditing(item); setFields({ name:item.name, category:item.category ?? "", countUnit:item.countUnit, parLevel:item.parLevel ?? "", active:item.active }); window.scrollTo({ top: 0, behavior: "smooth" }); }
+  async function toggle(item: InventoryItem) {
+    setBusy(true); setError("");
+    try { await request(`/v1/inventory-items/${item.id}`, { method:"PUT", body:JSON.stringify({ name:item.name, category:item.category, countUnit:item.countUnit, parLevel:item.parLevel, active:!item.active }) }); setNotice(`${item.name} ${item.active ? "archived" : "reactivated"}.`); await loadOverview(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "The item couldn't be updated."); }
+    finally { setBusy(false); }
+  }
+  async function saveDraft(showNotice = true) {
+    if (!count) return null; setBusy(true); setError(""); if (showNotice) setNotice("");
+    try { const value = await request<InventoryCount>(`/v1/inventory-counts/${count.id}`, { method:"PUT", body:JSON.stringify({ revision:count.revision, entries:count.entries.map(entry => ({ id:entry.id, quantity:quantities[entry.id]?.trim() || null })) }) }); adoptCount(value); if (showNotice) setNotice("Draft saved."); return value; }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "The draft couldn't be saved. Check the quantities and try again."); return null; }
+    finally { setBusy(false); }
+  }
+  async function reviewCount() { const saved = await saveDraft(false); if (saved) { setNotice(""); setMode("review"); } }
+  async function backToOverview() { const saved = await saveDraft(false); if (saved) { setMode("overview"); setNotice("Draft saved. Resume when you're ready."); } }
+  async function complete() {
+    if (!count) return; const missing = count.entries.filter(entry => !quantities[entry.id]?.trim()); setBusy(true); setError("");
+    try { await request(`/v1/inventory-counts/${count.id}/complete`, { method:"POST", body:JSON.stringify({ confirmMissing:missing.length > 0, revision:count.revision }) }); setCount(null); setQuantities({}); setMode("overview"); setNotice("Inventory count completed."); await loadOverview(); setNotice("Inventory count completed."); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "The count couldn't be completed."); }
+    finally { setBusy(false); }
+  }
+
+  if (mode !== "overview" && count) {
+    const groups = groupByCategory(count.entries); const missing = count.entries.filter(entry => !quantities[entry.id]?.trim());
+    if (mode === "review") return <section className="inventory-workspace count-workspace"><button className="text-button" type="button" onClick={() => setMode("count")}>← Back to count</button><header className="inventory-heading"><p className="section-code">DB—INVENTORY / REVIEW</p><h1>Review count</h1><p>{count.entries.length - missing.length} counted · {missing.length} missing</p></header>{missing.length > 0 && <div className="missing-list"><h2>Missing quantities</h2><p>These items will stay blank in this count.</p><ul>{missing.map(entry => <li key={entry.id}><strong>{entry.name}</strong> · {entry.countUnit}</li>)}</ul></div>}{error && <p className="form-error" role="alert">{error}</p>}<div className="count-actions"><button className="file-button" type="button" onClick={() => setMode("count")}>Back to count</button><button className="ledger-button" type="button" disabled={busy} onClick={() => void complete()}>{busy ? "Completing…" : missing.length ? "Complete with missing items" : "Complete count"}</button></div></section>;
+    return <section className="inventory-workspace count-workspace"><button className="text-button" type="button" disabled={busy} onClick={() => void backToOverview()}>← Save and return to overview</button><header className="inventory-heading"><p className="section-code">DB—INVENTORY / COUNT</p><h1>Count what is on hand</h1><p>Your saved draft stays here when you return to the overview.</p></header>{groups.map(([category, entries]) => <section className="count-category" key={category}><h2>{category}</h2>{entries.map(entry => <label className="count-row" key={entry.id}><span><strong>{entry.name}</strong><small>Count in {entry.countUnit}</small></span><span className="quantity-field"><input aria-label={`${entry.name}, quantity in ${entry.countUnit}`} inputMode="decimal" value={quantities[entry.id] ?? ""} onChange={event => setQuantities(current => ({...current,[entry.id]:event.target.value}))}/><b>{entry.countUnit}</b></span></label>)}</section>)}{error && <p className="form-error" role="alert">{error}</p>}{notice && <p className="success-notice" role="status">{notice}</p>}<div className="count-actions"><button className="file-button" type="button" disabled={busy} onClick={() => void saveDraft()}>{busy ? "Saving…" : "Save draft"}</button><button className="ledger-button" type="button" disabled={busy} onClick={() => void reviewCount()}>Review count</button></div></section>;
+  }
+
+  const active = items.filter(item => item.active); const archived = items.filter(item => !item.active);
+  return <section className="inventory-workspace"><header className="inventory-heading"><p className="section-code">DB—INVENTORY</p><h1>{restaurant.name} inventory</h1><p>See what is on hand and keep the next count moving.</p><button className="ledger-button" type="button" disabled={busy || (!count && active.length === 0)} onClick={() => void startOrResume()}>{busy ? "Opening…" : count ? "Resume count" : "Start count"}</button></header>
+    {error && <p className="form-error inventory-message" role="alert">{error}</p>}{notice && <p className="success-notice inventory-message" role="status">{notice}</p>}
+    {manager && <form className="inventory-item-form" onSubmit={saveItem}><div className="list-heading"><h2>{editing ? "Edit item" : "Add an item"}</h2>{editing && <button className="text-button" type="button" onClick={() => {setEditing(null);setFields(blankItem)}}>Cancel</button>}</div><div className="inventory-form-fields"><label>Name<input required maxLength={50} value={fields.name} onChange={e=>setFields({...fields,name:e.target.value})}/></label><label>Category <span>Optional</span><input maxLength={20} value={fields.category} onChange={e=>setFields({...fields,category:e.target.value})}/></label><label>Count unit<select required value={fields.countUnit} onChange={e=>setFields({...fields,countUnit:e.target.value})}>{inventoryUnits.map(unit=><option key={unit} value={unit}>{unit}</option>)}</select></label><label>Par level <span>Optional</span><input inputMode="decimal" value={fields.parLevel} onChange={e=>setFields({...fields,parLevel:e.target.value})}/></label></div>{editing && <label className="active-toggle"><input type="checkbox" checked={fields.active} onChange={e=>setFields({...fields,active:e.target.checked})}/> Active item</label>}<button className="ledger-button" disabled={busy}>{busy ? "Saving…" : editing ? "Save item" : "Add item"}</button></form>}
+    <div className="inventory-list"><div className="list-heading"><h2>Active items</h2><button className="text-button" type="button" onClick={() => void loadOverview()}>Refresh</button></div>{loading ? <p role="status">Loading inventory…</p> : active.length === 0 ? <p className="empty-state">{manager ? "No active items yet. Add your first item above, including how the crew counts it." : "No inventory items are ready to count. Ask an owner or manager to add them."}</p> : groupByCategory(active).map(([category, group]) => <InventoryCategory key={category} category={category} items={group} manager={manager} busy={busy} onEdit={edit} onToggle={toggle}/>)}</div>
+    {!loading && archived.length > 0 && <section className="archived-section"><h2>Archived items</h2><p>Kept here with their count history.</p>{groupByCategory(archived).map(([category, group])=><InventoryCategory key={category} category={category} items={group} manager={manager} busy={busy} onEdit={edit} onToggle={toggle}/>)}</section>}
+  </section>;
+}
+
+function groupByCategory<T extends {category:string|null}>(values:T[]): [string,T[]][] { const groups = new Map<string,T[]>(); values.forEach(value => { const key=value.category?.trim() || "Uncategorized"; groups.set(key,[...(groups.get(key)??[]),value]); }); return [...groups.entries()]; }
+function InventoryCategory({category,items,manager,busy,onEdit,onToggle}:{category:string;items:InventoryItem[];manager:boolean;busy:boolean;onEdit:(item:InventoryItem)=>void;onToggle:(item:InventoryItem)=>void}) { return <section className="inventory-category"><h3>{category}</h3><div className="inventory-cards">{items.map(item=><article className={`inventory-card${item.lowStock?" low-stock":""}`} key={item.id}><div className="inventory-card-head"><div><h4>{item.name}</h4>{item.lowStock&&<strong className="low-stock-label">Low stock</strong>}</div><p className="current-quantity">{item.latestQuantity===null?"Not counted":`${formatInventoryNumber(item.latestQuantity)} ${item.countUnit}`}</p></div><div className="inventory-metrics"><p><span>Previous</span>{item.previousQuantity===null?"—":`${formatInventoryNumber(item.previousQuantity)} ${item.countUnit}`}</p><p><span>Change</span>{item.change===null?"—":`${formatSigned(item.change)} ${item.countUnit}`}</p><p><span>Last counted</span>{item.lastCountedAt?formatInventoryDate(item.lastCountedAt):"Not yet"}</p></div>{manager&&<div className="card-actions"><button className="file-button" type="button" disabled={busy} onClick={()=>onEdit(item)}>Edit</button><button className="text-button" type="button" disabled={busy} onClick={()=>void onToggle(item)}>{item.active?"Archive":"Reactivate"}</button></div>}</article>)}</div></section> }
+function formatInventoryNumber(value:string) { const number=Number(value); return Number.isFinite(number) ? new Intl.NumberFormat(undefined,{maximumFractionDigits:6}).format(number) : value; }
+function formatSigned(value:string) { const number=Number(value); if (!Number.isFinite(number)) return value; return `${number>0?"+":""}${formatInventoryNumber(value)}`; }
+function formatInventoryDate(value:string) { const date=new Date(value); return Number.isNaN(date.getTime())?value:new Intl.DateTimeFormat(undefined,{dateStyle:"medium",timeStyle:"short"}).format(date); }
+
+function MenuWorkspace({ restaurant, request, active }: { restaurant: Restaurant; request: <T>(path: string, init?: RequestInit) => Promise<T>; active: boolean }) {
   const [items, setItems] = useState<MenuItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -126,29 +239,29 @@ function MenuWorkspace({ restaurant, request }: { restaurant: Restaurant; reques
       .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Menu imports couldn't load."));
   }, [request]);
 
-  useEffect(loadMenu, [loadMenu]);
-  useEffect(loadImports, [loadImports]);
+  useEffect(() => { if (active) loadMenu(); }, [active, loadMenu]);
+  useEffect(() => { if (active) loadImports(); }, [active, loadImports]);
   useEffect(() => {
-    if (!imports.some((menuImport) => menuImport.status === "processing")) return;
-    const timer = window.setInterval(loadImports, 5000);
-    return () => window.clearInterval(timer);
-  }, [imports, loadImports]);
+    if (!active || !imports.some((menuImport) => menuImport.status === "processing")) return;
+    const timer = window.setTimeout(loadImports, 15000);
+    return () => window.clearTimeout(timer);
+  }, [active, imports, loadImports]);
   async function submit(event:FormEvent<HTMLFormElement>){event.preventDefault();setError("");setNotice("");if(!name.trim()||!price.trim()){setError("Add the menu item name and selling price.");return}setSaving(true);try{const item=await request<MenuItem>("/v1/menu-items",{method:"POST",body:JSON.stringify({name,category:category||null,sellingPrice:price,currency})});setItems((current)=>[...current,item].sort((a,b)=>(a.category??"zzz").localeCompare(b.category??"zzz")||a.name.localeCompare(b.name)));setName("");setCategory("");setPrice("");setNotice(`${item.name} added to the menu.`);}catch(reason){setError(reason instanceof Error?reason.message:"The menu item couldn't be saved.");}finally{setSaving(false)}}
   async function uploadMenu(e:FormEvent<HTMLFormElement>){e.preventDefault();setError("");setNotice("");if(!importFile){setError("Choose one menu photo or PDF.");return}if(importFile.size>10*1024*1024){setError("Choose a file smaller than 10 MiB.");return}const body=new FormData();body.append("file",importFile);setUploading(true);try{const value=await request<MenuImport>("/v1/menu-imports",{method:"POST",body});setImports(v=>[value,...v]);setImportFile(null);setNotice("Menu uploaded. Extraction is processing.");(e.currentTarget as HTMLFormElement).reset()}catch(reason){setError(reason instanceof Error?reason.message:"Menu upload failed. Try again.")}finally{setUploading(false)}}
-  async function openReview(id:string){setError("");try{const value=await request<{import:MenuImport;items:MenuImportItem[]}>(`/v1/menu-imports/${id}`);setReview({...value,items:value.items.map(v=>({...v,selected:Boolean(v.name.trim()&&v.sellingPrice&&v.currency)}))})}catch(reason){setError(reason instanceof Error?reason.message:"Review couldn't open.")}}
+  async function openReview(id:string){setError("");try{const value=await request<{import:MenuImport;items:MenuImportItem[]}>(`/v1/menu-imports/${id}`);setReview({...value,items:value.items.map(v=>({...v,selected:isValidMenuImportItem(v)}))})}catch(reason){setError(reason instanceof Error?reason.message:"Review couldn't open.")}}
   async function retryMenu(menuImport:MenuImport){setRetryingId(menuImport.id);setError("");try{await request(`/v1/menu-imports/${menuImport.id}/retry`,{method:"POST"});loadImports()}catch(reason){setError(reason instanceof Error?reason.message:"The menu couldn't be retried.")}finally{setRetryingId("")}}
   async function openOriginal(menuImport:MenuImport){setOpeningId(menuImport.id);setError("");const popup=window.open("","_blank");if(popup)popup.opener=null;try{const {url}=await request<{url:string}>(`/v1/menu-imports/${menuImport.id}/file`);if(popup)popup.location.href=url;else window.open(url,"_blank","noopener,noreferrer")}catch(reason){popup?.close();setError(reason instanceof Error?reason.message:"The original couldn't open. Please try again.")}finally{setOpeningId("")}}
   async function approve(){if(!review)return;setError("");const selected=review.items.filter(v=>v.selected);if(!selected.length){setError("Select at least one valid item.");return}if(selected.some(v=>!isValidMenuImportItem(v))){setError("Check each selected item's name, positive price, and three-letter currency.");return}setSaving(true);try{const counts=await request<{imported:number;skipped:number}>(`/v1/menu-imports/${review.import.id}`,{method:"PUT",body:JSON.stringify({items:selected.map(({id,name,category,sellingPrice,currency})=>({id,name,category,sellingPrice,currency}))})});setNotice(`${counts.imported} items imported${counts.skipped?`; ${counts.skipped} duplicates skipped`:""}.`);setReview(null);loadMenu();loadImports()}catch(reason){setError(reason instanceof Error?reason.message:"Items couldn't be imported.")}finally{setSaving(false)}}
-  if(review)return <section className="review-shell"><button className="text-button" type="button" onClick={()=>{setError("");setReview(null)}}>← Back to menu</button><h1>Review menu</h1><p>Edit and select items with a clear selling price. Nothing is added until you import.</p><div className="review-form">{review.items.map((row,index)=><article className="line-card" key={row.id}><label><input type="checkbox" checked={Boolean(row.selected)} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,selected:e.target.checked}:x)}))}/> Import this item</label><label>Name<input value={row.name} maxLength={50} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,name:e.target.value}:x)}))}/></label><label>Category<input value={row.category??""} maxLength={20} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,category:e.target.value||null}:x)}))}/></label><label>Price<input inputMode="decimal" value={row.sellingPrice??""} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,sellingPrice:e.target.value||null}:x)}))}/></label><label>Currency<input maxLength={3} value={row.currency??""} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,currency:e.target.value.toUpperCase()||null}:x)}))}/></label><button className="text-button" type="button" onClick={()=>setReview(v=>v&&({...v,items:v.items.filter((_,i)=>i!==index)}))}>Remove row</button></article>)}{error&&<p className="form-error" role="alert">{error}</p>}<button className="ledger-button" type="button" disabled={saving} onClick={approve}>{saving?"Importing…":"Import selected items"}</button></div></section>;
+  if(review)return <section className="review-shell"><button className="text-button" type="button" onClick={()=>{setError("");setReview(null)}}>← Back to menu</button><h1>Review menu</h1><p>Edit and select items with a clear selling price. Nothing is added until you import.</p><div className="review-form">{review.items.map((row,index)=>{const needsAttention=row.hasWarnings||!isValidMenuImportItem(row);return <article className={`line-card${needsAttention?" needs-attention":""}`} key={row.id??`new-${index}`}>{needsAttention&&<p className="review-warning" role="status">Check this item against the original menu.</p>}<label><input type="checkbox" checked={Boolean(row.selected)} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,selected:e.target.checked}:x)}))}/> Import this item</label><label>Name<input value={row.name} maxLength={50} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,name:e.target.value}:x)}))}/></label><label>Category<input value={row.category??""} maxLength={20} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,category:e.target.value||null}:x)}))}/></label><label>Price<input inputMode="decimal" value={row.sellingPrice??""} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,sellingPrice:e.target.value||null}:x)}))}/></label><label>Currency<input maxLength={3} value={row.currency??""} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,currency:e.target.value.toUpperCase()||null}:x)}))}/></label><button className="text-button" type="button" onClick={()=>setReview(v=>v&&({...v,items:v.items.filter((_,i)=>i!==index)}))}>Remove row</button></article>})}<button className="file-button" type="button" onClick={()=>setReview(v=>v&&({...v,items:[...v.items,{name:"",category:null,sellingPrice:null,currency:"USD",hasWarnings:true,selected:true}]}))}>Add item</button>{error&&<p className="form-error" role="alert">{error}</p>}<button className="ledger-button" type="button" disabled={saving} onClick={approve}>{saving?"Importing…":"Import selected items"}</button></div></section>;
   return <section className="menu-workspace" aria-labelledby="menu-heading"><header className="invoice-heading"><p className="section-code">DB—MENU / TOP ITEMS</p><h1 id="menu-heading">{restaurant.name} menu</h1><p>Add items by hand or review one menu photo or PDF.</p></header><div className="menu-grid"><div><form className="invoice-form menu-form" onSubmit={submit} noValidate><h2>Add a menu item</h2><p>Record the name customers see and its current selling price.</p><div className="ledger-field"><label htmlFor="menu-name">Menu item</label><input id="menu-name" value={name} onChange={e=>setName(e.target.value)} maxLength={50} required/></div><div className="ledger-field"><label htmlFor="menu-category">Category <span className="optional-label">Optional</span></label><input id="menu-category" value={category} onChange={e=>setCategory(e.target.value)} maxLength={20}/></div><div className="menu-price-fields"><div className="ledger-field"><label htmlFor="menu-price">Selling price</label><input id="menu-price" inputMode="decimal" value={price} onChange={e=>setPrice(e.target.value)} required/></div><div className="ledger-field"><label htmlFor="menu-currency">Currency</label><select id="menu-currency" value={currency} onChange={e=>setCurrency(e.target.value)}><option>USD</option><option>CAD</option><option>GBP</option><option>EUR</option></select></div></div><button className="ledger-button" disabled={saving}>{saving?"Adding item…":"Add to menu"}</button></form><form className="invoice-form menu-import-form" onSubmit={uploadMenu}><h2>Import from photo</h2><p>Upload one PDF or photo. You'll review every item before it is added.</p><label className="file-button" htmlFor="menu-file">Choose photo or PDF</label><input className="visually-hidden" id="menu-file" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" onChange={e=>setImportFile(e.target.files?.[0]??null)}/>{importFile&&<span className="selected-file">{importFile.name}</span>}<button className="ledger-button" disabled={uploading}>{uploading?"Uploading…":"Upload menu"}</button></form>{error&&<p className="form-error" role="alert">{error}</p>}{notice&&<p className="success-notice" role="status">{notice}</p>}</div><div className="menu-list"><div className="list-heading"><h2>Active menu items</h2><button className="text-button" type="button" onClick={loadMenu}>Refresh</button></div>{loading?<p role="status">Loading menu…</p>:items.length===0?<p className="empty-state">No menu items yet.</p>:<div className="menu-cards">{items.map(item=><article className="menu-card" key={item.id}><div><p className="invoice-status">{item.category??"Uncategorized"}</p><h3>{item.name}</h3></div><strong>{formatMoney(item.sellingPrice,item.currency)}</strong></article>)}</div>}<div className="list-heading import-heading"><h2>Menu imports</h2></div>{imports.length===0?<p className="empty-state">No menu imports yet.</p>:<div className="menu-cards">{imports.map(value=><article className="menu-card" key={value.id}><div className="menu-card-copy"><p className="invoice-status">{importStatusLabel(value.status, value.delayed, "menu")}</p><h3>{value.originalFilename}</h3></div><div className="card-actions">{value.status==="needs_review"&&<button className="file-button" type="button" onClick={()=>void openReview(value.id)}>Review menu</button>}{value.status==="failed"&&<button className="file-button" type="button" disabled={retryingId===value.id} onClick={()=>void retryMenu(value)}>{retryingId===value.id?"Trying again…":"Retry"}</button>}<button className="text-button" type="button" disabled={openingId===value.id} onClick={()=>void openOriginal(value)}>{openingId===value.id?"Opening…":"Original"}</button></div></article>)}</div>}</div></div></section>;
 }
 
 function isValidMenuImportItem(item: MenuImportItem) {
   const price = item.sellingPrice?.trim() ?? "";
-  return Boolean(item.name.trim()) && /^\d+(?:\.\d{1,4})?$/.test(price) && Number(price) > 0 && /^[A-Z]{3}$/.test(item.currency?.trim() ?? "");
+  return Boolean(item.name.trim()) && item.name.trim().length <= 50 && (item.category?.trim().length ?? 0) <= 20 && /^\d+(?:\.\d{1,4})?$/.test(price) && Number(price) > 0 && /^[A-Z]{3}$/.test(item.currency?.trim() ?? "");
 }
 
-function InvoiceWorkspace({ restaurant, request }: { restaurant: Restaurant; request: <T>(path: string, init?: RequestInit) => Promise<T> }) {
+function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaurant; request: <T>(path: string, init?: RequestInit) => Promise<T>; active: boolean }) {
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [loading, setLoading] = useState(true);
   const [listError, setListError] = useState("");
@@ -170,12 +283,12 @@ function InvoiceWorkspace({ restaurant, request }: { restaurant: Restaurant; req
       .catch((error: unknown) => setListError(error instanceof Error ? error.message : "Invoices couldn't load. Please try again."))
       .finally(() => setLoading(false));
   }, [request]);
-  useEffect(loadInvoices, [loadInvoices]);
+  useEffect(() => { if (active) loadInvoices(); }, [active, loadInvoices]);
   useEffect(() => {
-    if (!invoices.some((invoice) => invoice.status === "processing")) return;
-    const timer = window.setInterval(loadInvoices, 5000);
-    return () => window.clearInterval(timer);
-  }, [invoices, loadInvoices]);
+    if (!active || !invoices.some((invoice) => invoice.status === "processing")) return;
+    const timer = window.setTimeout(loadInvoices, 15000);
+    return () => window.clearTimeout(timer);
+  }, [active, invoices, loadInvoices]);
 
   async function upload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setNotice(""); setUploadError("");
@@ -253,12 +366,18 @@ function ReviewInvoice({ invoiceId, request, onBack, onApproved, onViewOriginal 
   useEffect(()=>{ void request<Review>(`/v1/invoices/${invoiceId}/review`).then(setReview).catch((e:unknown)=>setError(e instanceof Error?e.message:"Review couldn't load.")); },[invoiceId,request]);
   function field(name:keyof Review,value:string){setReview((r)=>r?{...r,[name]:value||null}:r)}
   function line(index:number,name:keyof ReviewLine,value:string){setReview((r)=>r?{...r,lineItems:r.lineItems.map((item,i)=>i===index?{...item,[name]:value||null}:item)}:r)}
-  async function submit(event:FormEvent){event.preventDefault();if(!review)return;setSaving(true);setError("");try{const {invoiceId:_,...rest}=review;void _;const payload={...rest,lineItems:rest.lineItems.map(({id,...line})=>{void id;return line})};await request(`/v1/invoices/${invoiceId}/review`,{method:"PUT",body:JSON.stringify(payload)});onApproved();}catch(e){setError(e instanceof Error?e.message:"Review couldn't be saved. Check the values and try again.");setSaving(false)}}
+  async function submit(event:FormEvent){event.preventDefault();if(!review)return;setError("");if(!isValidInvoiceReview(review)){setError("Check the highlighted invoice fields and line items before approving.");return}setSaving(true);try{const {invoiceId:_,hasWarnings:__,...rest}=review;void _;void __;const payload={...rest,lineItems:rest.lineItems.map(({id,hasWarnings,...line})=>{void id;void hasWarnings;return line})};await request(`/v1/invoices/${invoiceId}/review`,{method:"PUT",body:JSON.stringify(payload)});onApproved();}catch(e){setError(e instanceof Error?e.message:"Review couldn't be saved. Check the values and try again.");setSaving(false)}}
   if(!review)return <section className="review-shell"><button className="text-button" onClick={onBack}>Back to invoices</button><p role={error?"alert":"status"}>{error||"Loading invoice…"}</p></section>;
   const textFields:[keyof Review,string][]=[["supplierName","Supplier"],["invoiceDate","Invoice date"],["invoiceNumber","Invoice number"],["currency","Currency"]];
   const totals:[keyof Review,string][]=[["subtotal","Subtotal"],["tax","Tax"],["fees","Fees"],["discount","Discount"],["total","Total"]];
-  return <section className="review-shell" aria-labelledby="review-heading"><div className="review-heading"><button className="text-button" type="button" onClick={onBack}>Back to invoices</button><button className="file-button" type="button" onClick={onViewOriginal}>View original</button></div><h1 id="review-heading">Review invoice</h1><p>Check every value against the original before approving.</p><form onSubmit={submit} className="review-form"> <div className="review-fields">{textFields.map(([name,label])=><label key={name}>{label}<input type={name==="invoiceDate"?"date":"text"} value={(review[name] as string|null)??""} onChange={(e)=>field(name,e.target.value)} required={name==="supplierName"||name==="currency"}/></label>)}</div><fieldset><legend>Line items</legend>{review.lineItems.map((item,index)=><div className="line-card" key={item.id??index}><label>Description<input value={item.description} onChange={(e)=>line(index,"description",e.target.value)} required/></label>{(["sku","quantity","unit","unitPrice","lineTotal"] as (keyof ReviewLine)[]).map((name)=><label key={name}>{name.replace(/([A-Z])/g," $1")}<input inputMode={name==="quantity"||name==="unitPrice"||name==="lineTotal"?"decimal":undefined} value={(item[name] as string|null)??""} onChange={(e)=>line(index,name,e.target.value)}/></label>)}<button className="text-button" type="button" onClick={()=>setReview({...review,lineItems:review.lineItems.filter((_,i)=>i!==index)})}>Remove row</button></div>)}<button className="file-button" type="button" onClick={()=>setReview({...review,lineItems:[...review.lineItems,{sku:null,description:"",quantity:null,unit:null,unitPrice:null,lineTotal:null}]})}>Add row</button></fieldset><div className="review-fields totals">{totals.map(([name,label])=><label key={name}>{label}<input inputMode="decimal" value={(review[name] as string|null)??""} onChange={(e)=>field(name,e.target.value)}/></label>)}</div>{error&&<p className="form-error" role="alert">{error}</p>}<button className="ledger-button" disabled={saving}>{saving?"Approving…":"Approve invoice"}</button></form></section>;
+  const headerNeedsAttention=review.hasWarnings||!isValidInvoiceHeader(review);
+  return <section className="review-shell" aria-labelledby="review-heading"><div className="review-heading"><button className="text-button" type="button" onClick={onBack}>Back to invoices</button><button className="file-button" type="button" onClick={onViewOriginal}>View original</button></div><h1 id="review-heading">Review invoice</h1><p>Check every value against the original before approving.</p><form onSubmit={submit} className="review-form">{headerNeedsAttention&&<p className="review-warning" role="status">Some invoice details were unclear or invalid. Compare them with the original.</p>}<div className={`review-fields${headerNeedsAttention?" needs-attention":""}`}>{textFields.map(([name,label])=><label key={name}>{label}<input type={name==="invoiceDate"?"date":"text"} value={(review[name] as string|null)??""} onChange={(e)=>field(name,e.target.value)} maxLength={name==="supplierName"||name==="invoiceNumber"?120:name==="currency"?3:undefined} required={name==="supplierName"||name==="currency"}/></label>)}</div><fieldset><legend>Line items</legend>{review.lineItems.map((item,index)=>{const needsAttention=item.hasWarnings||!isValidInvoiceLine(item);return <div className={`line-card${needsAttention?" needs-attention":""}`} key={item.id??index}>{needsAttention&&<p className="review-warning" role="status">Check this line against the original invoice.</p>}<label>Description<input value={item.description} maxLength={500} onChange={(e)=>line(index,"description",e.target.value)} required/></label>{(["sku","quantity","unit","unitPrice","lineTotal"] as (keyof ReviewLine)[]).map((name)=><label key={name}>{name.replace(/([A-Z])/g," $1")}<input inputMode={name==="quantity"||name==="unitPrice"||name==="lineTotal"?"decimal":undefined} maxLength={name==="sku"?120:name==="unit"?40:32} value={(item[name] as string|null)??""} onChange={(e)=>line(index,name,e.target.value)}/></label>)}<button className="text-button" type="button" onClick={()=>setReview({...review,lineItems:review.lineItems.filter((_,i)=>i!==index)})}>Remove row</button></div>})}<button className="file-button" type="button" onClick={()=>setReview({...review,lineItems:[...review.lineItems,{sku:null,description:"",quantity:null,unit:null,unitPrice:null,lineTotal:null,hasWarnings:true}]})}>Add row</button></fieldset><div className="review-fields totals">{totals.map(([name,label])=><label key={name}>{label}<input inputMode="decimal" maxLength={32} value={(review[name] as string|null)??""} onChange={(e)=>field(name,e.target.value)}/></label>)}</div>{error&&<p className="form-error" role="alert">{error}</p>}<button className="ledger-button" disabled={saving}>{saving?"Approving…":"Approve invoice"}</button></form></section>;
 }
+
+function isValidInvoiceHeader(review:Review){return Boolean(review.supplierName.trim())&&review.supplierName.trim().length<=120&&/^[A-Z]{3}$/.test(review.currency.trim())&&(review.invoiceNumber?.trim().length??0)<=120&&[review.subtotal,review.tax,review.fees,review.discount,review.total].every(value=>isValidOptionalDecimal(value,4))}
+function isValidInvoiceLine(line:ReviewLine){return Boolean(line.description.trim())&&line.description.trim().length<=500&&(line.sku?.trim().length??0)<=120&&(line.unit?.trim().length??0)<=40&&isValidOptionalDecimal(line.quantity,6)&&isValidOptionalDecimal(line.unitPrice,4)&&isValidOptionalDecimal(line.lineTotal,4)}
+function isValidInvoiceReview(review:Review){return isValidInvoiceHeader(review)&&review.lineItems.length<=200&&review.lineItems.every(isValidInvoiceLine)}
+function isValidOptionalDecimal(value:string|null,scale:number){if(!value?.trim())return true;const normalized=value.trim();const match=/^[+-]?(\d+)(?:\.(\d*))?$/.exec(normalized);return Boolean(match&&normalized.length<=32&&(match[2]?.length??0)<=scale&&match[1].replace(/^0+/,"").length<=18-scale)}
 
 function PriceChanges({ invoiceId, request, onBack }: { invoiceId:string; request:<T>(path:string, init?:RequestInit)=>Promise<T>; onBack:()=>void }) {
   const [changes,setChanges]=useState<PriceChange[]|null>(null); const [error,setError]=useState("");

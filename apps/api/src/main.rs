@@ -1,5 +1,6 @@
 mod auth;
 mod extraction;
+mod inventory;
 mod invoices;
 mod menu;
 mod menu_imports;
@@ -176,6 +177,24 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             get(invoices::price_changes),
         )
         .route("/v1/menu-items", get(menu::list).post(menu::create))
+        .route(
+            "/v1/inventory-items",
+            get(inventory::list_items).post(inventory::create_item),
+        )
+        .route(
+            "/v1/inventory-items/{id}",
+            axum::routing::put(inventory::update_item),
+        )
+        .route("/v1/inventory-counts/draft", get(inventory::draft))
+        .route("/v1/inventory-counts", post(inventory::start))
+        .route(
+            "/v1/inventory-counts/{id}",
+            axum::routing::put(inventory::save),
+        )
+        .route(
+            "/v1/inventory-counts/{id}/complete",
+            post(inventory::complete),
+        )
         .route(
             "/v1/menu-imports",
             get(menu_imports::list)

@@ -19,7 +19,13 @@ use crate::{
     uploads::{UploadedFile, multipart_error},
 };
 
-type ValidatedItem = (String, Option<String>, Option<BigDecimal>, Option<String>);
+type ValidatedItem = (
+    String,
+    Option<String>,
+    Option<BigDecimal>,
+    Option<String>,
+    bool,
+);
 
 const RETRY_DELAYS_SECS: [u64; 5] = [30, 5 * 60, 60 * 60, 6 * 60 * 60, 18 * 60 * 60];
 
@@ -40,6 +46,7 @@ struct Item {
     category: Option<String>,
     selling_price: Option<String>,
     currency: Option<String>,
+    has_warnings: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,7 +62,7 @@ pub(crate) struct Approval {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ApprovalItem {
-    id: Uuid,
+    id: Option<Uuid>,
     name: String,
     category: Option<String>,
     selling_price: String,
@@ -144,7 +151,7 @@ pub(crate) async fn review(
 ) -> Result<Json<Review>, ApiError> {
     let m = membership(&s, &headers).await?;
     let import=sqlx::query_as("SELECT id,original_filename,status,status='processing' AND updated_at<NOW()-INTERVAL '5 minutes' AS delayed,created_at FROM menu_imports WHERE id=$1 AND restaurant_id=$2").bind(id).bind(m.restaurant_id).fetch_optional(&s.pool).await.map_err(crate::database_error)?.ok_or(ApiError(StatusCode::NOT_FOUND,"Menu import not found."))?;
-    let items=sqlx::query_as("SELECT id,name,category,selling_price::text selling_price,currency FROM menu_import_items WHERE menu_import_id=$1 ORDER BY position").bind(id).fetch_all(&s.pool).await.map_err(crate::database_error)?;
+    let items=sqlx::query_as("SELECT id,name,category,selling_price::text selling_price,currency,has_warnings FROM menu_import_items WHERE menu_import_id=$1 ORDER BY position").bind(id).fetch_all(&s.pool).await.map_err(crate::database_error)?;
     Ok(Json(Review { import, items }))
 }
 pub(crate) async fn file_url(
@@ -203,7 +210,7 @@ pub(crate) async fn approve(
     let mut clean = Vec::new();
     let mut selected_ids = HashSet::new();
     for item in input.items {
-        if !selected_ids.insert(item.id) {
+        if item.id.is_some_and(|id| !selected_ids.insert(id)) {
             return Err(invalid());
         }
         let name = item.name.trim().to_owned();
@@ -248,7 +255,11 @@ pub(crate) async fn approve(
             .map_err(crate::database_error)?
             .into_iter()
             .collect::<HashSet<_>>();
-    if clean.iter().any(|v| !valid_ids.contains(&v.0)) {
+    if clean
+        .iter()
+        .filter_map(|value| value.0)
+        .any(|id| !valid_ids.contains(&id))
+    {
         return Err(invalid());
     }
     let mut insert = QueryBuilder::<Postgres>::new(
@@ -298,7 +309,7 @@ pub(crate) async fn run_worker(pool: PgPool, storage: ObjectStorage, gemini: Gem
     loop {
         match claim(&pool).await {
             Ok(Some(j)) => process(&pool, &storage, &gemini, j).await,
-            Ok(None) => tokio::time::sleep(Duration::from_secs(3)).await,
+            Ok(None) => tokio::time::sleep(Duration::from_secs(15)).await,
             Err(e) => {
                 tracing::error!(%e,"menu import claim failed");
                 tokio::time::sleep(Duration::from_secs(10)).await
@@ -388,18 +399,19 @@ async fn persist(
         .execute(&mut *tx)
         .await?;
     let mut insert = QueryBuilder::<Postgres>::new(
-        "INSERT INTO menu_import_items(id,menu_import_id,position,name,category,selling_price,currency) ",
+        "INSERT INTO menu_import_items(id,menu_import_id,position,name,category,selling_price,currency,has_warnings) ",
     );
     insert.push_values(
         items.into_iter().enumerate(),
-        |mut row, (position, (name, category, price, currency))| {
+        |mut row, (position, (name, category, price, currency, has_warnings))| {
             row.push_bind(Uuid::now_v7())
                 .push_bind(j.id)
                 .push_bind(position as i32)
                 .push_bind(name)
                 .push_bind(category)
                 .push_bind(price)
-                .push_bind(currency);
+                .push_bind(currency)
+                .push_bind(has_warnings);
         },
     );
     insert.build().execute(&mut *tx).await?;
@@ -411,37 +423,37 @@ async fn persist(
 fn validate_extracted(
     items: Vec<crate::extraction::ExtractedMenuItem>,
 ) -> Result<Vec<ValidatedItem>> {
-    if items.is_empty() || items.len() > 200 {
-        return Err(anyhow!(
-            "menu extraction must contain between 1 and 200 items"
-        ));
+    if items.is_empty() {
+        return Err(anyhow!("menu extraction did not contain any items"));
     }
     items
         .into_iter()
+        .take(200)
         .map(|i| {
             let name = i.name.trim().to_owned();
             let category = i.category.and_then(|v| {
                 let v = v.trim().to_owned();
                 (!v.is_empty()).then_some(v)
             });
-            let currency = i.currency.map(|v| v.trim().to_ascii_uppercase());
-            if name.is_empty()
+            let raw_currency = i.currency.map(|v| v.trim().to_ascii_uppercase());
+            let currency = raw_currency
+                .clone()
+                .filter(|value| value.len() == 3 && value.bytes().all(|c| c.is_ascii_uppercase()));
+            let raw_price = i.selling_price.map(|v| v.trim().to_owned());
+            let price = raw_price
+                .as_deref()
+                .and_then(|value| strict_decimal(value, 4).ok());
+            let has_warnings = name.is_empty()
                 || name.chars().count() > 50
-                || category.as_ref().is_some_and(|v| v.chars().count() > 20)
-                || currency
+                || category
                     .as_ref()
-                    .is_some_and(|v| v.len() != 3 || !v.bytes().all(|c| c.is_ascii_uppercase()))
-            {
-                return Err(anyhow!("invalid menu item"));
-            }
-            let price = i
-                .selling_price
-                .map(|v| strict_decimal(v.trim(), 4).map_err(|_| anyhow!("invalid price")))
-                .transpose()?;
-            if price.as_ref().is_some_and(|v| v <= &BigDecimal::from(0)) {
-                return Err(anyhow!("invalid price"));
-            }
-            Ok((name, category, price, currency))
+                    .is_some_and(|value| value.chars().count() > 20)
+                || raw_currency.is_some() && currency.is_none()
+                || raw_price.is_some() && price.is_none()
+                || price
+                    .as_ref()
+                    .is_some_and(|value| value <= &BigDecimal::from(0));
+            Ok((name, category, price, currency, has_warnings))
         })
         .collect()
 }
@@ -512,37 +524,23 @@ mod tests {
         .unwrap();
         assert_eq!(got[0].0, "Taco");
         assert_eq!(got[0].3.as_deref(), Some("USD"));
+        assert!(!got[0].4);
     }
     #[test]
-    fn rejects_bad_extraction() {
+    fn keeps_questionable_rows_for_review() {
         assert!(validate_extracted(vec![]).is_err());
-        assert!(
-            validate_extracted(vec![ExtractedMenuItem {
-                name: "".into(),
-                category: None,
-                selling_price: None,
-                currency: None
-            }])
-            .is_err()
-        );
-        assert!(
-            validate_extracted(vec![ExtractedMenuItem {
-                name: "Taco".into(),
-                category: None,
-                selling_price: Some("market".into()),
-                currency: None
-            }])
-            .is_err()
-        );
-        assert!(
-            validate_extracted(vec![ExtractedMenuItem {
-                name: "x".repeat(51),
-                category: Some("x".repeat(21)),
-                selling_price: Some("12.50".into()),
-                currency: Some("USD".into())
-            }])
-            .is_err()
-        );
+        let got = validate_extracted(vec![ExtractedMenuItem {
+            name: "x".repeat(51),
+            category: Some("x".repeat(21)),
+            selling_price: Some("market".into()),
+            currency: Some("US dollars".into()),
+        }])
+        .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.chars().count(), 51);
+        assert!(got[0].2.is_none());
+        assert!(got[0].3.is_none());
+        assert!(got[0].4);
     }
 
     #[test]

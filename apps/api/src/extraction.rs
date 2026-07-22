@@ -135,7 +135,7 @@ impl GeminiClient {
         let nullable_string = || json!({"anyOf": [{"type": "string"}, {"type": "null"}]});
         let schema = json!({
             "type":"object", "additionalProperties":false, "required":["items"],
-            "properties":{"items":{"type":"array","maxItems":200,"items":{
+            "properties":{"items":{"type":"array","items":{
                 "type":"object","additionalProperties":false,
                 "required":["name","category","selling_price","currency"],
                 "properties":{"name":{"type":"string"},"category":nullable_string(),"selling_price":nullable_string(),"currency":nullable_string()}
@@ -533,7 +533,7 @@ pub(crate) async fn run_worker(pool: PgPool, storage: ObjectStorage, gemini: Gem
     loop {
         match claim(&pool).await {
             Ok(Some(job)) => process(&pool, &storage, &gemini, job).await,
-            Ok(None) => tokio::time::sleep(Duration::from_secs(3)).await,
+            Ok(None) => tokio::time::sleep(Duration::from_secs(15)).await,
             Err(error) => {
                 tracing::error!(%error, "invoice worker claim failed");
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -598,7 +598,7 @@ async fn process(pool: &PgPool, storage: &ObjectStorage, gemini: &GeminiClient, 
             return;
         }
     };
-    let result = match gemini.extract(bytes, &job.content_type).await {
+    let mut result = match gemini.extract(bytes, &job.content_type).await {
         Ok(result) => result,
         Err(ProviderError::Retryable { error, retry_after }) => {
             handle_failure(pool, &job, error, false, retry_after).await;
@@ -609,11 +609,8 @@ async fn process(pool: &PgPool, storage: &ObjectStorage, gemini: &GeminiClient, 
             return;
         }
     };
-    if let Err(error) = validate_provider(&result.extracted) {
-        handle_failure(pool, &job, error, true, None).await;
-        return;
-    }
-    if let Err(error) = persist(pool, &job, &gemini.model, result).await {
+    let warnings = normalize_provider(&mut result.extracted);
+    if let Err(error) = persist(pool, &job, &gemini.model, result, warnings).await {
         handle_failure(pool, &job, error, false, None).await;
     }
 }
@@ -645,6 +642,7 @@ async fn persist(
     job: &ClaimedJob,
     model: &str,
     result: ProviderResult,
+    warnings: ProviderWarnings,
 ) -> Result<()> {
     let id = job.invoice_id;
     let e = result.extracted;
@@ -655,21 +653,22 @@ async fn persist(
         tx.commit().await?;
         return Ok(());
     }
-    sqlx::query("INSERT INTO invoice_extractions (invoice_id,provider,model_id,raw_provider_json,supplier_name,invoice_number,invoice_date,currency,subtotal,tax,fees,discount,total,prompt_tokens,candidate_tokens)
-        VALUES ($1,'gemini',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-        ON CONFLICT (invoice_id) DO UPDATE SET provider='gemini',model_id=EXCLUDED.model_id,raw_provider_json=EXCLUDED.raw_provider_json,supplier_name=EXCLUDED.supplier_name,invoice_number=EXCLUDED.invoice_number,invoice_date=EXCLUDED.invoice_date,currency=EXCLUDED.currency,subtotal=EXCLUDED.subtotal,tax=EXCLUDED.tax,fees=EXCLUDED.fees,discount=EXCLUDED.discount,total=EXCLUDED.total,prompt_tokens=EXCLUDED.prompt_tokens,candidate_tokens=EXCLUDED.candidate_tokens,updated_at=NOW()")
+    sqlx::query("INSERT INTO invoice_extractions (invoice_id,provider,model_id,raw_provider_json,supplier_name,invoice_number,invoice_date,currency,subtotal,tax,fees,discount,total,prompt_tokens,candidate_tokens,has_warnings)
+        VALUES ($1,'gemini',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        ON CONFLICT (invoice_id) DO UPDATE SET provider='gemini',model_id=EXCLUDED.model_id,raw_provider_json=EXCLUDED.raw_provider_json,supplier_name=EXCLUDED.supplier_name,invoice_number=EXCLUDED.invoice_number,invoice_date=EXCLUDED.invoice_date,currency=EXCLUDED.currency,subtotal=EXCLUDED.subtotal,tax=EXCLUDED.tax,fees=EXCLUDED.fees,discount=EXCLUDED.discount,total=EXCLUDED.total,prompt_tokens=EXCLUDED.prompt_tokens,candidate_tokens=EXCLUDED.candidate_tokens,has_warnings=EXCLUDED.has_warnings,updated_at=NOW()")
         .bind(id).bind(model).bind(result.raw).bind(&e.supplier_name).bind(&e.invoice_number)
         .bind(e.invoice_date.as_deref().map(parse_date).transpose()?).bind(e.currency.to_ascii_uppercase())
         .bind(decimal(&e.subtotal, 4)?).bind(decimal(&e.tax, 4)?).bind(decimal(&e.fees, 4)?).bind(decimal(&e.discount, 4)?).bind(decimal(&e.total, 4)?)
-        .bind(result.prompt_tokens).bind(result.candidate_tokens).execute(&mut *tx).await?;
+        .bind(result.prompt_tokens).bind(result.candidate_tokens).bind(warnings.header).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM invoice_line_items WHERE invoice_id=$1")
         .bind(id)
         .execute(&mut *tx)
         .await?;
     for (position, line) in e.line_items.iter().enumerate() {
-        sqlx::query("INSERT INTO invoice_line_items (id,invoice_id,position,sku,description,quantity,unit,unit_price,line_total) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+        sqlx::query("INSERT INTO invoice_line_items (id,invoice_id,position,sku,description,quantity,unit,unit_price,line_total,has_warnings) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
             .bind(Uuid::now_v7()).bind(id).bind(position as i32).bind(&line.sku).bind(&line.description)
-            .bind(decimal(&line.quantity, 6)?).bind(&line.unit).bind(decimal(&line.unit_price, 4)?).bind(decimal(&line.line_total, 4)?).execute(&mut *tx).await?;
+            .bind(decimal(&line.quantity, 6)?).bind(&line.unit).bind(decimal(&line.unit_price, 4)?).bind(decimal(&line.line_total, 4)?)
+            .bind(warnings.lines[position]).execute(&mut *tx).await?;
     }
     sqlx::query("UPDATE invoices SET status='needs_review',updated_at=NOW() WHERE id=$1 AND status='processing'")
         .bind(id)
@@ -680,45 +679,91 @@ async fn persist(
     Ok(())
 }
 
-fn validate_provider(e: &ExtractedInvoice) -> Result<()> {
-    anyhow::ensure!(
-        !e.supplier_name.trim().is_empty() && e.supplier_name.chars().count() <= 120,
-        "invalid supplier"
-    );
-    anyhow::ensure!(
-        e.currency.len() == 3 && e.currency.chars().all(|c| c.is_ascii_alphabetic()),
-        "invalid currency"
-    );
-    anyhow::ensure!(
-        e.invoice_number
+struct ProviderWarnings {
+    header: bool,
+    lines: Vec<bool>,
+}
+
+fn normalize_provider(e: &mut ExtractedInvoice) -> ProviderWarnings {
+    e.supplier_name = e.supplier_name.trim().to_owned();
+    e.invoice_number = trimmed(e.invoice_number.take());
+    e.currency = e.currency.trim().to_ascii_uppercase();
+    e.invoice_date = trimmed(e.invoice_date.take());
+
+    let mut header = e.supplier_name.is_empty()
+        || e.supplier_name.chars().count() > 120
+        || e.invoice_number
             .as_ref()
-            .is_none_or(|value| value.chars().count() <= 120),
-        "invalid invoice number"
-    );
-    if let Some(date) = e.invoice_date.as_deref() {
-        parse_date(date).context("invalid invoice date")?;
+            .is_some_and(|value| value.chars().count() > 120);
+    if e.currency.len() != 3 || !e.currency.bytes().all(|value| value.is_ascii_uppercase()) {
+        e.currency.clear();
+        header = true;
     }
-    for value in [&e.subtotal, &e.tax, &e.fees, &e.discount, &e.total] {
-        decimal(value, 4)?;
+    if e.invoice_date
+        .as_deref()
+        .is_some_and(|value| parse_date(value).is_err())
+    {
+        e.invoice_date = None;
+        header = true;
     }
-    anyhow::ensure!(
-        e.line_items.len() <= 200
-            && e.line_items.iter().all(|l| !l.description.trim().is_empty()
-                && l.description.chars().count() <= 500
-                && l.sku
+    for value in [
+        &mut e.subtotal,
+        &mut e.tax,
+        &mut e.fees,
+        &mut e.discount,
+        &mut e.total,
+    ] {
+        header |= normalize_decimal(value, 4);
+    }
+
+    if e.line_items.len() > 200 {
+        e.line_items.truncate(200);
+        header = true;
+    }
+    let lines = e
+        .line_items
+        .iter_mut()
+        .map(|line| {
+            line.description = line.description.trim().to_owned();
+            line.sku = trimmed(line.sku.take());
+            line.unit = trimmed(line.unit.take());
+            let mut warning = line.description.is_empty()
+                || line.description.chars().count() > 500
+                || line
+                    .sku
                     .as_ref()
-                    .is_none_or(|value| value.chars().count() <= 120)
-                && l.unit
+                    .is_some_and(|value| value.chars().count() > 120)
+                || line
+                    .unit
                     .as_ref()
-                    .is_none_or(|value| value.chars().count() <= 40)),
-        "invalid lines"
-    );
-    for line in &e.line_items {
-        decimal(&line.quantity, 6)?;
-        decimal(&line.unit_price, 4)?;
-        decimal(&line.line_total, 4)?;
+                    .is_some_and(|value| value.chars().count() > 40);
+            warning |= normalize_decimal(&mut line.quantity, 6);
+            warning |= normalize_decimal(&mut line.unit_price, 4);
+            warning |= normalize_decimal(&mut line.line_total, 4);
+            warning
+        })
+        .collect();
+    ProviderWarnings { header, lines }
+}
+
+fn trimmed(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+fn normalize_decimal(value: &mut Option<String>, scale: usize) -> bool {
+    let Some(raw) = value.take() else {
+        return false;
+    };
+    let raw = raw.trim().to_owned();
+    if strict_decimal(&raw, scale).is_ok() {
+        *value = Some(raw);
+        false
+    } else {
+        true
     }
-    Ok(())
 }
 fn parse_date(v: &str) -> Result<NaiveDate> {
     Ok(NaiveDate::parse_from_str(v, "%Y-%m-%d")?)
@@ -790,20 +835,34 @@ mod tests {
         assert!(parse_menu_response(raw).is_err());
     }
     #[test]
-    fn rejects_invalid_provider_values_before_persistence() {
-        let invalid = ExtractedInvoice {
-            supplier_name: "Acme".into(),
+    fn keeps_invalid_provider_values_for_review() {
+        let mut extracted = ExtractedInvoice {
+            supplier_name: " Acme ".into(),
             invoice_number: None,
             invoice_date: Some("07/17/2026".into()),
-            currency: "USD".into(),
+            currency: "US dollars".into(),
             subtotal: Some("1e3".into()),
             tax: None,
             fees: None,
             discount: None,
             total: None,
-            line_items: vec![],
+            line_items: vec![ExtractedLine {
+                sku: None,
+                description: " ".into(),
+                quantity: Some("several".into()),
+                unit: None,
+                unit_price: None,
+                line_total: None,
+            }],
         };
-        assert!(validate_provider(&invalid).is_err());
+        let warnings = normalize_provider(&mut extracted);
+        assert_eq!(extracted.supplier_name, "Acme");
+        assert!(extracted.invoice_date.is_none());
+        assert!(extracted.currency.is_empty());
+        assert!(extracted.subtotal.is_none());
+        assert!(extracted.line_items[0].quantity.is_none());
+        assert!(warnings.header);
+        assert_eq!(warnings.lines, vec![true]);
     }
 
     #[test]

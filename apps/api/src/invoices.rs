@@ -49,6 +49,7 @@ struct ReviewHeader {
     fees: Option<String>,
     discount: Option<String>,
     total: Option<String>,
+    has_warnings: bool,
 }
 
 struct Upload {
@@ -222,6 +223,7 @@ pub(crate) struct Review {
     fees: Option<String>,
     discount: Option<String>,
     total: Option<String>,
+    has_warnings: bool,
     line_items: Vec<ReviewLine>,
 }
 
@@ -235,6 +237,7 @@ struct ReviewLine {
     unit: Option<String>,
     unit_price: Option<String>,
     line_total: Option<String>,
+    has_warnings: bool,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -296,11 +299,11 @@ pub(crate) async fn get_review(
 ) -> Result<Json<Review>, ApiError> {
     let member = membership(&state, &headers).await?;
     let header = sqlx::query_as::<_, ReviewHeader>("SELECT e.invoice_id,e.supplier_name,e.invoice_number,e.invoice_date,e.currency,
-        e.subtotal::text subtotal,e.tax::text tax,e.fees::text fees,e.discount::text discount,e.total::text total
+        e.subtotal::text subtotal,e.tax::text tax,e.fees::text fees,e.discount::text discount,e.total::text total,e.has_warnings
         FROM invoice_extractions e JOIN invoices i ON i.id=e.invoice_id WHERE e.invoice_id=$1 AND i.restaurant_id=$2 AND i.status IN ('needs_review','ready')")
         .bind(id).bind(member.restaurant_id).fetch_optional(&state.pool).await.map_err(crate::database_error)?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "Invoice review is not available."))?;
-    let line_items = sqlx::query_as::<_, ReviewLine>("SELECT id,sku,description,quantity::text quantity,unit,unit_price::text unit_price,line_total::text line_total FROM invoice_line_items WHERE invoice_id=$1 ORDER BY position")
+    let line_items = sqlx::query_as::<_, ReviewLine>("SELECT id,sku,description,quantity::text quantity,unit,unit_price::text unit_price,line_total::text line_total,has_warnings FROM invoice_line_items WHERE invoice_id=$1 ORDER BY position")
         .bind(id).fetch_all(&state.pool).await.map_err(crate::database_error)?;
     let review = Review {
         invoice_id: header.invoice_id,
@@ -313,6 +316,7 @@ pub(crate) async fn get_review(
         fees: header.fees,
         discount: header.discount,
         total: header.total,
+        has_warnings: header.has_warnings,
         line_items,
     };
     Ok(Json(review))
@@ -348,7 +352,7 @@ pub(crate) async fn put_review(
             "This invoice is not waiting for review.",
         ));
     }
-    sqlx::query("UPDATE invoice_extractions SET supplier_name=$2,invoice_number=$3,invoice_date=$4,currency=$5,subtotal=$6,tax=$7,fees=$8,discount=$9,total=$10,reviewed_by=$11,reviewed_at=NOW(),updated_at=NOW() WHERE invoice_id=$1")
+    sqlx::query("UPDATE invoice_extractions SET supplier_name=$2,invoice_number=$3,invoice_date=$4,currency=$5,subtotal=$6,tax=$7,fees=$8,discount=$9,total=$10,has_warnings=FALSE,reviewed_by=$11,reviewed_at=NOW(),updated_at=NOW() WHERE invoice_id=$1")
         .bind(id).bind(&input.supplier_name).bind(&input.invoice_number).bind(invoice_date).bind(&input.currency)
         .bind(subtotal).bind(tax).bind(fees).bind(discount).bind(total).bind(member.user_id)
         .execute(&mut *tx).await.map_err(crate::database_error)?;
