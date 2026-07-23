@@ -1,11 +1,17 @@
 mod auth;
+mod costing;
 mod extraction;
 mod inventory;
 mod invoices;
+mod losses;
 mod menu;
 mod menu_imports;
+mod purchases;
+mod sales;
 mod storage;
+mod today;
 mod uploads;
+mod weekly_brief;
 
 use std::{env, net::SocketAddr};
 
@@ -48,6 +54,7 @@ struct Restaurant {
     name: String,
     city: String,
     service_style: String,
+    timezone: String,
     role: String,
 }
 
@@ -159,6 +166,8 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/v1/me", get(me))
+        .route("/v1/today", get(today::get))
+        .route("/v1/weekly-brief", get(weekly_brief::get))
         .route("/v1/restaurants", post(create_restaurant))
         .route(
             "/v1/invoices",
@@ -176,7 +185,23 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             "/v1/invoices/{id}/price-changes",
             get(invoices::price_changes),
         )
+        .route("/v1/invoices/{id}/purchase-review", get(purchases::review))
+        .route(
+            "/v1/invoices/{id}/purchase-receipt",
+            axum::routing::put(purchases::record),
+        )
+        .route("/v1/sales-days", get(sales::list))
+        .route(
+            "/v1/sales-days/{businessDate}",
+            get(sales::get).put(sales::put),
+        )
+        .route("/v1/sales/menu-options", get(sales::menu_options))
         .route("/v1/menu-items", get(menu::list).post(menu::create))
+        .route("/v1/menu-items/{id}/costing", get(costing::get))
+        .route(
+            "/v1/menu-items/{id}/ingredients",
+            axum::routing::put(costing::put),
+        )
         .route(
             "/v1/inventory-items",
             get(inventory::list_items).post(inventory::create_item),
@@ -185,6 +210,7 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             "/v1/inventory-items/{id}",
             axum::routing::put(inventory::update_item),
         )
+        .route("/v1/loss-events", get(losses::list).post(losses::create))
         .route("/v1/inventory-counts/draft", get(inventory::draft))
         .route("/v1/inventory-counts", post(inventory::start))
         .route(
@@ -218,7 +244,7 @@ async fn me(
 ) -> Result<Json<MeResponse>, ApiError> {
     let subject = authenticated_subject(&state, &headers).await?;
     let restaurant = sqlx::query_as::<_, Restaurant>(
-        "SELECT r.id, r.name, r.city, r.service_style, m.role
+        "SELECT r.id, r.name, r.city, r.service_style, r.timezone, m.role
          FROM users u JOIN restaurant_memberships m ON m.user_id = u.id
          JOIN restaurants r ON r.id = m.restaurant_id WHERE u.auth_subject = $1",
     )
@@ -253,14 +279,17 @@ async fn create_restaurant(
     .await
     .map_err(database_error)?;
     let restaurant_id = uuid::Uuid::now_v7();
-    sqlx::query("INSERT INTO restaurants (id, name, city, service_style) VALUES ($1, $2, $3, $4)")
-        .bind(restaurant_id)
-        .bind(&input.name)
-        .bind(&input.city)
-        .bind(&input.service_style)
-        .execute(&mut *tx)
-        .await
-        .map_err(database_error)?;
+    let timezone = sqlx::query_scalar::<_, String>(
+        "INSERT INTO restaurants (id, name, city, service_style) VALUES ($1, $2, $3, $4)
+         RETURNING timezone",
+    )
+    .bind(restaurant_id)
+    .bind(&input.name)
+    .bind(&input.city)
+    .bind(&input.service_style)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(database_error)?;
     if let Err(error) = sqlx::query(
         "INSERT INTO restaurant_memberships (restaurant_id, user_id, role) VALUES ($1, $2, 'owner')",
     ).bind(restaurant_id).bind(user_id).execute(&mut *tx).await {
@@ -279,6 +308,7 @@ async fn create_restaurant(
             name: input.name,
             city: input.city,
             service_style: input.service_style,
+            timezone,
             role: "owner".into(),
         }),
     ))

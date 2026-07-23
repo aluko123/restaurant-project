@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState,
+    ApiError, AppState, authenticated_subject, database_error,
     invoices::{membership, strict_decimal},
 };
 
@@ -21,6 +21,7 @@ pub(crate) struct MenuItem {
     selling_price: String,
     currency: String,
     active: bool,
+    ingredient_count: i64,
 }
 
 #[derive(Deserialize)]
@@ -36,11 +37,16 @@ pub(crate) async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<MenuItem>>, ApiError> {
-    let restaurant_id = membership(&state, &headers).await?.restaurant_id;
+    let restaurant_id = manager_restaurant_id(&state, &headers).await?;
     let items = sqlx::query_as::<_, MenuItem>(
-        "SELECT id,name,category,selling_price::text AS selling_price,currency,active
-         FROM menu_items WHERE restaurant_id=$1 AND active
-         ORDER BY category NULLS LAST,name,id",
+        "SELECT item.id,item.name,item.category,item.selling_price::text AS selling_price,
+                item.currency,item.active,COUNT(ingredient.id)::bigint AS ingredient_count
+         FROM menu_items item
+         LEFT JOIN menu_item_ingredients ingredient ON ingredient.menu_item_id=item.id
+           AND ingredient.restaurant_id=item.restaurant_id
+         WHERE item.restaurant_id=$1 AND item.active
+         GROUP BY item.id,item.name,item.category,item.selling_price,item.currency,item.active
+         ORDER BY item.category NULLS LAST,item.name,item.id",
     )
     .bind(restaurant_id)
     .fetch_all(&state.pool)
@@ -59,7 +65,8 @@ pub(crate) async fn create(
     let item = sqlx::query_as::<_, MenuItem>(
         "INSERT INTO menu_items (id,restaurant_id,name,category,selling_price,currency)
          VALUES ($1,$2,$3,$4,$5,$6)
-         RETURNING id,name,category,selling_price::text AS selling_price,currency,active",
+         RETURNING id,name,category,selling_price::text AS selling_price,currency,active,
+                   0::bigint AS ingredient_count",
     )
     .bind(Uuid::now_v7())
     .bind(restaurant_id)
@@ -84,6 +91,23 @@ pub(crate) async fn create(
         }
     })?;
     Ok((StatusCode::CREATED, Json(item)))
+}
+
+async fn manager_restaurant_id(state: &AppState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    let subject = authenticated_subject(state, headers).await?;
+    sqlx::query_scalar(
+        "SELECT m.restaurant_id FROM users u
+         JOIN restaurant_memberships m ON m.user_id=u.id
+         WHERE u.auth_subject=$1 AND m.role IN ('owner','manager')",
+    )
+    .bind(subject)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(database_error)?
+    .ok_or(ApiError(
+        StatusCode::FORBIDDEN,
+        "Owner or manager access is required for menu costing.",
+    ))
 }
 
 impl CreateMenuItem {

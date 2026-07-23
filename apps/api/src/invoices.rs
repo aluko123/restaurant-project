@@ -7,7 +7,7 @@ use bigdecimal::BigDecimal;
 use bytes::Bytes;
 use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Postgres, QueryBuilder};
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{
@@ -287,67 +287,92 @@ pub(crate) struct PriceChange {
     previous_invoice_date: NaiveDate,
 }
 
+#[derive(sqlx::FromRow)]
+struct PriceChangeRow {
+    id: Uuid,
+    invoice_id: Uuid,
+    supplier_name: String,
+    invoice_date: NaiveDate,
+    created_at: chrono::DateTime<Utc>,
+    description: String,
+    unit: Option<String>,
+    currency: String,
+    previous_unit_price: String,
+    current_unit_price: String,
+    percentage_change: String,
+    previous_invoice_date: NaiveDate,
+    comparison_key: String,
+    comparison_unit: String,
+    increased: bool,
+    at_least_ten_percent: bool,
+}
+
+pub(crate) struct TodayPriceChange {
+    pub(crate) invoice_id: Uuid,
+    pub(crate) supplier_name: String,
+    pub(crate) invoice_date: NaiveDate,
+    pub(crate) created_at: chrono::DateTime<Utc>,
+    pub(crate) description: String,
+    pub(crate) unit: Option<String>,
+    pub(crate) currency: String,
+    pub(crate) previous_unit_price: String,
+    pub(crate) current_unit_price: String,
+    pub(crate) percentage_change: String,
+    pub(crate) previous_invoice_date: NaiveDate,
+    pub(crate) comparison_key: String,
+    pub(crate) comparison_unit: String,
+    pub(crate) increased: bool,
+    pub(crate) at_least_ten_percent: bool,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Approval {
     price_changes: Vec<PriceChange>,
 }
 
-const PRICE_CHANGES_SQL: &str = "WITH current_invoice AS (
-        SELECT invoice.id,invoice.restaurant_id,invoice.supplier_name,invoice.invoice_date,
-               invoice.created_at,extraction.currency
-        FROM invoices invoice
-        JOIN invoice_extractions extraction ON extraction.invoice_id=invoice.id
-        WHERE invoice.id=$1 AND invoice.restaurant_id=$2 AND invoice.status='ready'
-     ), current_keys AS (
-        SELECT DISTINCT line.comparison_key,line.comparison_unit
-        FROM invoice_line_items line
-        JOIN current_invoice ON current_invoice.id=line.invoice_id
-        WHERE line.comparison_key IS NOT NULL AND line.comparison_unit IS NOT NULL
-          AND line.unit_price>0
-     ), candidate_lines AS (
+const PRICE_CHANGES_SQL: &str = "WITH comparable_lines AS (
         SELECT line.id,line.invoice_id,line.position,line.description,line.unit,line.unit_price,
-               line.comparison_key,line.comparison_unit,invoice.invoice_date,
-               invoice.created_at,extraction.currency,
+               line.comparison_key,line.comparison_unit,invoice.restaurant_id,
+               invoice.supplier_name,invoice.invoice_date,invoice.created_at,extraction.currency,
                COUNT(*) OVER (
                    PARTITION BY line.invoice_id,line.comparison_key,line.comparison_unit
                ) AS matching_lines
-        FROM current_invoice current
-        JOIN invoices invoice ON invoice.restaurant_id=current.restaurant_id
-          AND invoice.status='ready'
-          AND LOWER(BTRIM(invoice.supplier_name))=LOWER(BTRIM(current.supplier_name))
-          AND (invoice.invoice_date,invoice.created_at,invoice.id)
-              <=(current.invoice_date,current.created_at,current.id)
+        FROM invoices invoice
         JOIN invoice_extractions extraction ON extraction.invoice_id=invoice.id
-          AND extraction.currency=current.currency
         JOIN invoice_line_items line ON line.invoice_id=invoice.id AND line.unit_price>0
-        JOIN current_keys key ON key.comparison_key=line.comparison_key
-          AND key.comparison_unit=line.comparison_unit
+        WHERE invoice.restaurant_id=$2 AND invoice.status='ready'
+          AND line.comparison_key IS NOT NULL AND line.comparison_unit IS NOT NULL
      ), history AS (
-        SELECT id,invoice_id,position,description,unit,unit_price,currency,invoice_date,
+        SELECT id,invoice_id,position,description,unit,unit_price,currency,supplier_name,
+               invoice_date,created_at,comparison_key,comparison_unit,
                LAG(unit_price) OVER item_history AS previous_unit_price,
                LAG(invoice_date) OVER item_history AS previous_invoice_date
-        FROM candidate_lines
+        FROM comparable_lines
         WHERE matching_lines=1
         WINDOW item_history AS (
-            PARTITION BY comparison_key,comparison_unit
+            PARTITION BY restaurant_id,LOWER(BTRIM(supplier_name)),currency,
+                         comparison_key,comparison_unit
             ORDER BY invoice_date,created_at,invoice_id
         )
      ), changes AS (
-        SELECT id,position,description,unit,currency,previous_unit_price,unit_price,
+        SELECT id,invoice_id,position,supplier_name,invoice_date,created_at,description,unit,
+               currency,previous_unit_price,unit_price,comparison_key,comparison_unit,
                ROUND(((unit_price-previous_unit_price)/previous_unit_price)*100,2)
                    AS percentage_change,
-               previous_invoice_date
+               previous_invoice_date,unit_price>previous_unit_price AS increased,
+               unit_price*100>=previous_unit_price*110 AS at_least_ten_percent
         FROM history
-        WHERE invoice_id=$1 AND previous_unit_price IS NOT NULL
+        WHERE previous_unit_price IS NOT NULL
           AND ABS(unit_price-previous_unit_price)*100>=previous_unit_price*5
      )
-     SELECT id,description,unit,currency,
+     SELECT id,invoice_id,supplier_name,invoice_date,created_at,description,unit,currency,
             previous_unit_price::text AS previous_unit_price,
-            unit_price::text AS current_unit_price,
-            percentage_change::text AS percentage_change,previous_invoice_date
+            unit_price::text AS current_unit_price,percentage_change::text AS percentage_change,
+            previous_invoice_date,comparison_key,comparison_unit,increased,at_least_ten_percent
      FROM changes
-     ORDER BY ABS(percentage_change) DESC,position";
+     WHERE $1::uuid IS NULL OR invoice_id=$1
+     ORDER BY ABS(percentage_change) DESC,position,invoice_id";
 
 struct ReviewedLine {
     line_id: Uuid,
@@ -482,12 +507,15 @@ pub(crate) async fn put_review(
             .await
             .map_err(crate::database_error)?;
     }
-    let price_changes = sqlx::query_as::<_, PriceChange>(PRICE_CHANGES_SQL)
-        .bind(id)
+    let price_changes = sqlx::query_as::<_, PriceChangeRow>(PRICE_CHANGES_SQL)
+        .bind(Some(id))
         .bind(member.restaurant_id)
         .fetch_all(&mut *tx)
         .await
-        .map_err(crate::database_error)?;
+        .map_err(crate::database_error)?
+        .into_iter()
+        .map(PriceChange::from)
+        .collect();
     tx.commit().await.map_err(crate::database_error)?;
     Ok(Json(Approval { price_changes }))
 }
@@ -498,13 +526,67 @@ pub(crate) async fn price_changes(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<PriceChange>>, ApiError> {
     let member = membership(&state, &headers).await?;
-    let changes = sqlx::query_as::<_, PriceChange>(PRICE_CHANGES_SQL)
-        .bind(id)
+    let changes = sqlx::query_as::<_, PriceChangeRow>(PRICE_CHANGES_SQL)
+        .bind(Some(id))
         .bind(member.restaurant_id)
         .fetch_all(&state.pool)
         .await
-        .map_err(crate::database_error)?;
+        .map_err(crate::database_error)?
+        .into_iter()
+        .map(PriceChange::from)
+        .collect();
     Ok(Json(changes))
+}
+
+pub(crate) async fn restaurant_price_changes(
+    pool: &PgPool,
+    restaurant_id: Uuid,
+) -> Result<Vec<TodayPriceChange>, sqlx::Error> {
+    Ok(sqlx::query_as::<_, PriceChangeRow>(PRICE_CHANGES_SQL)
+        .bind(Option::<Uuid>::None)
+        .bind(restaurant_id)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(TodayPriceChange::from)
+        .collect())
+}
+
+impl From<PriceChangeRow> for PriceChange {
+    fn from(row: PriceChangeRow) -> Self {
+        Self {
+            id: row.id,
+            description: row.description,
+            unit: row.unit,
+            currency: row.currency,
+            previous_unit_price: row.previous_unit_price,
+            current_unit_price: row.current_unit_price,
+            percentage_change: row.percentage_change,
+            previous_invoice_date: row.previous_invoice_date,
+        }
+    }
+}
+
+impl From<PriceChangeRow> for TodayPriceChange {
+    fn from(row: PriceChangeRow) -> Self {
+        Self {
+            invoice_id: row.invoice_id,
+            supplier_name: row.supplier_name,
+            invoice_date: row.invoice_date,
+            created_at: row.created_at,
+            description: row.description,
+            unit: row.unit,
+            currency: row.currency,
+            previous_unit_price: row.previous_unit_price,
+            current_unit_price: row.current_unit_price,
+            percentage_change: row.percentage_change,
+            previous_invoice_date: row.previous_invoice_date,
+            comparison_key: row.comparison_key,
+            comparison_unit: row.comparison_unit,
+            increased: row.increased,
+            at_least_ten_percent: row.at_least_ten_percent,
+        }
+    }
 }
 
 pub(crate) async fn retry(
@@ -608,6 +690,17 @@ fn parse_decimal(v: &Option<String>, scale: i64) -> Result<Option<BigDecimal>, A
 }
 
 pub(crate) fn strict_decimal(value: &str, scale: usize) -> Result<BigDecimal, &'static str> {
+    strict_decimal_with_precision(value, 18, scale)
+}
+
+pub(crate) fn strict_decimal_with_precision(
+    value: &str,
+    precision: usize,
+    scale: usize,
+) -> Result<BigDecimal, &'static str> {
+    if scale > precision {
+        return Err("invalid decimal");
+    }
     let unsigned = value
         .strip_prefix('-')
         .or_else(|| value.strip_prefix('+'))
@@ -619,7 +712,7 @@ pub(crate) fn strict_decimal(value: &str, scale: usize) -> Result<BigDecimal, &'
         || !integer.bytes().all(|byte| byte.is_ascii_digit())
         || !fraction.bytes().all(|byte| byte.is_ascii_digit())
         || fraction.len() > scale
-        || integer.trim_start_matches('0').len().max(1) > 18 - scale
+        || integer.trim_start_matches('0').len().max(1) > precision - scale
         || unsigned.matches('.').count() > 1
     {
         return Err("invalid decimal");

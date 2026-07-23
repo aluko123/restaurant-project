@@ -39,21 +39,21 @@ pub(crate) struct InventoryItem {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ItemInput {
-    name: String,
-    category: Option<String>,
-    count_unit: String,
-    par_level: Option<String>,
+    pub(crate) name: String,
+    pub(crate) category: Option<String>,
+    pub(crate) count_unit: String,
+    pub(crate) par_level: Option<String>,
     #[serde(default = "yes")]
-    active: bool,
+    pub(crate) active: bool,
 }
 fn yes() -> bool {
     true
 }
-struct ValidItem {
-    name: String,
-    category: Option<String>,
-    count_unit: String,
-    par_level: Option<BigDecimal>,
+pub(crate) struct ValidItem {
+    pub(crate) name: String,
+    pub(crate) category: Option<String>,
+    pub(crate) count_unit: String,
+    pub(crate) par_level: Option<BigDecimal>,
     active: bool,
 }
 
@@ -170,10 +170,18 @@ pub(crate) async fn update_item(
     .ok_or(ApiError(StatusCode::NOT_FOUND, "Inventory item not found."))?;
     if current_unit != v.count_unit {
         let unit_in_use = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM inventory_count_entries e
-             JOIN inventory_count_sessions s ON s.id=e.session_id
-             WHERE e.inventory_item_id=$1
-               AND (s.status='draft' OR (s.status='completed' AND e.quantity IS NOT NULL)))",
+            "SELECT EXISTS(
+                SELECT 1 FROM inventory_count_entries e
+                JOIN inventory_count_sessions s ON s.id=e.session_id
+                WHERE e.inventory_item_id=$1
+                  AND (s.status='draft' OR (s.status='completed' AND e.quantity IS NOT NULL))
+                UNION ALL
+                SELECT 1 FROM supplier_product_mappings WHERE inventory_item_id=$1
+                UNION ALL
+                SELECT 1 FROM menu_item_ingredients WHERE inventory_item_id=$1
+                UNION ALL
+                SELECT 1 FROM loss_events WHERE inventory_item_id=$1
+             )",
         )
         .bind(id)
         .fetch_one(&mut *tx)
@@ -182,7 +190,7 @@ pub(crate) async fn update_item(
         if unit_in_use {
             return Err(ApiError(
                 StatusCode::CONFLICT,
-                "Count unit cannot change while a draft or completed count uses this item.",
+                "Count unit cannot change while a count, saved supplier purchase, menu ingredient setup, or loss log uses this item.",
             ));
         }
     }
@@ -421,7 +429,7 @@ fn unique(e: &sqlx::Error) -> bool {
         .and_then(|e| e.code())
         .is_some_and(|c| c == "23505")
 }
-fn item_write_error(e: sqlx::Error) -> ApiError {
+pub(crate) fn item_write_error(e: sqlx::Error) -> ApiError {
     if unique(&e) {
         ApiError(
             StatusCode::CONFLICT,
@@ -448,7 +456,7 @@ fn empty_item(id: Uuid, v: ValidItem) -> InventoryItem {
 }
 
 impl ItemInput {
-    fn validated(mut self) -> Result<ValidItem, ApiError> {
+    pub(crate) fn validated(mut self) -> Result<ValidItem, ApiError> {
         self.name = self.name.trim().to_owned();
         self.count_unit = self.count_unit.trim().to_owned();
         self.category = self.category.and_then(|x| {
