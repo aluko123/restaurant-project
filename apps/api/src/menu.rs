@@ -84,7 +84,7 @@ pub(crate) async fn create(
         {
             ApiError(
                 StatusCode::CONFLICT,
-                "That menu item is already in your Daybook.",
+                "That menu item is already in Parline.",
             )
         } else {
             crate::database_error(error)

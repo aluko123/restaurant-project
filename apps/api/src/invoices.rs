@@ -35,6 +35,7 @@ pub(crate) struct Invoice {
     status: String,
     delayed: bool,
     price_change_count: i64,
+    purchase_receipt_recorded: bool,
     created_at: chrono::DateTime<Utc>,
 }
 
@@ -98,6 +99,7 @@ pub(crate) async fn create(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing')
          RETURNING id, supplier_name, invoice_date, original_filename, content_type,
                    size_bytes, status, FALSE AS delayed, 0::bigint AS price_change_count,
+                   FALSE AS purchase_receipt_recorded,
                    created_at",
         )
         .bind(id)
@@ -174,6 +176,11 @@ pub(crate) async fn list(
                 invoice.status = 'processing'
                     AND invoice.updated_at < NOW() - INTERVAL '5 minutes' AS delayed,
                 COALESCE(change_counts.price_change_count,0) AS price_change_count,
+                EXISTS(
+                    SELECT 1 FROM purchase_receipts receipt
+                    WHERE receipt.invoice_id=invoice.id
+                      AND receipt.restaurant_id=invoice.restaurant_id
+                ) AS purchase_receipt_recorded,
                 invoice.created_at
          FROM invoices invoice
          LEFT JOIN change_counts ON change_counts.invoice_id=invoice.id
@@ -229,7 +236,7 @@ pub(crate) async fn membership(
     sqlx::query_as::<_, Membership>(
         "SELECT m.restaurant_id, u.id AS user_id FROM users u
          JOIN restaurant_memberships m ON m.user_id = u.id
-         WHERE u.auth_subject = $1 AND m.role = 'owner'",
+         WHERE u.auth_subject = $1 AND m.role IN ('owner','manager')",
     )
     .bind(subject)
     .fetch_optional(&state.pool)
@@ -240,7 +247,7 @@ pub(crate) async fn membership(
     })?
     .ok_or(ApiError(
         StatusCode::FORBIDDEN,
-        "An owner restaurant membership is required.",
+        "Owner or manager access is required for invoices.",
     ))
 }
 

@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { useAuth } from "@workos-inc/authkit-react";
 import { SalesWorkspace, type ApiRequest } from "./SalesWorkspace";
+import { SettingsWorkspace, type SettingsRestaurant } from "./SettingsWorkspace";
 import { TodayWorkspace } from "./TodayWorkspace";
 import { WeeklyBriefWorkspace } from "./WeeklyBriefWorkspace";
 
@@ -8,8 +9,8 @@ type AppProps = {
   authConfigured: boolean;
 };
 
-type Restaurant = { id: string; name: string; city: string; serviceStyle: ServiceStyle; timezone: string; role: string };
-type Invoice = { id: string; supplierName: string; invoiceDate: string; originalFilename: string; contentType: string; sizeBytes: number; status: string; delayed: boolean; priceChangeCount: number; createdAt: string };
+type Restaurant = SettingsRestaurant;
+type Invoice = { id: string; supplierName: string; invoiceDate: string; originalFilename: string; contentType: string; sizeBytes: number; status: string; delayed: boolean; priceChangeCount: number; purchaseReceiptRecorded: boolean; createdAt: string };
 type ReviewLine = { id?: string; sku: string | null; description: string; quantity: string | null; unit: string | null; unitPrice: string | null; lineTotal: string | null; hasWarnings: boolean };
 type Review = { invoiceId: string; supplierName: string; invoiceNumber: string | null; invoiceDate: string | null; currency: string; subtotal: string | null; tax: string | null; fees: string | null; discount: string | null; total: string | null; hasWarnings: boolean; lineItems: ReviewLine[] };
 type PriceChange = { id: string; description: string; unit: string | null; currency: string; previousUnitPrice: string; currentUnitPrice: string; percentageChange: string; previousInvoiceDate: string };
@@ -68,8 +69,8 @@ export function App({ authConfigured }: AppProps) {
 function AuthenticatedApp() {
   const { isLoading, user, signIn, signUp, signOut, getAccessToken } = useAuth();
   const [appState, setAppState] = useState<AppState>({ status: "loading" });
-  type Workspace = "today" | "brief" | "invoices" | "sales" | "menu" | "inventory" | "losses";
-  const workspaceForPath = (): Workspace => window.location.pathname === "/brief" ? "brief" : window.location.pathname === "/invoices" ? "invoices" : window.location.pathname === "/sales" ? "sales" : window.location.pathname === "/menu" ? "menu" : window.location.pathname === "/inventory" ? "inventory" : window.location.pathname === "/losses" ? "losses" : "today";
+  type Workspace = "today" | "brief" | "invoices" | "sales" | "menu" | "inventory" | "losses" | "settings";
+  const workspaceForPath = (): Workspace => window.location.pathname === "/brief" ? "brief" : window.location.pathname === "/invoices" ? "invoices" : window.location.pathname === "/sales" ? "sales" : window.location.pathname === "/menu" ? "menu" : window.location.pathname === "/inventory" ? "inventory" : window.location.pathname === "/losses" ? "losses" : window.location.pathname === "/settings" ? "settings" : "today";
   const [workspace, setWorkspace] = useState<Workspace>(workspaceForPath);
   const apiUrl = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
 
@@ -91,7 +92,7 @@ function AuthenticatedApp() {
     });
     const body = await response.json().catch(() => null) as { error?: string; code?: string } | null;
     if (!response.ok) {
-      const error = new Error(body?.error ?? "Daybook couldn't reach the kitchen. Please try again.") as Error & { status: number; code?: string };
+      const error = new Error(body?.error ?? "Parline couldn't reach the kitchen. Please try again.") as Error & { status: number; code?: string };
       error.status = response.status;
       error.code = body?.code;
       throw error;
@@ -104,8 +105,11 @@ function AuthenticatedApp() {
     setAppState({ status: "loading" });
     void request<{ restaurant: Restaurant | null }>("/v1/me")
       .then(({ restaurant }) => setAppState({ status: "ready", restaurant }))
-      .catch((error: unknown) => setAppState({ status: "error", message: error instanceof Error ? error.message : "Daybook couldn't load. Please try again." }));
+      .catch((error: unknown) => setAppState({ status: "error", message: error instanceof Error ? error.message : "Parline couldn't load. Please try again." }));
   }, [request, user]);
+  const updateRestaurant = useCallback((restaurant: SettingsRestaurant) => {
+    setAppState({ status: "ready", restaurant });
+  }, []);
 
   useEffect(loadApp, [loadApp]);
   useEffect(() => {
@@ -114,7 +118,10 @@ function AuthenticatedApp() {
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
   useEffect(() => {
-    if (appState.status === "ready" && appState.restaurant?.role !== "owner" && workspace === "brief") {
+    const role = appState.status === "ready" ? appState.restaurant?.role : undefined;
+    const unavailable = role !== "owner" && workspace === "brief"
+      || role === "staff" && (workspace === "invoices" || workspace === "menu");
+    if (role && unavailable) {
       window.history.replaceState({}, "", "/today");
       setWorkspace("today");
     }
@@ -139,7 +146,7 @@ function AuthenticatedApp() {
     return <Welcome authConfigured onSignIn={signIn} onSignUp={signUp} />;
   }
 
-  if (appState.status === "loading") return <StatusPage message="Opening your daybook…" />;
+  if (appState.status === "loading") return <StatusPage message="Opening Parline…" />;
   if (appState.status === "error") return <ErrorPage message={appState.message} onRetry={loadApp} onSignOut={() => signOut()} />;
   if (!appState.restaurant) {
     return <Onboarding onSignOut={() => signOut()} onCreate={(input) => request<Restaurant>("/v1/restaurants", { method: "POST", body: JSON.stringify(input) }).then((restaurant) => setAppState({ status: "ready", restaurant }))} />;
@@ -150,22 +157,24 @@ function AuthenticatedApp() {
   return (
     <main className="app-shell">
       <AppHeader restaurantName={restaurant.name} onSignOut={() => signOut()} />
-      <nav className="workspace-nav" aria-label="Daybook sections">
+      <nav className="workspace-nav" aria-label="Parline sections">
         <button type="button" aria-current={workspace === "today" ? "page" : undefined} onClick={() => openWorkspace("today")}>Today</button>
         {restaurant.role === "owner" && <button type="button" aria-current={workspace === "brief" ? "page" : undefined} onClick={() => openWorkspace("brief")}>Brief</button>}
-        <button type="button" aria-current={workspace === "invoices" ? "page" : undefined} onClick={() => openWorkspace("invoices")}>Invoices</button>
+        {restaurant.role !== "staff" && <button type="button" aria-current={workspace === "invoices" ? "page" : undefined} onClick={() => openWorkspace("invoices")}>Invoices</button>}
         <button type="button" aria-current={workspace === "sales" ? "page" : undefined} onClick={() => openWorkspace("sales")}>Sales</button>
-        <button type="button" aria-current={workspace === "menu" ? "page" : undefined} onClick={() => openWorkspace("menu")}>Menu</button>
+        {restaurant.role !== "staff" && <button type="button" aria-current={workspace === "menu" ? "page" : undefined} onClick={() => openWorkspace("menu")}>Menu</button>}
         <button type="button" aria-current={workspace === "inventory" ? "page" : undefined} onClick={() => openWorkspace("inventory")}>Inventory</button>
         <button type="button" aria-current={workspace === "losses" ? "page" : undefined} onClick={() => openWorkspace("losses")}>Losses</button>
+        <button type="button" aria-current={workspace === "settings" ? "page" : undefined} onClick={() => openWorkspace("settings")}>Settings</button>
       </nav>
       <div hidden={workspace !== "today"}><TodayWorkspace request={request} active={workspace === "today"} onNavigate={openTarget} /></div>
       {restaurant.role === "owner" && <div hidden={workspace !== "brief"}><WeeklyBriefWorkspace request={request} active={workspace === "brief"} /></div>}
-      <div hidden={workspace !== "invoices"}><InvoiceWorkspace restaurant={restaurant} request={request} active={workspace === "invoices"} /></div>
+      {restaurant.role !== "staff" && <div hidden={workspace !== "invoices"}><InvoiceWorkspace restaurant={restaurant} request={request} active={workspace === "invoices"} /></div>}
       <div hidden={workspace !== "sales"}><SalesWorkspace restaurant={restaurant} request={request} active={workspace === "sales"} /></div>
-      <div hidden={workspace !== "menu"}><MenuWorkspace restaurant={restaurant} request={request} active={workspace === "menu"} /></div>
+      {restaurant.role !== "staff" && <div hidden={workspace !== "menu"}><MenuWorkspace restaurant={restaurant} request={request} active={workspace === "menu"} /></div>}
       <div hidden={workspace !== "inventory"}><InventoryWorkspace restaurant={restaurant} request={request} /></div>
       <div hidden={workspace !== "losses"}><LossesWorkspace restaurant={restaurant} request={request} active={workspace === "losses"} /></div>
+      <div hidden={workspace !== "settings"}><SettingsWorkspace restaurant={restaurant} request={request} active={workspace === "settings"} onRestaurantChange={updateRestaurant} /></div>
     </main>
   );
 }
@@ -186,6 +195,9 @@ function InventoryWorkspace({ restaurant, request }: { restaurant: Restaurant; r
   const [notice, setNotice] = useState("");
   const [fields, setFields] = useState<ItemFields>(blankItem);
   const [editing, setEditing] = useState<InventoryItem | null>(null);
+  const [inventorySearch, setInventorySearch] = useState("");
+  const [inventoryView, setInventoryView] = useState<"attention" | "active" | "all" | "archived">("attention");
+  const [inventoryCategory, setInventoryCategory] = useState("all");
 
   const adoptCount = (value: InventoryCount) => {
     setCount(value);
@@ -245,21 +257,41 @@ function InventoryWorkspace({ restaurant, request }: { restaurant: Restaurant; r
 
   if (mode !== "overview" && count) {
     const groups = groupByCategory(count.entries); const missing = count.entries.filter(entry => !quantities[entry.id]?.trim());
-    if (mode === "review") return <section className="inventory-workspace count-workspace"><button className="text-button" type="button" onClick={() => setMode("count")}>← Back to count</button><header className="inventory-heading"><p className="section-code">DB—INVENTORY / REVIEW</p><h1>Review count</h1><p>{count.entries.length - missing.length} counted · {missing.length} missing</p></header>{missing.length > 0 && <div className="missing-list"><h2>Missing quantities</h2><p>These items will stay blank in this count.</p><ul>{missing.map(entry => <li key={entry.id}><strong>{entry.name}</strong> · {entry.countUnit}</li>)}</ul></div>}{error && <p className="form-error" role="alert">{error}</p>}<div className="count-actions"><button className="file-button" type="button" onClick={() => setMode("count")}>Back to count</button><button className="ledger-button" type="button" disabled={busy} onClick={() => void complete()}>{busy ? "Completing…" : missing.length ? "Complete with missing items" : "Complete count"}</button></div></section>;
-    return <section className="inventory-workspace count-workspace"><button className="text-button" type="button" disabled={busy} onClick={() => void backToOverview()}>← Save and return to overview</button><header className="inventory-heading"><p className="section-code">DB—INVENTORY / COUNT</p><h1>Count what is on hand</h1><p>Your saved draft stays here when you return to the overview.</p></header>{groups.map(([category, entries]) => <section className="count-category" key={category}><h2>{category}</h2>{entries.map(entry => <label className="count-row" key={entry.id}><span><strong>{entry.name}</strong><small>Count in {entry.countUnit}</small></span><span className="quantity-field"><input aria-label={`${entry.name}, quantity in ${entry.countUnit}`} inputMode="decimal" value={quantities[entry.id] ?? ""} onChange={event => setQuantities(current => ({...current,[entry.id]:event.target.value}))}/><b>{entry.countUnit}</b></span></label>)}</section>)}{error && <p className="form-error" role="alert">{error}</p>}{notice && <p className="success-notice" role="status">{notice}</p>}<div className="count-actions"><button className="file-button" type="button" disabled={busy} onClick={() => void saveDraft()}>{busy ? "Saving…" : "Save draft"}</button><button className="ledger-button" type="button" disabled={busy} onClick={() => void reviewCount()}>Review count</button></div></section>;
+    if (mode === "review") return <section className="inventory-workspace count-workspace"><button className="text-button" type="button" onClick={() => setMode("count")}>← Back to count</button><header className="inventory-heading"><p className="section-code">Inventory review</p><h1>Review count</h1><p>{count.entries.length - missing.length} counted · {missing.length} missing</p></header>{missing.length > 0 && <div className="missing-list"><h2>Missing quantities</h2><p>These items will stay blank in this count.</p><ul>{missing.map(entry => <li key={entry.id}><strong>{entry.name}</strong> · {entry.countUnit}</li>)}</ul></div>}{error && <p className="form-error" role="alert">{error}</p>}<div className="count-actions"><button className="file-button" type="button" onClick={() => setMode("count")}>Back to count</button><button className="ledger-button" type="button" disabled={busy} onClick={() => void complete()}>{busy ? "Completing…" : missing.length ? "Complete with missing items" : "Complete count"}</button></div></section>;
+    return <section className="inventory-workspace count-workspace"><button className="text-button" type="button" disabled={busy} onClick={() => void backToOverview()}>← Save and return to overview</button><header className="inventory-heading"><p className="section-code">Inventory count</p><h1>Count what is on hand</h1><p>Your saved draft stays here when you return to the overview.</p></header>{groups.map(([category, entries]) => <section className="count-category" key={category}><h2>{category}</h2>{entries.map(entry => <label className="count-row" key={entry.id}><span><strong>{entry.name}</strong><small>Count in {entry.countUnit}</small></span><span className="quantity-field"><input aria-label={`${entry.name}, quantity in ${entry.countUnit}`} inputMode="decimal" value={quantities[entry.id] ?? ""} onChange={event => setQuantities(current => ({...current,[entry.id]:event.target.value}))}/><b>{entry.countUnit}</b></span></label>)}</section>)}{error && <p className="form-error" role="alert">{error}</p>}{notice && <p className="success-notice" role="status">{notice}</p>}<div className="count-actions"><button className="file-button" type="button" disabled={busy} onClick={() => void saveDraft()}>{busy ? "Saving…" : "Save draft"}</button><button className="ledger-button" type="button" disabled={busy} onClick={() => void reviewCount()}>Review count</button></div></section>;
   }
 
-  const active = items.filter(item => item.active); const archived = items.filter(item => !item.active);
-  return <section className="inventory-workspace"><header className="inventory-heading"><p className="section-code">DB—INVENTORY</p><h1>{restaurant.name} inventory</h1><p>See what is on hand and keep the next count moving.</p><button className="ledger-button" type="button" disabled={busy || (!count && active.length === 0)} onClick={() => void startOrResume()}>{busy ? "Opening…" : count ? "Resume count" : "Start count"}</button></header>
+  const active = items.filter(item => item.active);
+  const normalizedInventorySearch = inventorySearch.trim().toLocaleLowerCase();
+  const inventoryCategories = categoryOptions(items);
+  const filteredItems = items.filter(item => {
+    const matchesSearch = !normalizedInventorySearch || item.name.toLocaleLowerCase().includes(normalizedInventorySearch);
+    const matchesCategory = inventoryCategory === "all" || categoryName(item.category) === inventoryCategory;
+    const matchesView = inventoryView === "attention" ? item.active && (item.lowStock || item.lastCountedAt === null)
+      : inventoryView === "active" ? item.active
+      : inventoryView === "archived" ? !item.active
+      : true;
+    return matchesSearch && matchesCategory && matchesView;
+  });
+  const inventoryFiltersActive = inventorySearch.trim() !== "" || inventoryCategory !== "all" || inventoryView !== "attention";
+  return <section className="inventory-workspace"><header className="inventory-heading"><h1>Inventory</h1><p>See what is on hand and keep the next count moving.</p><button className="ledger-button" type="button" disabled={busy || (!count && active.length === 0)} onClick={() => void startOrResume()}>{busy ? "Opening…" : count ? "Resume count" : "Start count"}</button></header>
     {error && <p className="form-error inventory-message" role="alert">{error}</p>}{notice && <p className="success-notice inventory-message" role="status">{notice}</p>}
     {manager && <form className="inventory-item-form" onSubmit={saveItem}><div className="list-heading"><h2>{editing ? "Edit item" : "Add an item"}</h2>{editing && <button className="text-button" type="button" onClick={() => {setEditing(null);setFields(blankItem)}}>Cancel</button>}</div><div className="inventory-form-fields"><label>Name<input required maxLength={50} value={fields.name} onChange={e=>setFields({...fields,name:e.target.value})}/></label><label>Category <span>Optional</span><input maxLength={20} value={fields.category} onChange={e=>setFields({...fields,category:e.target.value})}/></label><label>Count unit<select required value={fields.countUnit} onChange={e=>setFields({...fields,countUnit:e.target.value})}>{inventoryUnits.map(unit=><option key={unit} value={unit}>{unit}</option>)}</select></label><label>Par level <span>Optional</span><input inputMode="decimal" value={fields.parLevel} onChange={e=>setFields({...fields,parLevel:e.target.value})}/></label></div>{editing && <label className="active-toggle"><input type="checkbox" checked={fields.active} onChange={e=>setFields({...fields,active:e.target.checked})}/> Active item</label>}<button className="ledger-button" disabled={busy}>{busy ? "Saving…" : editing ? "Save item" : "Add item"}</button></form>}
-    <div className="inventory-list"><div className="list-heading"><h2>Active items</h2><button className="text-button" type="button" onClick={() => void loadOverview()}>Refresh</button></div>{loading ? <p role="status">Loading inventory…</p> : active.length === 0 ? <p className="empty-state">{manager ? "No active items yet. Add your first item above, including how the crew counts it." : "No inventory items are ready to count. Ask an owner or manager to add them."}</p> : groupByCategory(active).map(([category, group]) => <InventoryCategory key={category} category={category} items={group} manager={manager} busy={busy} onEdit={edit} onToggle={toggle}/>)}</div>
-    {!loading && archived.length > 0 && <section className="archived-section"><h2>Archived items</h2><p>Kept here with their count history.</p>{groupByCategory(archived).map(([category, group])=><InventoryCategory key={category} category={category} items={group} manager={manager} busy={busy} onEdit={edit} onToggle={toggle}/>)}</section>}
+    <div className="inventory-list"><div className="list-heading"><h2>Inventory items</h2><button className="text-button" type="button" onClick={() => void loadOverview()}>Refresh</button></div>
+      {!loading && items.length > 0 && <div className="collection-toolbar" aria-label="Filter inventory items">
+        <label className="collection-search">Search all inventory<input type="search" placeholder="Item name" value={inventorySearch} onChange={event => { const value=event.target.value; if (!inventorySearch.trim() && value.trim()) { setInventoryView("all"); setInventoryCategory("all"); } setInventorySearch(value); }}/></label>
+        <label>View<select value={inventoryView} onChange={event => setInventoryView(event.target.value as typeof inventoryView)}><option value="attention">Needs attention</option><option value="active">Active items</option><option value="all">All items</option><option value="archived">Archived</option></select></label>
+        <label>Category<select value={inventoryCategory} onChange={event => setInventoryCategory(event.target.value)}><option value="all">All categories ({items.length})</option>{inventoryCategories.map(option => <option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select></label>
+        <div className="collection-toolbar-summary"><strong>{filteredItems.length} {filteredItems.length === 1 ? "item" : "items"}</strong>{inventoryFiltersActive && <button className="text-button" type="button" onClick={() => { setInventorySearch(""); setInventoryView("attention"); setInventoryCategory("all"); }}>Clear filters</button>}</div>
+      </div>}
+      {loading ? <p role="status">Loading inventory…</p> : items.length === 0 ? <p className="empty-state">{manager ? "No inventory items yet. Add your first item above, including how the crew counts it." : "No inventory items are ready to count. Ask an owner or manager to add them."}</p> : filteredItems.length === 0 ? <div className="filtered-empty"><h3>{inventoryView === "attention" && !inventorySearch.trim() && inventoryCategory === "all" ? "Nothing needs attention" : "No items match these filters"}</h3><p>{inventoryView === "attention" && !inventorySearch.trim() && inventoryCategory === "all" ? "No active items are below par or waiting for their first count." : "Try another category or view, or clear the current filters."}</p><button className="file-button" type="button" onClick={() => { setInventorySearch(""); setInventoryView("all"); setInventoryCategory("all"); }}>Show all inventory</button></div> : groupByCategory(filteredItems).map(([category, group]) => <InventoryCategory key={category} category={category} items={group} manager={manager} busy={busy} onEdit={edit} onToggle={toggle}/>)}</div>
   </section>;
 }
 
-function groupByCategory<T extends {category:string|null}>(values:T[]): [string,T[]][] { const groups = new Map<string,T[]>(); values.forEach(value => { const key=value.category?.trim() || "Uncategorized"; groups.set(key,[...(groups.get(key)??[]),value]); }); return [...groups.entries()]; }
-function InventoryCategory({category,items,manager,busy,onEdit,onToggle}:{category:string;items:InventoryItem[];manager:boolean;busy:boolean;onEdit:(item:InventoryItem)=>void;onToggle:(item:InventoryItem)=>void}) { return <section className="inventory-category"><h3>{category}</h3><div className="inventory-cards">{items.map(item=><article className={`inventory-card${item.lowStock?" low-stock":""}`} key={item.id}><div className="inventory-card-head"><div><h4>{item.name}</h4>{item.lowStock&&<strong className="low-stock-label">Low stock</strong>}</div><p className="current-quantity">{item.latestQuantity===null?"Not counted":`${formatInventoryNumber(item.latestQuantity)} ${item.countUnit}`}</p></div><div className="inventory-metrics"><p><span>Previous</span>{item.previousQuantity===null?"—":`${formatInventoryNumber(item.previousQuantity)} ${item.countUnit}`}</p><p><span>Change</span>{item.change===null?"—":`${formatSigned(item.change)} ${item.countUnit}`}</p><p><span>Last counted</span>{item.lastCountedAt?formatInventoryDate(item.lastCountedAt):"Not yet"}</p></div>{manager&&<div className="card-actions"><button className="file-button" type="button" disabled={busy} onClick={()=>onEdit(item)}>Edit</button><button className="text-button" type="button" disabled={busy} onClick={()=>void onToggle(item)}>{item.active?"Archive":"Reactivate"}</button></div>}</article>)}</div></section> }
+function categoryName(value: string | null) { return value?.trim() || "Uncategorized"; }
+function categoryOptions<T extends { category: string | null }>(values: T[]) { const counts = new Map<string, number>(); values.forEach(value => { const name = categoryName(value.category); counts.set(name, (counts.get(name) ?? 0) + 1); }); return [...counts].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name)); }
+function groupByCategory<T extends {category:string|null}>(values:T[]): [string,T[]][] { const groups = new Map<string,T[]>(); values.forEach(value => { const key=categoryName(value.category); groups.set(key,[...(groups.get(key)??[]),value]); }); return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)); }
+function InventoryCategory({category,items,manager,busy,onEdit,onToggle}:{category:string;items:InventoryItem[];manager:boolean;busy:boolean;onEdit:(item:InventoryItem)=>void;onToggle:(item:InventoryItem)=>void}) { return <section className="inventory-category"><h3>{category}</h3><div className="inventory-cards">{items.map(item=><article className={`inventory-card${item.lowStock?" low-stock":""}`} key={item.id}><div className="inventory-card-head"><div><h4>{item.name}</h4>{!item.active?<strong className="archived-label">Archived</strong>:item.lowStock&&<strong className="low-stock-label">Low stock</strong>}</div><p className="current-quantity">{item.latestQuantity===null?"Not counted":`${formatInventoryNumber(item.latestQuantity)} ${item.countUnit}`}</p></div><div className="inventory-metrics"><p><span>Previous</span>{item.previousQuantity===null?"—":`${formatInventoryNumber(item.previousQuantity)} ${item.countUnit}`}</p><p><span>Change</span>{item.change===null?"—":`${formatSigned(item.change)} ${item.countUnit}`}</p><p><span>Last counted</span>{item.lastCountedAt?formatInventoryDate(item.lastCountedAt):"Not yet"}</p></div>{manager&&<div className="card-actions"><button className="file-button" type="button" disabled={busy} onClick={()=>onEdit(item)}>Edit</button><button className="text-button" type="button" disabled={busy} onClick={()=>void onToggle(item)}>{item.active?"Archive":"Reactivate"}</button></div>}</article>)}</div></section> }
 function formatInventoryNumber(value:string) { const number=Number(value); return Number.isFinite(number) ? new Intl.NumberFormat(undefined,{maximumFractionDigits:6}).format(number) : value; }
 function formatSigned(value:string) { const number=Number(value); if (!Number.isFinite(number)) return value; return `${number>0?"+":""}${formatInventoryNumber(value)}`; }
 function formatInventoryDate(value:string) { const date=new Date(value); return Number.isNaN(date.getTime())?value:new Intl.DateTimeFormat(undefined,{dateStyle:"medium",timeStyle:"short"}).format(date); }
@@ -380,7 +412,7 @@ function LossesWorkspace({ restaurant, request, active }: { restaurant: Restaura
   const selectedItem = items.find(item => item.id === inventoryItemId);
   const reasons = eventType === "waste" ? wasteReasons : stockoutReasons;
   return <section className="losses-workspace" aria-labelledby="losses-heading">
-    <header className="inventory-heading"><p className="section-code">DB—LOSSES</p><h1 id="losses-heading">Waste &amp; stockouts</h1><p>Record what happened without changing the last inventory count.</p></header>
+    <header className="inventory-heading"><p className="section-code">Losses</p><h1 id="losses-heading">Waste &amp; stockouts</h1><p>Record what happened without changing the last inventory count.</p></header>
     {itemsLoading ? <p className="loss-loading" role="status">Loading active inventory items…</p> : itemsError ? <div className="loss-load-error"><p className="form-error" role="alert">{itemsError}</p><button className="file-button" type="button" onClick={loadItems}>Retry inventory</button></div> : items.length === 0 ? <div className="loss-no-items"><h2>No active items to log</h2><p>{manager ? "Add or reactivate an item in Inventory before logging waste or a stockout." : "Ask an owner or manager to add an active inventory item first."}</p></div> : <form className="loss-form" onSubmit={submit}>
       <p className="loss-ready"><span aria-hidden="true">●</span> Ready to log an event</p>
       <fieldset className="loss-type-fieldset"><legend>What happened?</legend><div className="loss-type-grid">
@@ -406,7 +438,8 @@ function mergeLossLogs(values: LossEvent[]) { const byId = new Map(values.map(va
 
 function MenuWorkspace({ restaurant, request, active }: { restaurant: Restaurant; request: <T>(path: string, init?: RequestInit) => Promise<T>; active: boolean }) {
   const owner = restaurant.role === "owner";
-  const canManageCosting = owner || restaurant.role === "manager";
+  const canManageMenu = owner || restaurant.role === "manager";
+  const canManageCosting = canManageMenu;
   const [items, setItems] = useState<MenuItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -423,6 +456,8 @@ function MenuWorkspace({ restaurant, request, active }: { restaurant: Restaurant
   const [retryingId, setRetryingId] = useState("");
   const [openingId, setOpeningId] = useState("");
   const [costingItem, setCostingItem] = useState<MenuItem | null>(null);
+  const [menuSearch, setMenuSearch] = useState("");
+  const [menuCategory, setMenuCategory] = useState("all");
 
   const loadMenu = useCallback(() => {
     setLoading(true);
@@ -440,30 +475,33 @@ function MenuWorkspace({ restaurant, request, active }: { restaurant: Restaurant
   }, [request]);
 
   useEffect(() => { if (active) loadMenu(); }, [active, loadMenu]);
-  useEffect(() => { if (active && owner) loadImports(); }, [active, loadImports, owner]);
+  useEffect(() => { if (active && canManageMenu) loadImports(); }, [active, loadImports, canManageMenu]);
   useEffect(() => {
-    if (!active || !owner || !imports.some((menuImport) => menuImport.status === "processing")) return;
+    if (!active || !canManageMenu || !imports.some((menuImport) => menuImport.status === "processing")) return;
     const timer = window.setTimeout(loadImports, 15000);
     return () => window.clearTimeout(timer);
-  }, [active, imports, loadImports, owner]);
+  }, [active, canManageMenu, imports, loadImports]);
   async function submit(event:FormEvent<HTMLFormElement>){event.preventDefault();setError("");setNotice("");if(!name.trim()||!price.trim()){setError("Add the menu item name and selling price.");return}setSaving(true);try{const item=await request<MenuItem>("/v1/menu-items",{method:"POST",body:JSON.stringify({name,category:category||null,sellingPrice:price,currency})});setItems((current)=>[...current,item].sort((a,b)=>(a.category??"zzz").localeCompare(b.category??"zzz")||a.name.localeCompare(b.name)));setName("");setCategory("");setPrice("");setNotice(`${item.name} added to the menu.`);}catch(reason){setError(reason instanceof Error?reason.message:"The menu item couldn't be saved.");}finally{setSaving(false)}}
   async function uploadMenu(e:FormEvent<HTMLFormElement>){e.preventDefault();setError("");setNotice("");if(!importFile){setError("Choose one menu photo or PDF.");return}if(importFile.size>10*1024*1024){setError("Choose a file smaller than 10 MiB.");return}const body=new FormData();body.append("file",importFile);setUploading(true);try{const value=await request<MenuImport>("/v1/menu-imports",{method:"POST",body});setImports(v=>[value,...v]);setImportFile(null);setNotice("Menu uploaded. Extraction is processing.");(e.currentTarget as HTMLFormElement).reset()}catch(reason){setError(reason instanceof Error?reason.message:"Menu upload failed. Try again.")}finally{setUploading(false)}}
   async function openReview(id:string){setError("");try{const value=await request<{import:MenuImport;items:MenuImportItem[]}>(`/v1/menu-imports/${id}`);setReview({...value,items:value.items.map(v=>({...v,selected:isValidMenuImportItem(v)}))})}catch(reason){setError(reason instanceof Error?reason.message:"Review couldn't open.")}}
   async function retryMenu(menuImport:MenuImport){setRetryingId(menuImport.id);setError("");try{await request(`/v1/menu-imports/${menuImport.id}/retry`,{method:"POST"});loadImports()}catch(reason){setError(reason instanceof Error?reason.message:"The menu couldn't be retried.")}finally{setRetryingId("")}}
   async function openOriginal(menuImport:MenuImport){setOpeningId(menuImport.id);setError("");const popup=window.open("","_blank");if(popup)popup.opener=null;try{const {url}=await request<{url:string}>(`/v1/menu-imports/${menuImport.id}/file`);if(popup)popup.location.href=url;else window.open(url,"_blank","noopener,noreferrer")}catch(reason){popup?.close();setError(reason instanceof Error?reason.message:"The original couldn't open. Please try again.")}finally{setOpeningId("")}}
   async function approve(){if(!review)return;setError("");const selected=review.items.filter(v=>v.selected);if(!selected.length){setError("Select at least one valid item.");return}if(selected.some(v=>!isValidMenuImportItem(v))){setError("Check each selected item's name, positive price, and three-letter currency.");return}setSaving(true);try{const counts=await request<{imported:number;skipped:number}>(`/v1/menu-imports/${review.import.id}`,{method:"PUT",body:JSON.stringify({items:selected.map(({id,name,category,sellingPrice,currency})=>({id,name,category,sellingPrice,currency}))})});setNotice(`${counts.imported} items imported${counts.skipped?`; ${counts.skipped} duplicates skipped`:""}.`);setReview(null);loadMenu();loadImports()}catch(reason){setError(reason instanceof Error?reason.message:"Items couldn't be imported.")}finally{setSaving(false)}}
+  const menuCategories = categoryOptions(items);
+  const normalizedMenuSearch = menuSearch.trim().toLocaleLowerCase();
+  const filteredMenuItems = items.filter(item => (!normalizedMenuSearch || item.name.toLocaleLowerCase().includes(normalizedMenuSearch)) && (menuCategory === "all" || categoryName(item.category) === menuCategory));
+  const menuFiltersActive = menuSearch.trim() !== "" || menuCategory !== "all";
   if(costingItem)return <MenuItemCosting item={costingItem} request={request} onBack={()=>{setCostingItem(null);loadMenu()}} onSaved={ingredientCount=>{setItems(current=>current.map(item=>item.id===costingItem.id?{...item,ingredientCount}:item));setCostingItem(current=>current?{...current,ingredientCount}:current)}}/>;
   if(review)return <section className="review-shell"><button className="text-button" type="button" onClick={()=>{setError("");setReview(null)}}>← Back to menu</button><h1>Review menu</h1><p>Edit and select items with a clear selling price. Nothing is added until you import.</p><div className="review-form">{review.items.map((row,index)=>{const needsAttention=row.hasWarnings||!isValidMenuImportItem(row);return <article className={`line-card${needsAttention?" needs-attention":""}`} key={row.id??`new-${index}`}>{needsAttention&&<p className="review-warning" role="status">Check this item against the original menu.</p>}<label><input type="checkbox" checked={Boolean(row.selected)} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,selected:e.target.checked}:x)}))}/> Import this item</label><label>Name<input value={row.name} maxLength={50} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,name:e.target.value}:x)}))}/></label><label>Category<input value={row.category??""} maxLength={20} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,category:e.target.value||null}:x)}))}/></label><label>Price<input inputMode="decimal" value={row.sellingPrice??""} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,sellingPrice:e.target.value||null}:x)}))}/></label><label>Currency<input maxLength={3} value={row.currency??""} onChange={e=>setReview(v=>v&&({...v,items:v.items.map((x,i)=>i===index?{...x,currency:e.target.value.toUpperCase()||null}:x)}))}/></label><button className="text-button" type="button" onClick={()=>setReview(v=>v&&({...v,items:v.items.filter((_,i)=>i!==index)}))}>Remove row</button></article>})}<button className="file-button" type="button" onClick={()=>setReview(v=>v&&({...v,items:[...v.items,{name:"",category:null,sellingPrice:null,currency:"USD",hasWarnings:true,selected:true}]}))}>Add item</button>{error&&<p className="form-error" role="alert">{error}</p>}<button className="ledger-button" type="button" disabled={saving} onClick={approve}>{saving?"Importing…":"Import selected items"}</button></div></section>;
   return <section className="menu-workspace" aria-labelledby="menu-heading">
     <header className="invoice-heading">
-      <p className="section-code">DB—MENU / TOP ITEMS</p>
-      <h1 id="menu-heading">{restaurant.name} menu</h1>
-      <p>{owner ? "Add items by hand or review one menu photo or PDF." : canManageCosting ? "Review menu items and set up current approximate ingredient costs." : "Review the restaurant's active menu items."}</p>
+      <h1 id="menu-heading">Menu</h1>
+      <p>{canManageMenu ? "Add items by hand or review one menu photo or PDF." : "Review the restaurant's active menu items."}</p>
     </header>
     {error&&<p className="form-error menu-message" role="alert">{error}</p>}
     {notice&&<p className="success-notice menu-message" role="status">{notice}</p>}
-    <div className={`menu-grid${owner?"":" menu-grid-read-only"}`}>
-      {owner&&<div>
+    <div className={`menu-grid${canManageMenu?"":" menu-grid-read-only"}`}>
+      {canManageMenu&&<div>
         <form className="invoice-form menu-form" onSubmit={submit} noValidate>
           <h2>Add a menu item</h2><p>Record the name customers see and its current selling price.</p>
           <div className="ledger-field"><label htmlFor="menu-name">Menu item</label><input id="menu-name" value={name} onChange={e=>setName(e.target.value)} maxLength={50} required/></div>
@@ -480,8 +518,9 @@ function MenuWorkspace({ restaurant, request, active }: { restaurant: Restaurant
       </div>}
       <div className="menu-list">
         <div className="list-heading"><h2>Active menu items</h2><button className="text-button" type="button" onClick={loadMenu}>Refresh</button></div>
-        {loading?<p role="status">Loading menu…</p>:items.length===0?<p className="empty-state">No menu items yet.</p>:<div className="menu-cards">{items.map(item=><article className="menu-card" key={item.id}><div className="menu-card-main"><div><p className="invoice-status">{item.category??"Uncategorized"}</p><h3>{item.name}</h3></div><strong>{formatMoney(item.sellingPrice,item.currency)}</strong></div>{canManageCosting&&<button className="file-button costing-card-action" type="button" onClick={()=>setCostingItem(item)}>{item.ingredientCount>0?"Review ingredient cost":"Set up ingredient cost"}</button>}</article>)}</div>}
-        {owner&&<><div className="list-heading import-heading"><h2>Menu imports</h2></div>{imports.length===0?<p className="empty-state">No menu imports yet.</p>:<div className="menu-cards">{imports.map(value=><article className="menu-card" key={value.id}><div className="menu-card-copy"><p className="invoice-status">{importStatusLabel(value.status, value.delayed, "menu")}</p><h3>{value.originalFilename}</h3></div><div className="card-actions">{value.status==="needs_review"&&<button className="file-button" type="button" onClick={()=>void openReview(value.id)}>Review menu</button>}{value.status==="failed"&&<button className="file-button" type="button" disabled={retryingId===value.id} onClick={()=>void retryMenu(value)}>{retryingId===value.id?"Trying again…":"Retry"}</button>}<button className="text-button" type="button" disabled={openingId===value.id} onClick={()=>void openOriginal(value)}>{openingId===value.id?"Opening…":"Original"}</button></div></article>)}</div>}</>}
+        {!loading&&items.length>0&&<div className="collection-toolbar" aria-label="Filter menu items"><label className="collection-search">Search all menu items<input type="search" placeholder="Menu item name" value={menuSearch} onChange={event=>{const value=event.target.value;if(!menuSearch.trim()&&value.trim())setMenuCategory("all");setMenuSearch(value)}}/></label><label>Category<select value={menuCategory} onChange={event=>setMenuCategory(event.target.value)}><option value="all">All categories ({items.length})</option>{menuCategories.map(option=><option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select></label><div className="collection-toolbar-summary"><strong>{filteredMenuItems.length} {filteredMenuItems.length===1?"item":"items"}</strong>{menuFiltersActive&&<button className="text-button" type="button" onClick={()=>{setMenuSearch("");setMenuCategory("all")}}>Clear filters</button>}</div></div>}
+        {loading?<p role="status">Loading menu…</p>:items.length===0?<p className="empty-state">No menu items yet.</p>:filteredMenuItems.length===0?<div className="filtered-empty"><h3>No menu items match</h3><p>Try another name or category.</p><button className="file-button" type="button" onClick={()=>{setMenuSearch("");setMenuCategory("all")}}>Show all menu items</button></div>:<div className="menu-category-groups">{groupByCategory(filteredMenuItems).map(([groupCategory,group])=><section className="menu-category-group" key={groupCategory}><h3>{groupCategory}<span>{group.length}</span></h3><div className="menu-cards">{group.map(item=><article className="menu-card" key={item.id}><div className="menu-card-main"><div><p className="invoice-status">{item.ingredientCount>0?"Costing connected":"Costing not set up"}</p><h4>{item.name}</h4></div><strong>{formatMoney(item.sellingPrice,item.currency)}</strong></div>{canManageCosting&&<button className="file-button costing-card-action" type="button" onClick={()=>setCostingItem(item)}>{item.ingredientCount>0?"Review ingredient cost":"Set up ingredient cost"}</button>}</article>)}</div></section>)}</div>}
+        {canManageMenu&&<><div className="list-heading import-heading"><h2>Menu imports</h2></div>{imports.length===0?<p className="empty-state">No menu imports yet.</p>:<div className="menu-cards">{imports.map(value=><article className="menu-card" key={value.id}><div className="menu-card-copy"><p className="invoice-status">{importStatusLabel(value.status, value.delayed, "menu")}</p><h3>{value.originalFilename}</h3></div><div className="card-actions">{value.status==="needs_review"&&<button className="file-button" type="button" onClick={()=>void openReview(value.id)}>Review menu</button>}{value.status==="failed"&&<button className="file-button" type="button" disabled={retryingId===value.id} onClick={()=>void retryMenu(value)}>{retryingId===value.id?"Trying again…":"Retry"}</button>}<button className="text-button" type="button" disabled={openingId===value.id} onClick={()=>void openOriginal(value)}>{openingId===value.id?"Opening…":"Original"}</button></div></article>)}</div>}</>}
       </div>
     </div>
   </section>;
@@ -593,7 +632,7 @@ function MenuItemCosting({ item, request, onBack, onSaved }: { item: MenuItem; r
     const canAdd = drafts.length < 30 && response.inventoryItems.some(candidate => !used.has(candidate.id));
     return <section className="review-shell costing-shell" aria-labelledby="ingredient-editor-heading">
       <button className="text-button" type="button" disabled={saving} onClick={leaveEditor}>← {response.ingredients.length ? "Back to ingredient cost" : "Back to menu"}</button>
-      <p className="section-code">DB—MENU / INGREDIENT SETUP</p>
+      <p className="section-code">Ingredient setup</p>
       <h1 id="ingredient-editor-heading">{response.menuItem.name}</h1>
       <p>Choose the inventory items and exact amount used for one serving. Package labels such as case, bag, bottle, and can are not serving units.</p>
       <form className="ingredient-form" onSubmit={submit} noValidate>
@@ -619,7 +658,7 @@ function MenuItemCosting({ item, request, onBack, onSaved }: { item: MenuItem; r
 
   return <section className="review-shell costing-shell" aria-labelledby="ingredient-cost-heading">
     <button className="text-button" type="button" onClick={onBack}>← Back to menu</button>
-    <p className="section-code">DB—MENU / CURRENT INGREDIENT COST</p>
+    <p className="section-code">Ingredient cost</p>
     <h1 id="ingredient-cost-heading">{response.menuItem.name}</h1>
     <p>Current approximate ingredient cost per serving, using each ingredient's latest linked recorded purchase receipt when compatible.</p>
     {notice && <p className="success-notice" role="status">{notice}</p>}
@@ -684,6 +723,9 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
   const [purchaseId, setPurchaseId] = useState("");
   const [approvedPriceChanges, setApprovedPriceChanges] = useState<PriceChange[] | null>(null);
   const [retryingId, setRetryingId] = useState("");
+  const [invoiceSearch, setInvoiceSearch] = useState("");
+  const [invoiceStatus, setInvoiceStatus] = useState<"action" | "processing" | "approved" | "all">("action");
+  const [invoicePeriod, setInvoicePeriod] = useState<"30" | "90" | "year" | "all">("90");
 
   const loadInvoices = useCallback(() => {
     setLoading(true); setListError("");
@@ -737,8 +779,25 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
   if (priceChangeId) return <PriceChanges invoiceId={priceChangeId} request={request} initialChanges={approvedPriceChanges} onBack={() => { setPriceChangeId(""); setApprovedPriceChanges(null); loadInvoices(); }} />;
   if (purchaseId) return <ConnectPurchases invoiceId={purchaseId} request={request} onBack={() => { setPurchaseId(""); loadInvoices(); }} />;
 
+  const normalizedInvoiceSearch = invoiceSearch.trim().toLocaleLowerCase();
+  const today = new Date();
+  const periodCutoff = invoicePeriod === "30" || invoicePeriod === "90" ? new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - Number(invoicePeriod))).toISOString().slice(0, 10) : null;
+  const filteredInvoices = invoices.filter(invoice => {
+    const matchesSearch = !normalizedInvoiceSearch || invoice.supplierName.toLocaleLowerCase().includes(normalizedInvoiceSearch) || invoice.originalFilename.toLocaleLowerCase().includes(normalizedInvoiceSearch);
+    const matchesStatus = invoiceStatus === "action" ? invoice.status === "needs_review" || invoice.status === "failed" || invoice.status === "ready" && !invoice.purchaseReceiptRecorded
+      : invoiceStatus === "processing" ? invoice.status === "processing"
+      : invoiceStatus === "approved" ? invoice.status === "ready"
+      : true;
+    const matchesPeriod = invoicePeriod === "all" || (invoicePeriod === "year" ? invoice.invoiceDate.startsWith(String(today.getUTCFullYear())) : Boolean(periodCutoff && invoice.invoiceDate >= periodCutoff));
+    return matchesSearch && matchesStatus && matchesPeriod;
+  });
+  const operationalInvoices = filteredInvoices.filter(invoice => invoice.status !== "ready" || invoiceStatus !== "approved" && !invoice.purchaseReceiptRecorded);
+  const approvedInvoices = filteredInvoices.filter(invoice => invoice.status === "ready" && (invoiceStatus === "approved" || invoice.purchaseReceiptRecorded));
+  const invoiceMonths = groupInvoicesByMonth(approvedInvoices);
+  const invoiceFiltersActive = invoiceSearch.trim() !== "" || invoiceStatus !== "action" || invoicePeriod !== "90";
+
   return <section className="invoice-workspace" aria-labelledby="invoices-heading">
-    <header className="invoice-heading"><p className="section-code">DB—INVOICES</p><h1>{restaurant.name}</h1><p>{restaurant.city} · {formatServiceStyle(restaurant.serviceStyle)}</p></header>
+    <header className="invoice-heading"><h1 id="invoices-heading">Invoices</h1><p>{restaurant.name} · {restaurant.city} · {formatServiceStyle(restaurant.serviceStyle)}</p></header>
     <div className="invoice-grid">
       <form className="invoice-form" onSubmit={upload} noValidate>
         <h2>Upload an invoice</h2><p>Save one supplier PDF or photo. Maximum 10 MiB.</p>
@@ -753,14 +812,21 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
         {notice && <p className="success-notice" role="status">{notice}</p>}
         <button className="ledger-button" type="submit" disabled={uploading}>{uploading ? "Uploading invoice…" : "Upload invoice"}<span aria-hidden="true">→</span></button>
       </form>
-      <div className="invoice-list"><div className="list-heading"><h2 id="invoices-heading">Recent invoices</h2>{!loading && <button className="text-button" type="button" onClick={loadInvoices}>Refresh</button>}</div>
+      <div className="invoice-list"><div className="list-heading"><h2>Recent invoices</h2>{!loading && <button className="text-button" type="button" onClick={loadInvoices}>Refresh</button>}</div>
         {listError && <p className="form-error" role="alert">{listError}</p>}
-        {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload your first supplier invoice.</p> :
-          <div className="invoice-cards">{invoices.map((invoice) => <article className="invoice-card" key={invoice.id}><div><p className="invoice-status">{importStatusLabel(invoice.status, invoice.delayed, "invoice")}</p><h3>{invoice.supplierName}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><div className="card-actions">{invoice.status === "needs_review" && <button className="ledger-button" type="button" onClick={() => setReviewId(invoice.id)}>Review invoice</button>}{invoice.status === "failed" && <button className="ledger-button" type="button" disabled={retryingId===invoice.id} onClick={() => void retry(invoice)}>{retryingId===invoice.id ? "Trying again…" : "Try again"}</button>}{invoice.status === "ready" && invoice.priceChangeCount > 0 && <button className="price-change-alert" type="button" onClick={() => {setApprovedPriceChanges(null);setPriceChangeId(invoice.id)}}><span aria-hidden="true">!</span>{invoice.priceChangeCount} {invoice.priceChangeCount === 1 ? "price" : "prices"} changed</button>}{invoice.status === "ready" && <button className="ledger-button" type="button" onClick={() => setPurchaseId(invoice.id)}>Connect purchases</button>}<button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void openOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></div></article>)}</div>}
+        {!loading&&invoices.length>0&&<div className="collection-toolbar invoice-toolbar" aria-label="Filter invoices"><label className="collection-search">Search all invoices<input type="search" placeholder="Supplier or filename" value={invoiceSearch} onChange={event=>{const value=event.target.value;if(!invoiceSearch.trim()&&value.trim()){setInvoiceStatus("all");setInvoicePeriod("all")}setInvoiceSearch(value)}}/></label><label>Status<select value={invoiceStatus} onChange={event=>setInvoiceStatus(event.target.value as typeof invoiceStatus)}><option value="action">Needs action</option><option value="processing">Processing</option><option value="approved">Approved</option><option value="all">All statuses</option></select></label><label>Period<select value={invoicePeriod} onChange={event=>setInvoicePeriod(event.target.value as typeof invoicePeriod)}><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="year">This year</option><option value="all">All history</option></select></label><div className="collection-toolbar-summary"><strong>{filteredInvoices.length} {filteredInvoices.length===1?"invoice":"invoices"}</strong>{invoiceFiltersActive&&<button className="text-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("action");setInvoicePeriod("90")}}>Clear filters</button>}</div></div>}
+        {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload your first supplier invoice.</p> : filteredInvoices.length===0 ? <div className="filtered-empty"><h3>{invoiceStatus === "action" && !invoiceSearch.trim() ? "No invoices need action" : "No invoices match"}</h3><p>{invoiceStatus === "action" && !invoiceSearch.trim() ? "You're caught up for this period. Approved invoices remain available in history." : "Try a different status, period, or search."}</p><button className="file-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("all");setInvoicePeriod("all")}}>Show all invoices</button></div> : <div className="invoice-results">
+          {operationalInvoices.length>0&&<section className="invoice-result-group"><h3>Current work<span>{operationalInvoices.length}</span></h3><div className="invoice-cards">{operationalInvoices.map(invoice=><InvoiceCard key={invoice.id} invoice={invoice} openingId={openingId} retryingId={retryingId} onReview={setReviewId} onRetry={retry} onPriceChanges={id=>{setApprovedPriceChanges(null);setPriceChangeId(id)}} onPurchases={setPurchaseId} onOriginal={openOriginal}/>)}</div></section>}
+          {invoiceMonths.map(([month,monthInvoices],index)=><details className="invoice-month" key={month} open={index===0}><summary><span>{formatInvoiceMonth(month)}</span><strong>{monthInvoices.length}</strong></summary><div className="invoice-cards">{monthInvoices.map(invoice=><InvoiceCard key={invoice.id} invoice={invoice} openingId={openingId} retryingId={retryingId} onReview={setReviewId} onRetry={retry} onPriceChanges={id=>{setApprovedPriceChanges(null);setPriceChangeId(id)}} onPurchases={setPurchaseId} onOriginal={openOriginal}/>)}</div></details>)}
+        </div>}
       </div>
     </div>
   </section>;
 }
+
+function InvoiceCard({invoice,openingId,retryingId,onReview,onRetry,onPriceChanges,onPurchases,onOriginal}:{invoice:Invoice;openingId:string;retryingId:string;onReview:(id:string)=>void;onRetry:(invoice:Invoice)=>void;onPriceChanges:(id:string)=>void;onPurchases:(id:string)=>void;onOriginal:(invoice:Invoice)=>void}) { return <article className="invoice-card"><div><p className="invoice-status">{invoice.status === "ready" && invoice.purchaseReceiptRecorded ? "Approved · purchases connected" : importStatusLabel(invoice.status, invoice.delayed, "invoice")}</p><h3>{invoice.supplierName}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><div className="card-actions">{invoice.status === "needs_review" && <button className="ledger-button" type="button" onClick={() => onReview(invoice.id)}>Review invoice</button>}{invoice.status === "failed" && <button className="ledger-button" type="button" disabled={retryingId===invoice.id} onClick={() => void onRetry(invoice)}>{retryingId===invoice.id ? "Trying again…" : "Try again"}</button>}{invoice.status === "ready" && invoice.priceChangeCount > 0 && <button className="price-change-alert" type="button" onClick={() => onPriceChanges(invoice.id)}><span aria-hidden="true">!</span>{invoice.priceChangeCount} {invoice.priceChangeCount === 1 ? "price" : "prices"} changed</button>}{invoice.status === "ready" && <button className={invoice.purchaseReceiptRecorded ? "file-button" : "ledger-button"} type="button" onClick={() => onPurchases(invoice.id)}>{invoice.purchaseReceiptRecorded ? "View receipt" : "Connect purchases"}</button>}<button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void onOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></div></article>; }
+function groupInvoicesByMonth(invoices: Invoice[]): [string, Invoice[]][] { const groups=new Map<string,Invoice[]>(); invoices.forEach(invoice=>{const month=invoice.invoiceDate.slice(0,7);groups.set(month,[...(groups.get(month)??[]),invoice])}); return [...groups.entries()].sort(([a],[b])=>b.localeCompare(a)); }
+function formatInvoiceMonth(value:string) { const [year,month]=value.split("-").map(Number); return new Intl.DateTimeFormat(undefined,{month:"long",year:"numeric",timeZone:"UTC"}).format(new Date(Date.UTC(year,month-1,1))); }
 
 function importStatusLabel(status: string, delayed: boolean, document: "invoice" | "menu") {
   if (status === "processing") return delayed ? "Taking longer than usual" : `Reading ${document}…`;
@@ -792,7 +858,7 @@ function isValidOptionalDecimal(value:string|null,scale:number){if(!value?.trim(
 function PriceChanges({ invoiceId, request, initialChanges, onBack }: { invoiceId:string; request:<T>(path:string, init?:RequestInit)=>Promise<T>; initialChanges:PriceChange[]|null; onBack:()=>void }) {
   const [changes,setChanges]=useState<PriceChange[]|null>(initialChanges); const [error,setError]=useState("");
   useEffect(()=>{if(initialChanges)return;void request<PriceChange[]>(`/v1/invoices/${invoiceId}/price-changes`).then(setChanges).catch((reason:unknown)=>setError(reason instanceof Error?reason.message:"Price changes couldn't load."));},[initialChanges,invoiceId,request]);
-  return <section className="review-shell price-change-shell" aria-labelledby="price-change-heading"><button className="text-button" type="button" onClick={onBack}>Back to invoices</button><p className="section-code">DB—COST CHECK</p><h1 id="price-change-heading">Price changes</h1>{initialChanges&&<p className="success-notice" role="status">Invoice approved. {initialChanges.length} {initialChanges.length===1?"price":"prices"} changed.</p>}<p>Compared with the last approved invoice from the same supplier.</p>{error?<p className="form-error" role="alert">{error}</p>:changes===null?<p role="status">Checking approved purchases…</p>:changes.length===0?<div className="price-empty"><h2>No price changes to flag.</h2><p>Prices are either within 5% of the last comparable purchase or there is not enough matching history yet. We only compare the same supplier, item, currency, and unit.</p></div>:<div className="price-change-list">{changes.map((change)=>{const percentage=Number(change.percentageChange);const increased=percentage>0;return <article className="price-change-card" key={change.id}><p className="invoice-status">{increased?"Cost increase":"Cost decrease"} · High confidence</p><h2>{change.description} is {increased?"up":"down"} {Math.abs(percentage).toFixed(1)}%</h2><p className="price-comparison"><strong>{formatMoney(change.currentUnitPrice,change.currency)}</strong><span>was {formatMoney(change.previousUnitPrice,change.currency)}{change.unit?` per ${change.unit}`:""}</span></p><p>Last comparable purchase: {formatDate(change.previousInvoiceDate)}.</p><p className="price-action"><strong>Next move:</strong> {increased?"Check the next delivery price or ask the supplier what changed.":"Use the lower cost when planning the next order."}</p></article>})}</div>}</section>;
+  return <section className="review-shell price-change-shell" aria-labelledby="price-change-heading"><button className="text-button" type="button" onClick={onBack}>Back to invoices</button><p className="section-code">Cost check</p><h1 id="price-change-heading">Price changes</h1>{initialChanges&&<p className="success-notice" role="status">Invoice approved. {initialChanges.length} {initialChanges.length===1?"price":"prices"} changed.</p>}<p>Compared with the last approved invoice from the same supplier.</p>{error?<p className="form-error" role="alert">{error}</p>:changes===null?<p role="status">Checking approved purchases…</p>:changes.length===0?<div className="price-empty"><h2>No price changes to flag.</h2><p>Prices are either within 5% of the last comparable purchase or there is not enough matching history yet. We only compare the same supplier, item, currency, and unit.</p></div>:<div className="price-change-list">{changes.map((change)=>{const percentage=Number(change.percentageChange);const increased=percentage>0;return <article className="price-change-card" key={change.id}><p className="invoice-status">{increased?"Cost increase":"Cost decrease"} · High confidence</p><h2>{change.description} is {increased?"up":"down"} {Math.abs(percentage).toFixed(1)}%</h2><p className="price-comparison"><strong>{formatMoney(change.currentUnitPrice,change.currency)}</strong><span>was {formatMoney(change.previousUnitPrice,change.currency)}{change.unit?` per ${change.unit}`:""}</span></p><p>Last comparable purchase: {formatDate(change.previousInvoiceDate)}.</p><p className="price-action"><strong>Next move:</strong> {increased?"Check the next delivery price or ask the supplier what changed.":"Use the lower cost when planning the next order."}</p></article>})}</div>}</section>;
 }
 
 function ConnectPurchases({ invoiceId, request, onBack }: { invoiceId:string; request:<T>(path:string, init?:RequestInit)=>Promise<T>; onBack:()=>void }) {
@@ -803,14 +869,14 @@ function ConnectPurchases({ invoiceId, request, onBack }: { invoiceId:string; re
   async function submit(event:FormEvent){event.preventDefault();if(!response||response.status!=="pending")return;setError("");const invalid=response.lines.some(line=>!validPurchaseDecision(decisions[line.id],line));if(invalid){setError("Choose how to handle every line and check each conversion.");return}setSaving(true);try{const resolutions=response.lines.map(line=>{const decision=decisions[line.id];if(decision.action==="match"){return {lineId:line.id,action:decision.action,inventoryItemId:decision.inventoryItemId,expectedCountUnit:decision.expectedCountUnit,conversion:decision.conversion}}return {lineId:line.id,...decision}});const next=await request<PurchaseResponse>(`/v1/invoices/${invoiceId}/purchase-receipt`,{method:"PUT",body:JSON.stringify({resolutions})});setResponse(next);window.scrollTo({top:0});}catch(reason){setError(reason instanceof Error?reason.message:"The purchase receipt couldn't be recorded. Check the lines and try again.");}finally{setSaving(false)}}
   if(!response)return <section className="review-shell"><button className="text-button" type="button" onClick={onBack}>Back to invoices</button><p role={error?"alert":"status"}>{error||"Opening purchases…"}</p></section>;
   if(response.status==="recorded")return <ReceiptSummary receipt={response.receipt} replay={response.alreadyRecorded} onBack={onBack}/>;
-  return <section className="review-shell purchase-shell" aria-labelledby="purchase-heading"><button className="text-button" type="button" onClick={onBack}>Back to invoices</button><p className="section-code">DB—PURCHASES</p><h1 id="purchase-heading">Connect purchases</h1><p>Choose what each invoice line should connect to. Nothing changes your inventory count.</p><div className="purchase-invoice-meta"><strong>{response.invoice.supplierName}</strong><span>{formatDate(response.invoice.invoiceDate)} · {response.invoice.invoiceNumber||"No invoice number"}</span></div><form className="purchase-form" onSubmit={submit}>{response.lines.map(line=>{const decision=decisions[line.id]??{action:""};const suggested=decision.action==="match"&&decision.suggested;const selectedItem=decision.action==="match"?response.inventoryItems.find(item=>item.id===decision.inventoryItemId):null;const countUnit=decision.action==="create"?decision.countUnit:selectedItem?.countUnit;return <fieldset className="purchase-line" key={line.id}><legend>{line.description}</legend><p className="purchase-source">{line.quantity??"No quantity"} {line.unit??"No purchase unit"}{line.lineTotal?` · ${formatMoney(line.lineTotal,response.invoice.currency)}`:""}</p>{suggested&&<p className="saved-match" role="status">Saved from past invoices · Review and record to confirm</p>}{!line.canTrack&&<p className="review-warning">This line needs a positive quantity and purchase unit to connect. You can choose not to track it.</p>}<div className="purchase-options"><label><input type="radio" name={`action-${line.id}`} checked={decision.action==="match"} disabled={!line.canTrack||response.inventoryItems.length===0} onChange={()=>choose(line,"match")}/> Match an inventory item</label><label><input type="radio" name={`action-${line.id}`} checked={decision.action==="create"} disabled={!line.canTrack} onChange={()=>choose(line,"create")}/> Create an inventory item</label><label><input type="radio" name={`action-${line.id}`} checked={decision.action==="ignore"} onChange={()=>choose(line,"ignore")}/> Don’t track this item</label></div>{decision.action==="match"&&<div className="purchase-fields"><label>Inventory item<select value={decision.inventoryItemId} onChange={event=>{const item=response.inventoryItems.find(candidate=>candidate.id===event.target.value);update(line.id,{inventoryItemId:event.target.value,expectedCountUnit:item?.countUnit??""})}}>{response.inventoryItems.map(item=><option key={item.id} value={item.id}>{item.name} · {item.countUnit}</option>)}</select></label><ConversionField line={line} countUnit={countUnit??"count units"} value={decision.conversion} onChange={value=>update(line.id,{conversion:value})}/></div>}{decision.action==="create"&&<div className="purchase-fields"><label>Item name<input maxLength={50} value={decision.name} onChange={event=>update(line.id,{name:event.target.value})}/></label><label>Category <span>Optional</span><input maxLength={20} value={decision.category} onChange={event=>update(line.id,{category:event.target.value})}/></label><label>Count unit<select value={decision.countUnit} onChange={event=>update(line.id,{countUnit:event.target.value})}>{inventoryUnits.map(unit=><option key={unit}>{unit}</option>)}</select></label><ConversionField line={line} countUnit={decision.countUnit} value={decision.conversion} onChange={value=>update(line.id,{conversion:value})}/></div>}</fieldset>})}{error&&<p className="form-error" role="alert">{error}</p>}<div className="purchase-submit"><button className="file-button" type="button" disabled={saving} onClick={onBack}>Save nothing and go back</button><button className="ledger-button" disabled={saving}>{saving?"Recording…":"Record purchase receipt"}</button></div></form></section>;
+  return <section className="review-shell purchase-shell" aria-labelledby="purchase-heading"><button className="text-button" type="button" onClick={onBack}>Back to invoices</button><p className="section-code">Purchases</p><h1 id="purchase-heading">Connect purchases</h1><p>Choose what each invoice line should connect to. Nothing changes your inventory count.</p><div className="purchase-invoice-meta"><strong>{response.invoice.supplierName}</strong><span>{formatDate(response.invoice.invoiceDate)} · {response.invoice.invoiceNumber||"No invoice number"}</span></div><form className="purchase-form" onSubmit={submit}>{response.lines.map(line=>{const decision=decisions[line.id]??{action:""};const suggested=decision.action==="match"&&decision.suggested;const selectedItem=decision.action==="match"?response.inventoryItems.find(item=>item.id===decision.inventoryItemId):null;const countUnit=decision.action==="create"?decision.countUnit:selectedItem?.countUnit;return <fieldset className="purchase-line" key={line.id}><legend>{line.description}</legend><p className="purchase-source">{line.quantity??"No quantity"} {line.unit??"No purchase unit"}{line.lineTotal?` · ${formatMoney(line.lineTotal,response.invoice.currency)}`:""}</p>{suggested&&<p className="saved-match" role="status">Saved from past invoices · Review and record to confirm</p>}{!line.canTrack&&<p className="review-warning">This line needs a positive quantity and purchase unit to connect. You can choose not to track it.</p>}<div className="purchase-options"><label><input type="radio" name={`action-${line.id}`} checked={decision.action==="match"} disabled={!line.canTrack||response.inventoryItems.length===0} onChange={()=>choose(line,"match")}/> Match an inventory item</label><label><input type="radio" name={`action-${line.id}`} checked={decision.action==="create"} disabled={!line.canTrack} onChange={()=>choose(line,"create")}/> Create an inventory item</label><label><input type="radio" name={`action-${line.id}`} checked={decision.action==="ignore"} onChange={()=>choose(line,"ignore")}/> Don’t track this item</label></div>{decision.action==="match"&&<div className="purchase-fields"><label>Inventory item<select value={decision.inventoryItemId} onChange={event=>{const item=response.inventoryItems.find(candidate=>candidate.id===event.target.value);update(line.id,{inventoryItemId:event.target.value,expectedCountUnit:item?.countUnit??""})}}>{response.inventoryItems.map(item=><option key={item.id} value={item.id}>{item.name} · {item.countUnit}</option>)}</select></label><ConversionField line={line} countUnit={countUnit??"count units"} value={decision.conversion} onChange={value=>update(line.id,{conversion:value})}/></div>}{decision.action==="create"&&<div className="purchase-fields"><label>Item name<input maxLength={50} value={decision.name} onChange={event=>update(line.id,{name:event.target.value})}/></label><label>Category <span>Optional</span><input maxLength={20} value={decision.category} onChange={event=>update(line.id,{category:event.target.value})}/></label><label>Count unit<select value={decision.countUnit} onChange={event=>update(line.id,{countUnit:event.target.value})}>{inventoryUnits.map(unit=><option key={unit}>{unit}</option>)}</select></label><ConversionField line={line} countUnit={decision.countUnit} value={decision.conversion} onChange={value=>update(line.id,{conversion:value})}/></div>}</fieldset>})}{error&&<p className="form-error" role="alert">{error}</p>}<div className="purchase-submit"><button className="file-button" type="button" disabled={saving} onClick={onBack}>Save nothing and go back</button><button className="ledger-button" disabled={saving}>{saving?"Recording…":"Record purchase receipt"}</button></div></form></section>;
 }
 
 function ConversionField({line,countUnit,value,onChange}:{line:PurchaseLine;countUnit:string;value:string;onChange:(value:string)=>void}){const converted=convertedQuantity(line.quantity,value);return <label>Conversion<span className="conversion-input">1 {line.unit} = <input aria-label={`${line.description}, count units per ${line.unit}`} inputMode="decimal" value={value} onChange={event=>onChange(event.target.value)}/> {countUnit}</span>{converted&&<small>{line.quantity} {line.unit} will be recorded as {converted} {countUnit}</small>}</label>}
 function validPurchaseDecision(decision:PurchaseDecision|undefined,line:PurchaseLine){if(!decision||!decision.action)return false;if(decision.action==="ignore")return true;if(!line.canTrack||!isPositiveDecimal(decision.conversion,12))return false;if(decision.action==="match")return Boolean(decision.inventoryItemId);return Boolean(decision.name.trim())&&decision.name.trim().length<=50&&decision.category.trim().length<=20&&Boolean(decision.countUnit.trim())}
 function isPositiveDecimal(value:string,scale:number){const match=/^(\d+)(?:\.(\d*))?$/.exec(value.trim());return Boolean(match&&(match[2]?.length??0)<=scale&&Number(value)>0)}
 function convertedQuantity(quantity:string|null,conversion:string){if(!quantity||!isPositiveDecimal(conversion,12))return "";const left=/^(\d+)(?:\.(\d*))?$/.exec(quantity.trim());const right=/^(\d+)(?:\.(\d*))?$/.exec(conversion.trim());if(!left||!right)return "";const leftFraction=left[2]??"";const rightFraction=right[2]??"";const product=(BigInt(left[1]+leftFraction)*BigInt(right[1]+rightFraction)).toString().padStart(leftFraction.length+rightFraction.length+1,"0");const scale=leftFraction.length+rightFraction.length;if(scale===0)return product;const exact=`${product.slice(0,-scale)}.${product.slice(-scale)}`.replace(/\.0+$/,"").replace(/(\.\d*?)0+$/,"$1");return exact.startsWith(".")?`0${exact}`:exact}
-function ReceiptSummary({receipt,replay,onBack}:{receipt:PurchaseReceipt;replay:boolean;onBack:()=>void}){const tracked=receipt.lines.filter(line=>line.resolution!=="ignored").length;return <section className="review-shell receipt-shell" aria-labelledby="receipt-heading"><button className="text-button" type="button" onClick={onBack}>Back to invoices</button><p className="section-code">DB—PURCHASES / RECEIPT</p><h1 id="receipt-heading">Purchase receipt recorded</h1>{replay&&<p className="success-notice" role="status">This invoice was already recorded. Showing the saved receipt.</p>}<p>{receipt.invoice.supplierName} · {formatDate(receipt.invoice.invoiceDate)} · {tracked} connected, {receipt.lines.length-tracked} not tracked</p><div className="receipt-lines">{receipt.lines.map(line=><article key={line.id}><div><p className="invoice-status">{line.resolution==="ignored"?"Not tracked":line.resolution==="created"?"Inventory item created":"Matched to inventory"}</p><h2>{line.description}</h2><p>{line.quantity??"—"} {line.unit??""}{line.lineTotal?` · ${formatMoney(line.lineTotal,receipt.invoice.currency)}`:""}</p></div>{line.inventoryItemName&&<div className="receipt-link"><strong>{line.inventoryItemName}</strong><span>1 {line.unit} = {line.conversion} {line.countUnit}</span>{convertedQuantity(line.quantity,line.conversion??"")&&<span>Receipt quantity: {convertedQuantity(line.quantity,line.conversion??"")} {line.countUnit}</span>}</div>}</article>)}</div><button className="ledger-button" type="button" onClick={onBack}>Done</button></section>}
+function ReceiptSummary({receipt,replay,onBack}:{receipt:PurchaseReceipt;replay:boolean;onBack:()=>void}){const tracked=receipt.lines.filter(line=>line.resolution!=="ignored").length;return <section className="review-shell receipt-shell" aria-labelledby="receipt-heading"><button className="text-button" type="button" onClick={onBack}>Back to invoices</button><p className="section-code">Purchase receipt</p><h1 id="receipt-heading">Purchase receipt recorded</h1>{replay&&<p className="success-notice" role="status">This invoice was already recorded. Showing the saved receipt.</p>}<p>{receipt.invoice.supplierName} · {formatDate(receipt.invoice.invoiceDate)} · {tracked} connected, {receipt.lines.length-tracked} not tracked</p><div className="receipt-lines">{receipt.lines.map(line=><article key={line.id}><div><p className="invoice-status">{line.resolution==="ignored"?"Not tracked":line.resolution==="created"?"Inventory item created":"Matched to inventory"}</p><h2>{line.description}</h2><p>{line.quantity??"—"} {line.unit??""}{line.lineTotal?` · ${formatMoney(line.lineTotal,receipt.invoice.currency)}`:""}</p></div>{line.inventoryItemName&&<div className="receipt-link"><strong>{line.inventoryItemName}</strong><span>1 {line.unit} = {line.conversion} {line.countUnit}</span>{convertedQuantity(line.quantity,line.conversion??"")&&<span>Receipt quantity: {convertedQuantity(line.quantity,line.conversion??"")} {line.countUnit}</span>}</div>}</article>)}</div><button className="ledger-button" type="button" onClick={onBack}>Done</button></section>}
 
 function formatBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`)); }
@@ -828,28 +894,28 @@ function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string;
     if (!name.trim() || !city.trim()) { setError("Add your restaurant name and city to continue."); return; }
     setSubmitting(true); setError("");
     try { await onCreate({ name, city, serviceStyle }); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : "We couldn't open your Daybook. Please try again."); setSubmitting(false); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "We couldn't open Parline. Please try again."); setSubmitting(false); }
   }
 
   return <main className="app-shell">
     <AppHeader onSignOut={onSignOut} />
     <section className="onboarding-shell" aria-labelledby="onboarding-heading">
-      <p className="section-code">DB—SETUP / 01</p>
-      <h1 id="onboarding-heading">Open your <em>restaurant daybook.</em></h1>
+      <p className="section-code">Setup</p>
+      <h1 id="onboarding-heading">Set up <em>your restaurant.</em></h1>
       <p className="brief-intro">Three details now. Invoices, ingredients, and the rest can wait until your next shift.</p>
       <form className="onboarding-form" onSubmit={submit} noValidate>
         <div className="ledger-field"><label htmlFor="restaurant-name">Restaurant name</label><p id="name-help">Use the name your crew knows.</p><input id="restaurant-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={120} autoComplete="organization" aria-describedby="name-help form-error" required /></div>
         <div className="ledger-field"><label htmlFor="city">City</label><p id="city-help">The city for this first location.</p><input id="city" value={city} onChange={(event) => setCity(event.target.value)} maxLength={100} autoComplete="address-level2" aria-describedby="city-help form-error" required /></div>
         <div className="ledger-field"><label htmlFor="service-style">Service style</label><p id="style-help">Choose the closest fit. You can keep setup simple.</p><select id="service-style" value={serviceStyle} onChange={(event) => setServiceStyle(event.target.value as ServiceStyle)} aria-describedby="style-help form-error">{serviceStyles.map((style) => <option key={style.value} value={style.value}>{style.label}</option>)}</select></div>
         {error && <p className="form-error" id="form-error" role="alert">{error}</p>}
-        <button className="ledger-button" type="submit" disabled={submitting}>{submitting ? "Opening Daybook…" : "Open my Daybook"}<span aria-hidden="true">→</span></button>
+        <button className="ledger-button" type="submit" disabled={submitting}>{submitting ? "Opening Parline…" : "Open Parline"}<span aria-hidden="true">→</span></button>
       </form>
     </section>
   </main>;
 }
 
 function ErrorPage({ message, onRetry, onSignOut }: { message: string; onRetry: () => void; onSignOut: () => void }) {
-  return <main className="status-page"><div className="error-notice" role="alert"><p className="section-code">DB—CONNECTION</p><h1>We couldn't open the brief.</h1><p>{message}</p><button className="ledger-button ledger-button-light" type="button" onClick={onRetry}>Retry <span aria-hidden="true">→</span></button><button className="text-button" type="button" onClick={onSignOut}>Sign out</button></div></main>;
+  return <main className="status-page"><div className="error-notice" role="alert"><p className="section-code">Connection</p><h1>We couldn't open the brief.</h1><p>{message}</p><button className="ledger-button ledger-button-light" type="button" onClick={onRetry}>Retry <span aria-hidden="true">→</span></button><button className="text-button" type="button" onClick={onSignOut}>Sign out</button></div></main>;
 }
 
 function formatServiceStyle(value: ServiceStyle) { return serviceStyles.find((style) => style.value === value)?.label ?? value; }
@@ -878,17 +944,17 @@ function Welcome({ authConfigured, onSignIn, onSignUp }: WelcomeProps) {
       <section className="landing-hero" aria-labelledby="hero-heading">
         <div className="hero-copy">
           <p className="hero-kicker"><span>Service intelligence</span><span>Not another dashboard</span></p>
-          <h1 id="hero-heading"><span className="hero-command">Run the <span>shift.</span></span><em>Protect the margin.</em></h1>
-          <p className="hero-lede">Daybook keeps invoice reviews, supplier price evidence, and inventory count follow-ups in one short list.</p>
+          <h1 id="hero-heading"><span className="hero-command">Know what <span>changed.</span></span><em>Protect the next shift.</em></h1>
+          <p className="hero-lede">Parline keeps invoice reviews, supplier price evidence, and inventory count follow-ups in one short list.</p>
 
           <div className="hero-actions">
             <button className="ledger-button ledger-button-light" type="button" onClick={onSignUp} disabled={!authConfigured}>
-              Start your daybook <span aria-hidden="true">→</span>
+              Start with Parline <span aria-hidden="true">→</span>
             </button>
             <span>Keep your POS.<br />Skip the spreadsheet.</span>
           </div>
 
-          <div className="signal-chain" aria-label="How Daybook works">
+          <div className="signal-chain" aria-label="How Parline works">
             <span>01 · Snap invoices</span>
             <span>02 · Count what matters</span>
             <span>03 · Work the brief</span>
@@ -909,9 +975,9 @@ function Welcome({ authConfigured, onSignIn, onSignUp }: WelcomeProps) {
 
 function Wordmark() {
   return (
-    <a className="wordmark" href="/" aria-label="Daybook home">
-      <span className="wordmark-index">DB<br />01</span>
-      <span className="wordmark-name">Daybook</span>
+    <a className="wordmark" href="/" aria-label="Parline home">
+      <span className="wordmark-index">PL<br />01</span>
+      <span className="wordmark-name">Parline</span>
     </a>
   );
 }
@@ -920,7 +986,7 @@ function AppHeader({ onSignOut, restaurantName }: { onSignOut: () => void; resta
   return (
     <header className="app-header">
       <Wordmark />
-      <p className="restaurant-label"><span>Restaurant</span>{restaurantName ?? "New daybook"}</p>
+      <p className="restaurant-label"><span>Restaurant</span>{restaurantName ?? "New restaurant"}</p>
       <button className="text-button" type="button" onClick={onSignOut}>Sign out</button>
     </header>
   );
@@ -964,7 +1030,7 @@ function ServiceBrief() {
       <footer className="service-brief-footer">
         <span>Generated 7:04 AM</span>
         <span className="confidence-stamp">Source<br />backed</span>
-        <span>Daybook / DB-0717</span>
+        <span>Parline / 0717</span>
       </footer>
     </aside>
   );

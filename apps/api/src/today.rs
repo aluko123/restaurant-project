@@ -186,20 +186,24 @@ pub(crate) async fn get(
         .await
         .map_err(today_database_error)?;
 
-    // Owner-only queries stay inside this branch so other roles cannot execute or serialize
-    // financial and document evidence.
-    let (workflows, prices) = if member.role == "owner" {
-        let workflows = sqlx::query_as::<_, WorkflowFacts>(OWNER_WORKFLOW_SQL)
-            .bind(member.restaurant_id)
-            .fetch_one(&state.pool)
-            .await
-            .map_err(today_database_error)?;
-        let prices = restaurant_price_changes(&state.pool, member.restaurant_id)
-            .await
-            .map_err(today_database_error)?;
-        (Some(workflows), prices)
+    let workflows = if matches!(member.role.as_str(), "owner" | "manager") {
+        Some(
+            sqlx::query_as::<_, WorkflowFacts>(OWNER_WORKFLOW_SQL)
+                .bind(member.restaurant_id)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(today_database_error)?,
+        )
     } else {
-        (None, Vec::new())
+        None
+    };
+    // Supplier pricing remains owner-only financial evidence.
+    let prices = if member.role == "owner" {
+        restaurant_price_changes(&state.pool, member.restaurant_id)
+            .await
+            .map_err(today_database_error)?
+    } else {
+        Vec::new()
     };
 
     let generated_at = Utc::now();
@@ -244,79 +248,78 @@ fn today_database_error(error: sqlx::Error) -> ApiError {
 fn build_actions(role: &str, timezone: Tz, local_date: NaiveDate, sources: Sources) -> Vec<Action> {
     let mut actions = Vec::new();
 
+    if let Some(facts) = sources.workflows {
+        push_grouped_action(
+            &mut actions,
+            facts.invoice_review_count,
+            facts.invoice_review_at,
+            GroupedAction {
+                action_id: "today:invoice_review",
+                rule_key: "invoice_review",
+                category: "document_review",
+                priority: Priority::Urgent,
+                singular: "invoice needs review",
+                plural: "invoices need review",
+                title: "Review supplier invoices",
+                why: "These invoices are still waiting for an owner or manager to verify the extracted details.",
+                next: "Open Invoices and compare each record with its original document.",
+                source: "invoices.status = needs_review",
+                limitation: "This is a grouped status count; each original invoice still needs review.",
+                target: Target {
+                    workspace: "invoices",
+                    path: "/invoices",
+                    label: "Review invoices",
+                },
+            },
+        );
+        push_grouped_action(
+            &mut actions,
+            facts.menu_review_count,
+            facts.menu_review_at,
+            GroupedAction {
+                action_id: "today:menu_review",
+                rule_key: "menu_review",
+                category: "document_review",
+                priority: Priority::Urgent,
+                singular: "menu import needs review",
+                plural: "menu imports need review",
+                title: "Review menu imports",
+                why: "These menu files are still waiting for an owner or manager to check the extracted items and prices.",
+                next: "Open Menu and verify each import against its original file.",
+                source: "menu_imports.status = needs_review",
+                limitation: "This is a grouped status count; nothing is imported until an owner or manager approves it.",
+                target: Target {
+                    workspace: "menu",
+                    path: "/menu",
+                    label: "Review menu",
+                },
+            },
+        );
+        push_grouped_action(
+            &mut actions,
+            facts.failed_invoice_count,
+            facts.failed_invoice_at,
+            GroupedAction {
+                action_id: "today:import_retry",
+                rule_key: "import_retry",
+                category: "import_retry",
+                priority: Priority::High,
+                singular: "invoice import failed",
+                plural: "invoice imports failed",
+                title: "Retry failed invoice imports",
+                why: "These invoice imports have a failed status and can be tried again.",
+                next: "Open Invoices and retry each failed import.",
+                source: "invoices.status = failed",
+                limitation: "Only failed imports are included; delayed processing is not treated as retryable.",
+                target: Target {
+                    workspace: "invoices",
+                    path: "/invoices",
+                    label: "Open failed imports",
+                },
+            },
+        );
+    }
     if role == "owner" {
-        if let Some(facts) = sources.workflows {
-            push_grouped_action(
-                &mut actions,
-                facts.invoice_review_count,
-                facts.invoice_review_at,
-                GroupedAction {
-                    action_id: "today:invoice_review",
-                    rule_key: "invoice_review",
-                    category: "document_review",
-                    priority: Priority::Urgent,
-                    singular: "invoice needs review",
-                    plural: "invoices need review",
-                    title: "Review supplier invoices",
-                    why: "These invoices are still waiting for an owner to verify the extracted details.",
-                    next: "Open Invoices and compare each record with its original document.",
-                    source: "invoices.status = needs_review",
-                    limitation: "This is a grouped status count; each original invoice still needs review.",
-                    target: Target {
-                        workspace: "invoices",
-                        path: "/invoices",
-                        label: "Review invoices",
-                    },
-                },
-            );
-            push_grouped_action(
-                &mut actions,
-                facts.menu_review_count,
-                facts.menu_review_at,
-                GroupedAction {
-                    action_id: "today:menu_review",
-                    rule_key: "menu_review",
-                    category: "document_review",
-                    priority: Priority::Urgent,
-                    singular: "menu import needs review",
-                    plural: "menu imports need review",
-                    title: "Review menu imports",
-                    why: "These menu files are still waiting for an owner to check the extracted items and prices.",
-                    next: "Open Menu and verify each import against its original file.",
-                    source: "menu_imports.status = needs_review",
-                    limitation: "This is a grouped status count; nothing is imported until an owner approves it.",
-                    target: Target {
-                        workspace: "menu",
-                        path: "/menu",
-                        label: "Review menu",
-                    },
-                },
-            );
-            push_grouped_action(
-                &mut actions,
-                facts.failed_invoice_count,
-                facts.failed_invoice_at,
-                GroupedAction {
-                    action_id: "today:import_retry",
-                    rule_key: "import_retry",
-                    category: "import_retry",
-                    priority: Priority::High,
-                    singular: "invoice import failed",
-                    plural: "invoice imports failed",
-                    title: "Retry failed invoice imports",
-                    why: "These invoice imports have a failed status and can be tried again.",
-                    next: "Open Invoices and retry each failed import.",
-                    source: "invoices.status = failed",
-                    limitation: "Only failed imports are included; delayed processing is not treated as retryable.",
-                    target: Target {
-                        workspace: "invoices",
-                        path: "/invoices",
-                        label: "Open failed imports",
-                    },
-                },
-            );
-        }
-
         for change in sources.prices {
             if let Some(action) = price_action(change) {
                 actions.push(action);
@@ -729,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn financial_and_document_actions_are_owner_only() {
+    fn managers_receive_document_actions_but_not_owner_price_actions() {
         let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
         let owner = build_actions("owner", chrono_tz::UTC, date, sources(true));
         assert!(
@@ -743,10 +746,19 @@ mod tests {
                 .any(|action| action.rule_key == "supplier_price_increase")
         );
 
-        for role in ["manager", "staff"] {
-            let actions = build_actions(role, chrono_tz::UTC, date, sources(true));
-            assert!(actions.is_empty());
-        }
+        let manager = build_actions("manager", chrono_tz::UTC, date, sources(true));
+        assert!(
+            manager
+                .iter()
+                .any(|action| action.rule_key == "invoice_review")
+        );
+        assert!(
+            !manager
+                .iter()
+                .any(|action| action.rule_key == "supplier_price_increase")
+        );
+        let staff = build_actions("staff", chrono_tz::UTC, date, sources(false));
+        assert!(staff.is_empty());
     }
 
     #[test]

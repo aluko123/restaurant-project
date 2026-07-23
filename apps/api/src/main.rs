@@ -8,10 +8,15 @@ mod menu;
 mod menu_imports;
 mod purchases;
 mod sales;
+mod settings;
 mod storage;
 mod today;
 mod uploads;
 mod weekly_brief;
+mod workos;
+
+#[cfg(test)]
+mod release_tests;
 
 use std::{env, net::SocketAddr};
 
@@ -34,12 +39,14 @@ use tower_http::{
 };
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use workos::WorkosClient;
 
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
     verifier: JwtVerifier,
     storage: ObjectStorage,
+    workos: WorkosClient,
 }
 
 #[derive(Serialize)]
@@ -105,6 +112,7 @@ async fn main() -> Result<()> {
     let storage = ObjectStorage::from_env()
         .await
         .context("failed to configure private Cloudflare R2 storage")?;
+    let workos = WorkosClient::from_env().context("failed to configure WorkOS invitations")?;
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -134,6 +142,7 @@ async fn main() -> Result<()> {
             pool,
             verifier,
             storage,
+            workos,
         },
         web_origin
             .parse::<HeaderValue>()
@@ -156,7 +165,7 @@ async fn main() -> Result<()> {
 fn router(state: AppState, web_origin: HeaderValue) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::exact(web_origin))
-        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([
             axum::http::header::AUTHORIZATION,
             axum::http::header::CONTENT_TYPE,
@@ -169,6 +178,24 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/v1/today", get(today::get))
         .route("/v1/weekly-brief", get(weekly_brief::get))
         .route("/v1/restaurants", post(create_restaurant))
+        .route("/v1/settings", get(settings::get).put(settings::update))
+        .route("/v1/settings/invitations", post(settings::invite))
+        .route(
+            "/v1/settings/invitations/{id}/resend",
+            post(settings::resend_invitation),
+        )
+        .route(
+            "/v1/settings/invitations/{id}",
+            axum::routing::delete(settings::revoke_invitation),
+        )
+        .route(
+            "/v1/settings/team/{user_id}",
+            axum::routing::delete(settings::remove_member),
+        )
+        .route(
+            "/v1/settings/team/{user_id}/role",
+            axum::routing::put(settings::update_role),
+        )
         .route(
             "/v1/invoices",
             get(invoices::list)
@@ -194,6 +221,10 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route(
             "/v1/sales-days/{businessDate}",
             get(sales::get).put(sales::put),
+        )
+        .route(
+            "/v1/sales-imports/preview",
+            post(sales::preview_import).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
         )
         .route("/v1/sales/menu-options", get(sales::menu_options))
         .route("/v1/menu-items", get(menu::list).post(menu::create))
@@ -243,12 +274,12 @@ async fn me(
     headers: HeaderMap,
 ) -> Result<Json<MeResponse>, ApiError> {
     let subject = authenticated_subject(&state, &headers).await?;
-    let restaurant = sqlx::query_as::<_, Restaurant>(
+    let mut restaurant = sqlx::query_as::<_, Restaurant>(
         "SELECT r.id, r.name, r.city, r.service_style, r.timezone, m.role
          FROM users u JOIN restaurant_memberships m ON m.user_id = u.id
          JOIN restaurants r ON r.id = m.restaurant_id WHERE u.auth_subject = $1",
     )
-    .bind(subject)
+    .bind(&subject)
     .fetch_optional(&state.pool)
     .await
     .map_err(|_| {
@@ -257,7 +288,161 @@ async fn me(
             "We couldn't load your restaurant. Please try again.",
         )
     })?;
+    if restaurant.is_none() {
+        reconcile_invitation(&state, &subject).await?;
+        restaurant = sqlx::query_as::<_, Restaurant>(
+            "SELECT r.id,r.name,r.city,r.service_style,r.timezone,m.role
+             FROM users u JOIN restaurant_memberships m ON m.user_id=u.id
+             JOIN restaurants r ON r.id=m.restaurant_id WHERE u.auth_subject=$1",
+        )
+        .bind(&subject)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(database_error)?;
+    }
     Ok(Json(MeResponse { restaurant }))
+}
+
+#[derive(sqlx::FromRow)]
+struct ReconcileInvite {
+    id: uuid::Uuid,
+    restaurant_id: uuid::Uuid,
+    email: String,
+    role: String,
+    workos_invitation_id: String,
+}
+
+async fn reconcile_invitation(state: &AppState, subject: &str) -> Result<(), ApiError> {
+    if !state.workos.enabled() {
+        return Ok(());
+    }
+    let active = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM team_invitations WHERE state='pending')",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(database_error)?;
+    if !active {
+        return Ok(());
+    }
+    let user = state
+        .workos
+        .user(subject)
+        .await
+        .map_err(workos_recoverable)?;
+    if user.id != subject {
+        return Ok(());
+    }
+    let email = settings::normalize_email(&user.email).ok_or(ApiError(
+        StatusCode::FORBIDDEN,
+        "Your verified sign-in email does not match an active invitation.",
+    ))?;
+    if !user.email_verified {
+        return Ok(());
+    }
+    let local = sqlx::query_as::<_, ReconcileInvite>(
+        "SELECT id,restaurant_id,email,role,workos_invitation_id
+         FROM team_invitations WHERE email=$1 AND state='pending'",
+    )
+    .bind(&email)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(database_error)?;
+    let Some(local) = local else {
+        return Ok(());
+    };
+    let provider = state
+        .workos
+        .invitation(&local.workos_invitation_id)
+        .await
+        .map_err(workos_recoverable)?;
+    if provider.state != "accepted"
+        || provider.accepted_user_id.as_deref() != Some(subject)
+        || settings::normalize_email(&provider.email).as_deref() != Some(local.email.as_str())
+    {
+        return Ok(());
+    }
+    let display_name = [user.first_name.as_deref(), user.last_name.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|v| !v.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut tx = state.pool.begin().await.map_err(database_error)?;
+    let locked = sqlx::query_as::<_, ReconcileInvite>(
+        "SELECT id,restaurant_id,email,role,workos_invitation_id FROM team_invitations
+         WHERE id=$1 AND state='pending' FOR UPDATE",
+    )
+    .bind(local.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    let Some(locked) = locked else {
+        tx.rollback().await.map_err(database_error)?;
+        return Ok(());
+    };
+    let email_user = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT id,auth_subject FROM users WHERE LOWER(email)=LOWER($1) FOR UPDATE",
+    )
+    .bind(&email)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    if email_user
+        .as_ref()
+        .is_some_and(|(_, existing_subject)| existing_subject != subject)
+    {
+        tx.rollback().await.map_err(database_error)?;
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "This email is already linked to another Parline account.",
+        ));
+    }
+    let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "INSERT INTO users(id,auth_subject,email,display_name) VALUES($1,$2,$3,NULLIF($4,''))
+         ON CONFLICT(auth_subject) DO UPDATE SET email=EXCLUDED.email,display_name=EXCLUDED.display_name,updated_at=NOW() RETURNING id",
+    ).bind(uuid::Uuid::now_v7()).bind(subject).bind(&email).bind(display_name).fetch_one(&mut *tx).await.map_err(database_error)?;
+    let existing = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT restaurant_id FROM restaurant_memberships WHERE user_id=$1",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    if existing.is_some_and(|id| id != locked.restaurant_id) {
+        tx.rollback().await.map_err(database_error)?;
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "This account already belongs to another restaurant.",
+        ));
+    }
+    sqlx::query("INSERT INTO restaurant_memberships(restaurant_id,user_id,role) VALUES($1,$2,$3) ON CONFLICT(user_id) DO NOTHING")
+        .bind(locked.restaurant_id).bind(user_id).bind(&locked.role).execute(&mut *tx).await.map_err(database_error)?;
+    let membership_restaurant = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT restaurant_id FROM restaurant_memberships WHERE user_id=$1",
+    )
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    if membership_restaurant != locked.restaurant_id {
+        tx.rollback().await.map_err(database_error)?;
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "This account already belongs to another restaurant.",
+        ));
+    }
+    sqlx::query("UPDATE team_invitations SET state='accepted',accepted_by=$1,accepted_at=NOW(),updated_at=NOW() WHERE id=$2")
+        .bind(user_id).bind(locked.id).execute(&mut *tx).await.map_err(database_error)?;
+    tx.commit().await.map_err(database_error)?;
+    Ok(())
+}
+
+fn workos_recoverable(_: workos::WorkosError) -> ApiError {
+    ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Invitation verification is temporarily unavailable. Please try again.",
+    )
 }
 
 async fn create_restaurant(
@@ -296,7 +481,7 @@ async fn create_restaurant(
         let membership_exists = is_one_membership_violation(&error);
         tx.rollback().await.map_err(database_error)?;
         if membership_exists {
-            return Err(ApiError(StatusCode::CONFLICT, "You already belong to a restaurant. Reload your Daybook."));
+            return Err(ApiError(StatusCode::CONFLICT, "You already belong to a restaurant. Reload Parline."));
         }
         return Err(database_error(error));
     }

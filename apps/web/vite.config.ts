@@ -8,9 +8,9 @@ export default defineConfig({
     VitePWA({
       registerType: "autoUpdate",
       manifest: {
-        name: "Restaurant Daily Profit Copilot",
-        short_name: "Restaurant Copilot",
-        description: "Daily purchasing, prep, and profit actions for independent restaurants.",
+        name: "Parline — Restaurant Operations",
+        short_name: "Parline",
+        description: "Know what changed and protect the next shift with source-backed restaurant operations insights.",
         theme_color: "#173f35",
         background_color: "#f7f4ed",
         display: "standalone",

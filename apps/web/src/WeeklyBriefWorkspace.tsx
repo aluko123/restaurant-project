@@ -98,7 +98,7 @@ export function WeeklyBriefWorkspace({
     <section className="weekly-brief-workspace" aria-labelledby="weekly-brief-heading">
       <header className="weekly-brief-heading">
         <div className="weekly-brief-eyebrow">
-          <p className="section-code">DB—WEEKLY BRIEF</p>
+          <p className="section-code">Weekly brief</p>
           <span>Live preview</span>
         </div>
         <h1 id="weekly-brief-heading">Current week</h1>

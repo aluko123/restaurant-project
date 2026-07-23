@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Multipart, Path, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -11,9 +12,15 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use crate::{ApiError, AppState, authenticated_subject, database_error, invoices::strict_decimal};
+use crate::{
+    ApiError, AppState, authenticated_subject, database_error, invoices::strict_decimal,
+    uploads::multipart_error,
+};
 
 const MAX_SALES_LINES: usize = 200;
+const MAX_CSV_BYTES: usize = 1024 * 1024;
+const MAX_CSV_ROWS: usize = 2_000;
+const MAX_CSV_ERRORS: usize = 25;
 
 #[derive(sqlx::FromRow)]
 struct Membership {
@@ -89,6 +96,64 @@ struct MenuRecord {
     active: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SalesImportPreview {
+    original_filename: String,
+    business_date: NaiveDate,
+    rows: Vec<SalesImportRow>,
+    existing_day: Option<SalesDay>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SalesImportRow {
+    row_number: u64,
+    raw_item_label: String,
+    item_code: Option<String>,
+    quantity: String,
+    reported_net_sales: Option<String>,
+    currency: Option<String>,
+    match_status: &'static str,
+    matched_menu_item_id: Option<Uuid>,
+    matched_menu_item_name: Option<String>,
+    matched_menu_item_currency: Option<String>,
+    validation_errors: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ParsedCsv {
+    business_date: NaiveDate,
+    rows: Vec<ParsedCsvRow>,
+}
+
+#[derive(Debug)]
+struct ParsedCsvRow {
+    row_number: u64,
+    raw_item_label: String,
+    item_code: Option<String>,
+    quantity: String,
+    reported_net_sales: Option<String>,
+    currency: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+struct CsvIssue {
+    row_number: Option<u64>,
+    message: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct SalesImportError {
+    status: StatusCode,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct SalesImportErrorBody<'a> {
+    error: &'a str,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SaveSalesDay {
@@ -109,6 +174,8 @@ struct SaveLine {
     menu_item_id: Uuid,
     quantity: String,
     reported_net_sales: Option<String>,
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 #[derive(Debug)]
@@ -122,6 +189,7 @@ struct ValidatedLine {
     menu_item_id: Uuid,
     quantity: BigDecimal,
     reported_net_sales: Option<BigDecimal>,
+    reported_currency: Option<String>,
 }
 
 pub(crate) async fn list(
@@ -183,6 +251,107 @@ pub(crate) async fn menu_options(
     Ok(Json(options))
 }
 
+pub(crate) async fn preview_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<SalesImportPreview>, SalesImportError> {
+    let member = membership(&state, &headers).await?;
+    require_manager(&member.role)?;
+    let mut upload = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| SalesImportError::from(multipart_error(error)))?
+    {
+        if field.name() != Some("file") {
+            continue;
+        }
+        if upload.is_some() {
+            return Err(SalesImportError::unprocessable(
+                "Upload one CSV file at a time.".into(),
+            ));
+        }
+        let filename = field.file_name().unwrap_or("").to_owned();
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|error| SalesImportError::from(multipart_error(error)))?;
+        upload = Some((filename, bytes));
+    }
+    let (original_filename, bytes) = upload.ok_or_else(|| {
+        SalesImportError::unprocessable("Choose a Parline CSV file to preview.".into())
+    })?;
+    validate_csv_upload(&original_filename, &bytes)?;
+    let parsed = parse_sales_csv(&bytes).map_err(SalesImportError::csv_validation)?;
+
+    let mut tx = state.pool.begin().await.map_err(database_error)?;
+    let menu = sqlx::query_as::<_, MenuRecord>(
+        "SELECT id,name,currency,active FROM menu_items
+         WHERE restaurant_id=$1 AND active
+         ORDER BY LOWER(name),id",
+    )
+    .bind(member.restaurant_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    let menu_by_name = menu_name_index(menu);
+    let rows = parsed
+        .rows
+        .into_iter()
+        .map(|row| {
+            let matched = menu_by_name.get(&normalized_menu_name(&row.raw_item_label));
+            let mut validation_errors = Vec::new();
+            if let (Some(currency), Some(item)) = (&row.currency, matched)
+                && currency != &item.currency
+            {
+                validation_errors.push(format!(
+                    "Reported net sales use {currency}, but {} uses {}.",
+                    item.name, item.currency
+                ));
+            }
+            SalesImportRow {
+                row_number: row.row_number,
+                raw_item_label: row.raw_item_label,
+                item_code: row.item_code,
+                quantity: row.quantity,
+                reported_net_sales: row.reported_net_sales,
+                currency: row.currency,
+                match_status: if matched.is_some() {
+                    "matched"
+                } else {
+                    "unmatched"
+                },
+                matched_menu_item_id: matched.map(|item| item.id),
+                matched_menu_item_name: matched.map(|item| item.name.clone()),
+                matched_menu_item_currency: matched.map(|item| item.currency.clone()),
+                validation_errors,
+            }
+        })
+        .collect();
+    let existing_day = match load_header(
+        &mut tx,
+        member.restaurant_id,
+        parsed.business_date,
+        "FOR SHARE",
+    )
+    .await?
+    {
+        Some(header) => {
+            let lines = load_lines(&mut tx, header.id, member.restaurant_id).await?;
+            Some(day_response(header, lines))
+        }
+        None => None,
+    };
+    tx.commit().await.map_err(database_error)?;
+    Ok(Json(SalesImportPreview {
+        original_filename,
+        business_date: parsed.business_date,
+        rows,
+        existing_day,
+    }))
+}
+
 pub(crate) async fn put(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -190,7 +359,6 @@ pub(crate) async fn put(
     Json(input): Json<SaveSalesDay>,
 ) -> Result<Json<SalesDay>, ApiError> {
     let member = membership(&state, &headers).await?;
-    require_manager(&member.role)?;
     let business_date = parse_business_date(&business_date)?;
     let input = input.validated()?;
     let mut tx = state.pool.begin().await.map_err(database_error)?;
@@ -290,7 +458,7 @@ fn require_manager(role: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError(
             StatusCode::FORBIDDEN,
-            "Owner or manager access is required to save sales.",
+            "Owner or manager access is required to import sales.",
         ))
     }
 }
@@ -368,10 +536,28 @@ impl SaveSalesDay {
                         "Reported net sales must be a nonnegative plain decimal with at most 4 decimal places.",
                     )
                 })?;
+            let reported_currency = line
+                .currency
+                .map(|currency| currency.trim().to_ascii_uppercase());
+            if reported_currency.as_ref().is_some_and(|currency| {
+                currency.len() != 3 || !currency.bytes().all(|byte| byte.is_ascii_uppercase())
+            }) {
+                return Err(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Currency must be a three-letter code such as USD.",
+                ));
+            }
+            if reported_currency.is_some() && reported_net_sales.is_none() {
+                return Err(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Currency may only be provided with reported net sales.",
+                ));
+            }
             lines.push(ValidatedLine {
                 menu_item_id: line.menu_item_id,
                 quantity,
                 reported_net_sales,
+                reported_currency,
             });
         }
         lines.sort_by_key(|line| line.menu_item_id);
@@ -404,6 +590,10 @@ fn replay_matches(input: &[ValidatedLine], stored: &[StoredLine]) -> bool {
             input.menu_item_id == stored.menu_item_id
                 && input.quantity == stored.quantity
                 && input.reported_net_sales == stored.reported_net_sales
+                && input
+                    .reported_currency
+                    .as_ref()
+                    .is_none_or(|currency| stored.currency.as_ref() == Some(currency))
         })
 }
 
@@ -487,6 +677,11 @@ async fn hydrate_lines(
                     "New sales lines must use active menu items.",
                 ));
             }
+            validate_reported_currency(
+                line.reported_currency.as_deref(),
+                line.reported_net_sales.is_some(),
+                &item.currency,
+            )?;
             Ok(StoredLine {
                 menu_item_id: line.menu_item_id,
                 menu_item_name: item.name.clone(),
@@ -545,6 +740,320 @@ fn day_response(header: DayHeader, lines: Vec<StoredLine>) -> SalesDay {
                 currency: line.currency,
             })
             .collect(),
+    }
+}
+
+fn validate_reported_currency(
+    requested: Option<&str>,
+    has_reported_sales: bool,
+    menu_currency: &str,
+) -> Result<(), ApiError> {
+    if has_reported_sales && requested.is_some_and(|currency| currency != menu_currency) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Reported net sales currency must match the selected menu item.",
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_menu_name(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+fn menu_name_index(menu: Vec<MenuRecord>) -> HashMap<String, MenuRecord> {
+    let mut index = HashMap::with_capacity(menu.len());
+    let mut ambiguous = HashSet::new();
+    for item in menu {
+        let key = normalized_menu_name(&item.name);
+        if ambiguous.contains(&key) {
+            continue;
+        }
+        if index.insert(key.clone(), item).is_some() {
+            index.remove(&key);
+            ambiguous.insert(key);
+        }
+    }
+    index
+}
+
+fn validate_csv_upload(filename: &str, bytes: &[u8]) -> Result<(), SalesImportError> {
+    if filename.trim().is_empty()
+        || filename.chars().count() > 255
+        || filename.chars().any(char::is_control)
+    {
+        return Err(SalesImportError::unprocessable(
+            "The CSV filename is missing or too long.".into(),
+        ));
+    }
+    if bytes.is_empty() || bytes.len() > MAX_CSV_BYTES {
+        return Err(SalesImportError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "CSV files must be between 1 byte and 1 MiB.".into(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_sales_csv(bytes: &[u8]) -> Result<ParsedCsv, Vec<CsvIssue>> {
+    const REQUIRED_HEADERS: [&str; 3] = ["business_date", "item_name", "quantity"];
+    const ALLOWED_HEADERS: [&str; 6] = [
+        "business_date",
+        "item_name",
+        "quantity",
+        "item_code",
+        "net_sales",
+        "currency",
+    ];
+
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(false)
+        .from_reader(bytes);
+    let headers = match reader.headers() {
+        Ok(headers) => headers.clone(),
+        Err(error) => {
+            return Err(vec![CsvIssue {
+                row_number: error.position().map(|position| position.line()),
+                message: format!("The CSV header could not be read: {error}."),
+            }]);
+        }
+    };
+    let mut issues = Vec::new();
+    let mut indexes = HashMap::new();
+    for (index, header) in headers.iter().enumerate() {
+        if !ALLOWED_HEADERS.contains(&header) {
+            push_csv_issue(
+                &mut issues,
+                None,
+                format!("Unknown header '{header}'. Use the Parline CSV template headers."),
+            );
+        } else if indexes.insert(header, index).is_some() {
+            push_csv_issue(
+                &mut issues,
+                None,
+                format!("Header '{header}' appears more than once."),
+            );
+        }
+    }
+    for required in REQUIRED_HEADERS {
+        if !indexes.contains_key(required) {
+            push_csv_issue(
+                &mut issues,
+                None,
+                format!("Required header '{required}' is missing."),
+            );
+        }
+    }
+    if !issues.is_empty() {
+        return Err(issues);
+    }
+
+    let mut business_date = None;
+    let mut rows = Vec::new();
+    for result in reader.records() {
+        let record = match result {
+            Ok(record) => record,
+            Err(error) => {
+                push_csv_issue(
+                    &mut issues,
+                    error.position().map(|position| position.line()),
+                    format!("This row is not valid comma-delimited CSV: {error}."),
+                );
+                continue;
+            }
+        };
+        let row_number = record
+            .position()
+            .map(|position| position.line())
+            .unwrap_or((rows.len() + 2) as u64);
+        if rows.len() >= MAX_CSV_ROWS {
+            push_csv_issue(
+                &mut issues,
+                Some(row_number),
+                format!("A CSV may contain no more than {MAX_CSV_ROWS} data rows."),
+            );
+            break;
+        }
+        let date_value = csv_value(&record, &indexes, "business_date").trim();
+        let row_date = NaiveDate::parse_from_str(date_value, "%Y-%m-%d")
+            .ok()
+            .filter(|date| date.format("%Y-%m-%d").to_string() == date_value);
+        match row_date {
+            None => push_csv_issue(
+                &mut issues,
+                Some(row_number),
+                "Business date must use YYYY-MM-DD.".into(),
+            ),
+            Some(date) if business_date.is_some_and(|current| current != date) => push_csv_issue(
+                &mut issues,
+                Some(row_number),
+                "Every row must use the same business date.".into(),
+            ),
+            Some(date) => business_date = Some(date),
+        }
+
+        let raw_item_label = csv_value(&record, &indexes, "item_name").to_owned();
+        let item_name = raw_item_label.trim();
+        if item_name.is_empty() || item_name.chars().count() > 50 {
+            push_csv_issue(
+                &mut issues,
+                Some(row_number),
+                "Item name must be between 1 and 50 characters.".into(),
+            );
+        }
+        let item_code = indexes.get("item_code").and_then(|index| {
+            let item_code = record.get(*index).unwrap_or("").trim();
+            (!item_code.is_empty()).then(|| item_code.to_owned())
+        });
+        if item_code
+            .as_ref()
+            .is_some_and(|item_code| item_code.chars().count() > 120)
+        {
+            push_csv_issue(
+                &mut issues,
+                Some(row_number),
+                "Item code must be no more than 120 characters.".into(),
+            );
+        }
+
+        let quantity = csv_value(&record, &indexes, "quantity").trim().to_owned();
+        let parsed_quantity = sales_decimal(&quantity, 6);
+        if parsed_quantity.is_err()
+            || parsed_quantity
+                .as_ref()
+                .is_ok_and(|quantity| quantity <= &BigDecimal::from(0))
+        {
+            push_csv_issue(
+                &mut issues,
+                Some(row_number),
+                "Quantity must be a positive plain decimal with at most 6 decimal places.".into(),
+            );
+        }
+        let reported_net_sales = indexes.get("net_sales").and_then(|index| {
+            let net_sales = record.get(*index).unwrap_or("").trim();
+            (!net_sales.is_empty()).then(|| net_sales.to_owned())
+        });
+        if reported_net_sales.as_ref().is_some_and(|net_sales| {
+            sales_decimal(net_sales, 4)
+                .map(|net_sales| net_sales < 0)
+                .unwrap_or(true)
+        }) {
+            push_csv_issue(
+                &mut issues,
+                Some(row_number),
+                "Net sales must be a nonnegative plain decimal with at most 4 decimal places."
+                    .into(),
+            );
+        }
+        let currency = indexes.get("currency").and_then(|index| {
+            let currency = record.get(*index).unwrap_or("").trim();
+            (!currency.is_empty()).then(|| currency.to_ascii_uppercase())
+        });
+        if currency.as_ref().is_some_and(|currency| {
+            currency.len() != 3 || !currency.bytes().all(|byte| byte.is_ascii_uppercase())
+        }) {
+            push_csv_issue(
+                &mut issues,
+                Some(row_number),
+                "Currency must be a three-letter code such as USD.".into(),
+            );
+        }
+        if reported_net_sales.is_some() && currency.is_none() {
+            push_csv_issue(
+                &mut issues,
+                Some(row_number),
+                "Currency is required when net sales are provided.".into(),
+            );
+        } else if reported_net_sales.is_none() && currency.is_some() {
+            push_csv_issue(
+                &mut issues,
+                Some(row_number),
+                "Leave currency blank when net sales are blank.".into(),
+            );
+        }
+        rows.push(ParsedCsvRow {
+            row_number,
+            raw_item_label,
+            item_code,
+            quantity,
+            reported_net_sales,
+            currency,
+        });
+    }
+    if rows.is_empty() {
+        push_csv_issue(
+            &mut issues,
+            None,
+            "The CSV must contain at least one data row.".into(),
+        );
+    }
+    if !issues.is_empty() {
+        return Err(issues);
+    }
+    Ok(ParsedCsv {
+        business_date: business_date.expect("a valid nonempty CSV has a business date"),
+        rows,
+    })
+}
+
+fn push_csv_issue(issues: &mut Vec<CsvIssue>, row_number: Option<u64>, message: String) {
+    if issues.len() < MAX_CSV_ERRORS {
+        issues.push(CsvIssue {
+            row_number,
+            message,
+        });
+    }
+}
+
+fn csv_value<'a>(
+    record: &'a csv::StringRecord,
+    indexes: &HashMap<&str, usize>,
+    name: &str,
+) -> &'a str {
+    record.get(indexes[name]).unwrap_or("")
+}
+
+impl SalesImportError {
+    fn unprocessable(message: String) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message,
+        }
+    }
+
+    fn csv_validation(issues: Vec<CsvIssue>) -> Self {
+        let details = issues
+            .into_iter()
+            .map(|issue| match issue.row_number {
+                Some(row) => format!("Row {row}: {}", issue.message),
+                None => issue.message,
+            })
+            .collect::<Vec<_>>()
+            .join(" • ");
+        Self::unprocessable(format!("The CSV needs correction. {details}"))
+    }
+}
+
+impl From<ApiError> for SalesImportError {
+    fn from(error: ApiError) -> Self {
+        Self {
+            status: error.0,
+            message: error.1.into(),
+        }
+    }
+}
+
+impl IntoResponse for SalesImportError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(SalesImportErrorBody {
+                error: &self.message,
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -662,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn only_owner_and_manager_can_write() {
+    fn only_owner_and_manager_can_import() {
         assert!(require_manager("owner").is_ok());
         assert!(require_manager("manager").is_ok());
         assert!(require_manager("staff").is_err());
@@ -673,5 +1182,183 @@ mod tests {
         assert!(parse_business_date("2026-07-22").is_ok());
         assert!(parse_business_date("2026-7-22").is_err());
         assert!(parse_business_date("not-a-date").is_err());
+    }
+
+    #[test]
+    fn parses_bom_quoted_csv_without_losing_exact_decimal_text() {
+        let parsed = parse_sales_csv(
+            b"\xef\xbb\xbfbusiness_date,item_name,quantity,item_code,net_sales,currency\n\
+              2026-07-21,\"Burger, large\",2.500000,BURGER-L,25.0000,usd\n\
+              2026-07-21,Fries,3,,,\n",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.business_date.to_string(), "2026-07-21");
+        assert_eq!(parsed.rows.len(), 2);
+        assert_eq!(parsed.rows[0].row_number, 2);
+        assert_eq!(parsed.rows[0].raw_item_label, "Burger, large");
+        assert_eq!(parsed.rows[0].quantity, "2.500000");
+        assert_eq!(
+            parsed.rows[0].reported_net_sales.as_deref(),
+            Some("25.0000")
+        );
+        assert_eq!(parsed.rows[0].currency.as_deref(), Some("USD"));
+        assert_eq!(parsed.rows[1].reported_net_sales, None);
+    }
+
+    #[test]
+    fn csv_rejects_unknown_duplicate_and_missing_headers() {
+        let unknown =
+            parse_sales_csv(b"business_date,item_name,quantity,total\n2026-07-21,Taco,1,2\n")
+                .unwrap_err();
+        assert!(
+            unknown
+                .iter()
+                .any(|issue| issue.message.contains("Unknown header 'total'"))
+        );
+
+        let duplicate =
+            parse_sales_csv(b"business_date,item_name,quantity,quantity\n2026-07-21,Taco,1,1\n")
+                .unwrap_err();
+        assert!(
+            duplicate
+                .iter()
+                .any(|issue| issue.message.contains("appears more than once"))
+        );
+
+        let missing = parse_sales_csv(b"business_date,item_name\n2026-07-21,Taco\n").unwrap_err();
+        assert!(missing.iter().any(|issue| {
+            issue
+                .message
+                .contains("Required header 'quantity' is missing")
+        }));
+    }
+
+    #[test]
+    fn csv_reports_row_numbered_date_decimal_and_currency_errors() {
+        let issues = parse_sales_csv(
+            b"business_date,item_name,quantity,net_sales,currency\n\
+              2026-07-21,Taco,1,12.00,\n\
+              2026-07-22,Fries,1.0000001,-1,USD\n",
+        )
+        .unwrap_err();
+
+        assert!(issues.iter().any(|issue| {
+            issue.row_number == Some(2) && issue.message.contains("Currency is required")
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.row_number == Some(3) && issue.message.contains("same business date")
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.row_number == Some(3) && issue.message.contains("Quantity must be")
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.row_number == Some(3) && issue.message.contains("Net sales must be")
+        }));
+    }
+
+    #[test]
+    fn csv_enforces_the_data_row_limit() {
+        let mut csv = String::from("business_date,item_name,quantity\n");
+        for _ in 0..=MAX_CSV_ROWS {
+            csv.push_str("2026-07-21,Taco,1\n");
+        }
+        let issues = parse_sales_csv(csv.as_bytes()).unwrap_err();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.message.contains("no more than 2000"))
+        );
+    }
+
+    #[test]
+    fn csv_rejects_malformed_rows_and_uploads_over_one_mibibyte() {
+        let issues =
+            parse_sales_csv(b"business_date,item_name,quantity\n2026-07-21,Taco,1,unexpected\n")
+                .unwrap_err();
+        assert!(issues.iter().any(|issue| {
+            issue.row_number == Some(2) && issue.message.contains("not valid comma-delimited CSV")
+        }));
+
+        assert!(validate_csv_upload("sales.csv", b"business_date").is_ok());
+        let oversized = vec![b'x'; MAX_CSV_BYTES + 1];
+        let error = validate_csv_upload("sales.csv", &oversized).unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn exact_matching_only_trims_and_folds_case() {
+        assert_eq!(normalized_menu_name("  Chicken Taco "), "chicken taco");
+        assert_eq!(
+            normalized_menu_name("Chicken  Taco"),
+            "chicken  taco",
+            "internal whitespace must not be fuzzily normalized"
+        );
+        assert_ne!(
+            normalized_menu_name("Chicken-Taco"),
+            normalized_menu_name("Chicken Taco")
+        );
+    }
+
+    #[test]
+    fn lowercasing_collision_is_left_unmatched_instead_of_chosen_arbitrarily() {
+        let item = |id, name: &str| MenuRecord {
+            id: Uuid::from_u128(id),
+            name: name.into(),
+            currency: "USD".into(),
+            active: true,
+        };
+        let index = menu_name_index(vec![
+            item(1, "İ"),
+            item(2, "i\u{307}"),
+            item(3, "Chicken Taco"),
+        ]);
+
+        assert!(!index.contains_key(&normalized_menu_name("İ")));
+        assert_eq!(
+            index[&normalized_menu_name("chicken taco")].id,
+            Uuid::from_u128(3)
+        );
+    }
+
+    #[test]
+    fn imported_currency_is_checked_for_apply_and_replay() {
+        let id = Uuid::from_u128(1);
+        assert!(validate_reported_currency(Some("USD"), true, "USD").is_ok());
+        assert!(validate_reported_currency(Some("EUR"), true, "USD").is_err());
+        assert!(validate_reported_currency(None, true, "USD").is_ok());
+
+        let stored = vec![StoredLine {
+            menu_item_id: id,
+            menu_item_name: "Burger".into(),
+            quantity: "1".parse().unwrap(),
+            reported_net_sales: Some("12.50".parse().unwrap()),
+            currency: Some("USD".into()),
+        }];
+        let same = input(
+            serde_json::json!(1),
+            serde_json::json!([{
+                "menuItemId": id,
+                "quantity": "1",
+                "reportedNetSales": "12.5000",
+                "currency": "usd"
+            }]),
+        )
+        .validated()
+        .unwrap();
+        assert!(replay_matches(&same.lines, &stored));
+
+        let different_currency = input(
+            serde_json::json!(1),
+            serde_json::json!([{
+                "menuItemId": id,
+                "quantity": "1",
+                "reportedNetSales": "12.50",
+                "currency": "EUR"
+            }]),
+        )
+        .validated()
+        .unwrap();
+        assert!(!replay_matches(&different_currency.lines, &stored));
     }
 }

@@ -70,6 +70,19 @@ impl JwtVerifier {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_key(issuer: &str, kid: &str, key: DecodingKey) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                issuer: issuer.to_owned(),
+                jwks_url: reqwest::Url::parse("https://test.invalid/jwks").unwrap(),
+                client: reqwest::Client::builder().https_only(true).build().unwrap(),
+                keys: RwLock::new(HashMap::from([(kid.to_owned(), key)])),
+                refresh: Mutex::new(None),
+            }),
+        }
+    }
+
     pub async fn subject(&self, headers: &HeaderMap) -> Result<String, ()> {
         let token = bearer_token(headers).ok_or(())?;
         let header = decode_header(token).map_err(|_| ())?;

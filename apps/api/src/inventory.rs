@@ -433,7 +433,7 @@ pub(crate) fn item_write_error(e: sqlx::Error) -> ApiError {
     if unique(&e) {
         ApiError(
             StatusCode::CONFLICT,
-            "That inventory item is already in your Daybook.",
+            "That inventory item is already in Parline.",
         )
     } else {
         database_error(e)

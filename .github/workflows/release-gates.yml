@@ -1,0 +1,42 @@
+name: Release gates
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  release-gates:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: restaurant
+          POSTGRES_USER: restaurant
+          POSTGRES_PASSWORD: restaurant
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U restaurant -d restaurant"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      CI: true
+      RELEASE_GATE_EXTERNAL_POSTGRES: 1
+      TEST_DATABASE_URL: postgres://restaurant:restaurant@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Run release gates
+        run: ./scripts/release-gate.sh

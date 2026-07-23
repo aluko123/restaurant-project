@@ -35,6 +35,27 @@ impl ObjectStorage {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn inert_for_tests() -> Self {
+        let config = Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("auto"))
+            .credentials_provider(Credentials::new(
+                uuid::Uuid::now_v7().to_string(),
+                uuid::Uuid::now_v7().to_string(),
+                None,
+                None,
+                "release-tests",
+            ))
+            .endpoint_url("http://127.0.0.1:9")
+            .force_path_style(true)
+            .build();
+        Self {
+            client: Client::from_conf(config),
+            bucket: "release-tests".into(),
+        }
+    }
+
     pub(crate) async fn put(&self, key: &str, content_type: &str, body: Bytes) -> Result<()> {
         self.client
             .put_object()

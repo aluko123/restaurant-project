@@ -8,3 +8,6 @@ target/
 .DS_Store
 *.log
 sample-invoices/
+apps/web/playwright-report/
+apps/web/test-results/
+apps/web/.auth/

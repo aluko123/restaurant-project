@@ -199,7 +199,7 @@ impl GeminiClient {
             .header("X-Goog-Upload-Command", "start")
             .header("X-Goog-Upload-Header-Content-Length", bytes.len())
             .header("X-Goog-Upload-Header-Content-Type", content_type)
-            .json(&json!({"file":{"display_name":"Daybook extraction input"}}))
+            .json(&json!({"file":{"display_name":"Parline extraction input"}}))
             .send()
             .await
             .map_err(|error| retryable_transport(error, "file upload start"))?;

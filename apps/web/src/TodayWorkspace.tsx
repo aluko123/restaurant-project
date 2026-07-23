@@ -63,7 +63,6 @@ export function TodayWorkspace({
   return (
     <section className="today-workspace" aria-labelledby="today-heading">
       <header className="today-heading">
-        <p className="section-code">DB—TODAY</p>
         <h1 id="today-heading">Today</h1>
         {state.status === "ready" ? (
           <p>
