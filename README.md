@@ -251,3 +251,32 @@ npm run test:e2e:authenticated --prefix apps/web
 - Extraction and menu-import workers run **inside** the API process. Keep **`min_machines_running = 1`** so jobs are not delayed until the next HTTP request.
 - First Docker build on Fly is slow (Rust release compile); later deploys are faster with cache.
 - Invoice “today” is the restaurant’s IANA timezone (Settings), not UTC.
+- Prefer the stable Pages host `https://parline.pages.dev` for WorkOS and `WEB_ORIGIN` (not a per-deploy `*.parline.pages.dev` preview URL).
+
+## CI/CD (GitHub Actions)
+
+| Workflow | When | What |
+|----------|------|------|
+| [Release gates](.github/workflows/release-gates.yml) | PR + push to `main` | fmt, clippy, tests, web build, credential-free e2e |
+| [Deploy staging](.github/workflows/deploy.yml) | After gates succeed on `main`, or manual **Run workflow** | API → Fly.io (`parline-api`), web → Cloudflare Pages (`parline`) |
+
+Deploy does **not** set Fly secrets (DB, WorkOS, R2, Gemini). Those stay in `fly secrets`. The web build bakes `VITE_API_URL=https://parline-api.fly.dev` and `VITE_WORKOS_CLIENT_ID` from GitHub.
+
+### One-time GitHub secrets
+
+In the repo: **Settings → Secrets and variables → Actions**.
+
+| Secret | How to create |
+|--------|----------------|
+| `FLY_API_TOKEN` | `fly tokens create deploy -a parline-api -x 999999h` (or an org deploy token) |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare → My Profile → API Tokens → create token with **Account → Cloudflare Pages → Edit** (and Account read) |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare dashboard sidebar → Account ID |
+| `VITE_WORKOS_CLIENT_ID` | Same WorkOS client ID as local `apps/web/.env` |
+
+### Flow
+
+1. Open a PR → Release gates must pass.  
+2. Merge to `main` → Release gates run again → on success, Deploy staging runs.  
+3. Check the Actions tab; then smoke `https://parline-api.fly.dev/health/ready` and `https://parline.pages.dev`.  
+
+Manual deploy without a new commit: Actions → **Deploy staging** → **Run workflow**.
