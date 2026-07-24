@@ -255,16 +255,18 @@ npm run test:e2e:authenticated --prefix apps/web
 
 ## CI/CD (GitHub Actions)
 
+`main` is protected: **no direct pushes**. Work on a branch, open a PR, merge when gates are green. Merge to `main` is what deploys staging (one environment — no separate prod env yet).
+
 | Workflow | When | What |
 |----------|------|------|
-| [Release gates](.github/workflows/release-gates.yml) | PR + push to `main` | fmt, clippy, tests, web build, credential-free e2e |
+| [Release gates](.github/workflows/release-gates.yml) | Every PR + every update to `main` | fmt, clippy, tests, web build, credential-free e2e |
 | [Deploy staging](.github/workflows/deploy.yml) | After gates succeed on `main`, or manual **Run workflow** | API → Fly.io (`parline-api`), web → Cloudflare Pages (`parline`) |
 
 Deploy does **not** set Fly secrets (DB, WorkOS, R2, Gemini). Those stay in `fly secrets`. The web build bakes `VITE_API_URL=https://parline-api.fly.dev` and `VITE_WORKOS_CLIENT_ID` from GitHub.
 
 ### One-time GitHub secrets
 
-In the repo: **Settings → Secrets and variables → Actions**.
+In the repo: **Settings → Secrets and variables → Actions** → **Repository secrets**.
 
 | Secret | How to create |
 |--------|----------------|
@@ -275,8 +277,25 @@ In the repo: **Settings → Secrets and variables → Actions**.
 
 ### Flow
 
-1. Open a PR → Release gates must pass.  
-2. Merge to `main` → Release gates run again → on success, Deploy staging runs.  
-3. Check the Actions tab; then smoke `https://parline-api.fly.dev/health/ready` and `https://parline.pages.dev`.  
+```text
+feature branch  →  PR  →  Release gates (required)
+                              ↓ merge
+                           main updated
+                              ↓
+                    Release gates on main
+                              ↓ success
+                    Deploy staging (Fly + Pages)
+```
+
+```sh
+git switch -c my-change
+# …commit…
+git push -u origin HEAD
+gh pr create --fill
+# wait for Release gates ✓, then:
+gh pr merge --squash
+```
+
+After merge, check Actions → **Deploy staging**, then smoke `https://parline-api.fly.dev/health/ready` and `https://parline.pages.dev`.
 
 Manual deploy without a new commit: Actions → **Deploy staging** → **Run workflow**.
