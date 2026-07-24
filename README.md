@@ -153,8 +153,20 @@ Target stack: **API on Fly.io**, **Postgres on PlanetScale**, **web on Cloudflar
 ### 1. PlanetScale
 
 1. Create a Postgres database (prefer a region near Fly, e.g. US East for `iad`).
-2. Copy the **direct** connection string on port **`5432`** with TLS (`sslmode=require` or PlanetScale's equivalent).
+2. Copy the **direct** connection string on port **`5432`** with TLS.
 3. Do **not** use the PgBouncer `:6432` URL for this MVP while migrations run on API boot.
+
+**SQLx / Rust note:** PlanetScale's default string often includes `sslrootcert=system`. That is a libpq shortcut; SQLx treats it as a **file path** and the API fails with `No such file or directory (os error 2)`. For this app use one of:
+
+```text
+# simplest (works with sqlx + rustls webpki roots)
+postgres://USER:PASS@HOST:5432/DB?sslmode=require
+
+# or verify against the container CA bundle (Dockerfile installs ca-certificates)
+postgres://USER:PASS@HOST:5432/DB?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt
+```
+
+Drop `sslrootcert=system`. If the password has special characters, URL-encode them.
 
 ### 2. Fly API
 
