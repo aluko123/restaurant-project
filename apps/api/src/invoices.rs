@@ -5,7 +5,8 @@ use axum::{
 };
 use bigdecimal::BigDecimal;
 use bytes::Bytes;
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
@@ -21,6 +22,7 @@ const MAX_SUPPLIER_CHARS: usize = 120;
 pub(crate) struct Membership {
     pub(crate) restaurant_id: Uuid,
     pub(crate) user_id: Uuid,
+    pub(crate) timezone: String,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -74,7 +76,8 @@ pub(crate) async fn create(
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<Invoice>), ApiError> {
     let membership = membership(&state, &headers).await?;
-    let upload = parse_upload(multipart).await?;
+    let today = restaurant_local_today(&membership.timezone, Utc::now());
+    let upload = parse_upload(multipart, today).await?;
     let id = Uuid::now_v7();
     let key = object_key(membership.restaurant_id, id, upload.extension);
     let size_bytes = upload.bytes.len() as i64;
@@ -234,8 +237,10 @@ pub(crate) async fn membership(
 ) -> Result<Membership, ApiError> {
     let subject = authenticated_subject(state, headers).await?;
     sqlx::query_as::<_, Membership>(
-        "SELECT m.restaurant_id, u.id AS user_id FROM users u
+        "SELECT m.restaurant_id, u.id AS user_id, r.timezone
+         FROM users u
          JOIN restaurant_memberships m ON m.user_id = u.id
+         JOIN restaurants r ON r.id = m.restaurant_id
          WHERE u.auth_subject = $1 AND m.role IN ('owner','manager')",
     )
     .bind(subject)
@@ -457,11 +462,12 @@ pub(crate) async fn put_review(
     Json(input): Json<ReviewInput>,
 ) -> Result<Json<Approval>, ApiError> {
     let member = membership(&state, &headers).await?;
-    let input = validate_review(input)?;
+    let today = restaurant_local_today(&member.timezone, Utc::now());
+    let input = validate_review(input, today)?;
     let invoice_date = input
         .invoice_date
         .as_deref()
-        .map(parse_review_date)
+        .map(|value| validate_date(value, today))
         .transpose()?;
     let subtotal = parse_decimal(&input.subtotal, 4)?;
     let tax = parse_decimal(&input.tax, 4)?;
@@ -616,7 +622,7 @@ pub(crate) async fn retry(
     Ok(StatusCode::ACCEPTED)
 }
 
-fn validate_review(mut i: ReviewInput) -> Result<ReviewInput, ApiError> {
+fn validate_review(mut i: ReviewInput, today: NaiveDate) -> Result<ReviewInput, ApiError> {
     i.supplier_name = i.supplier_name.trim().to_owned();
     i.currency = i.currency.trim().to_ascii_uppercase();
     if i.supplier_name.is_empty()
@@ -668,17 +674,9 @@ fn validate_review(mut i: ReviewInput) -> Result<ReviewInput, ApiError> {
         parse_decimal(value, 4)?;
     }
     if let Some(date) = &i.invoice_date {
-        parse_review_date(date)?;
+        validate_date(date, today)?;
     }
     Ok(i)
-}
-fn parse_review_date(v: &str) -> Result<NaiveDate, ApiError> {
-    NaiveDate::parse_from_str(v, "%Y-%m-%d").map_err(|_| {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Use a valid invoice date.",
-        )
-    })
 }
 fn parse_decimal(v: &Option<String>, scale: i64) -> Result<Option<BigDecimal>, ApiError> {
     let Some(v) = v.as_deref() else {
@@ -772,7 +770,7 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     })
 }
 
-async fn parse_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
+async fn parse_upload(mut multipart: Multipart, today: NaiveDate) -> Result<Upload, ApiError> {
     let mut supplier = None;
     let mut date = None;
     let mut file = None;
@@ -789,7 +787,7 @@ async fn parse_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
         }
     }
     let supplier_name = validate_supplier(supplier.as_deref().unwrap_or(""))?;
-    let invoice_date = validate_date(date.as_deref().unwrap_or(""))?;
+    let invoice_date = validate_date(date.as_deref().unwrap_or(""), today)?;
     let (original_filename, bytes) = file.ok_or(ApiError(
         StatusCode::UNPROCESSABLE_ENTITY,
         "Choose an invoice file.",
@@ -816,7 +814,18 @@ fn validate_supplier(value: &str) -> Result<String, ApiError> {
     Ok(value.to_owned())
 }
 
-fn validate_date(value: &str) -> Result<NaiveDate, ApiError> {
+fn restaurant_local_today(timezone: &str, now: DateTime<Utc>) -> NaiveDate {
+    let tz = timezone.parse::<Tz>().unwrap_or_else(|_| {
+        tracing::warn!(
+            timezone,
+            "invalid restaurant timezone; invoice date validation falling back to UTC"
+        );
+        chrono_tz::UTC
+    });
+    now.with_timezone(&tz).date_naive()
+}
+
+fn validate_date(value: &str, today: NaiveDate) -> Result<NaiveDate, ApiError> {
     let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
         ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -824,7 +833,7 @@ fn validate_date(value: &str) -> Result<NaiveDate, ApiError> {
         )
     })?;
     let earliest = NaiveDate::from_ymd_opt(2000, 1, 1).expect("valid fixed date");
-    if date < earliest || date > Utc::now().date_naive() {
+    if date < earliest || date > today {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Invoice date must be between 2000-01-01 and today.",
@@ -843,12 +852,36 @@ mod tests {
 
     #[test]
     fn validates_supplier_and_date() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
         assert_eq!(validate_supplier("  Acme Foods ").unwrap(), "Acme Foods");
         assert!(validate_supplier(" ").is_err());
         assert!(validate_supplier(&"x".repeat(121)).is_err());
-        assert!(validate_date("not-a-date").is_err());
-        assert!(validate_date("1999-12-31").is_err());
-        assert!(validate_date("2999-01-01").is_err());
+        assert!(validate_date("not-a-date", today).is_err());
+        assert!(validate_date("1999-12-31", today).is_err());
+        assert!(validate_date("2999-01-01", today).is_err());
+        assert_eq!(
+            validate_date("2026-07-24", today).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 24).unwrap()
+        );
+    }
+
+    #[test]
+    fn invoice_today_uses_restaurant_timezone() {
+        // 2026-07-25 01:30 UTC is still 2026-07-24 evening in America/Chicago.
+        let now = DateTime::parse_from_rfc3339("2026-07-25T01:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let chicago_today = restaurant_local_today("America/Chicago", now);
+        assert_eq!(
+            chicago_today,
+            NaiveDate::from_ymd_opt(2026, 7, 24).unwrap()
+        );
+        assert!(validate_date("2026-07-24", chicago_today).is_ok());
+        assert!(validate_date("2026-07-25", chicago_today).is_err());
+
+        let utc_today = restaurant_local_today("UTC", now);
+        assert_eq!(utc_today, NaiveDate::from_ymd_opt(2026, 7, 25).unwrap());
+        assert!(validate_date("2026-07-25", utc_today).is_ok());
     }
 
     #[test]

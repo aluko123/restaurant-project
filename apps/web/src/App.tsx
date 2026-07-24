@@ -74,6 +74,10 @@ function AuthenticatedApp() {
   const [workspace, setWorkspace] = useState<Workspace>(workspaceForPath);
   const apiUrl = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
 
+  const handleSignOut = () => {
+    void signOut({ returnTo: `${window.location.origin}/` });
+  };
+
   useEffect(() => {
     if (!isLoading && !user && window.location.pathname === "/login") {
       const context = new URLSearchParams(window.location.search).get("context") ?? undefined;
@@ -147,16 +151,16 @@ function AuthenticatedApp() {
   }
 
   if (appState.status === "loading") return <StatusPage message="Opening Parline…" />;
-  if (appState.status === "error") return <ErrorPage message={appState.message} onRetry={loadApp} onSignOut={() => signOut()} />;
+  if (appState.status === "error") return <ErrorPage message={appState.message} onRetry={loadApp} onSignOut={handleSignOut} />;
   if (!appState.restaurant) {
-    return <Onboarding onSignOut={() => signOut()} onCreate={(input) => request<Restaurant>("/v1/restaurants", { method: "POST", body: JSON.stringify(input) }).then((restaurant) => setAppState({ status: "ready", restaurant }))} />;
+    return <Onboarding onSignOut={handleSignOut} onCreate={(input) => request<Restaurant>("/v1/restaurants", { method: "POST", body: JSON.stringify(input) }).then((restaurant) => setAppState({ status: "ready", restaurant }))} />;
   }
 
   const restaurant = appState.restaurant;
 
   return (
     <main className="app-shell">
-      <AppHeader restaurantName={restaurant.name} onSignOut={() => signOut()} />
+      <AppHeader restaurantName={restaurant.name} onSignOut={handleSignOut} />
       <nav className="workspace-nav" aria-label="Parline sections">
         <button type="button" aria-current={workspace === "today" ? "page" : undefined} onClick={() => openWorkspace("today")}>Today</button>
         {restaurant.role === "owner" && <button type="button" aria-current={workspace === "brief" ? "page" : undefined} onClick={() => openWorkspace("brief")}>Brief</button>}
