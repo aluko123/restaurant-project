@@ -114,24 +114,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
 .hero-copy { min-width: 0; }
 
-.hero-kicker {
-  margin: 0;
-  display: grid;
-  grid-template-columns: auto auto;
-  justify-content: start;
-  gap: 24px;
-  font-family: var(--mono);
-  font-size: 0.64rem;
-  font-weight: 700;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-}
-
-.hero-kicker span:last-child { color: #e8a53a; }
-
 .hero-copy h1 {
   max-width: 820px;
-  margin: clamp(28px, 5vw, 58px) 0 0;
+  margin: 0;
   font-size: clamp(3.7rem, 9.4vw, 8.8rem);
   font-weight: 950;
   line-height: 0.86;
@@ -217,6 +202,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .service-brief {
   position: relative;
   width: min(100%, 540px);
+  min-width: 0;
   justify-self: center;
   padding: clamp(26px, 4vw, 44px);
   color: var(--ink);
@@ -226,6 +212,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   background-size: 100% 4px;
   box-shadow: 12px 14px 0 var(--tomato), 0 26px 70px rgba(0, 0, 0, 0.28);
   transform: rotate(0.8deg);
+  container-type: inline-size;
 }
 
 .brief-pin {
@@ -242,7 +229,17 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 20px;
+  gap: 12px;
+  min-width: 0;
+}
+
+.service-brief-header {
+  overflow: hidden;
+}
+
+.service-brief-header > div:first-child {
+  min-width: 0;
+  flex: 1;
 }
 
 .service-brief-header p, .section-code, .task-overline {
@@ -256,7 +253,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
 .service-brief-header h2 {
   margin: 10px 0 0;
-  font-size: clamp(2.6rem, 6vw, 4.2rem);
+  font-size: clamp(2.1rem, 4.2vw, 3.6rem);
   font-weight: 950;
   line-height: 0.9;
   letter-spacing: 0;
@@ -268,12 +265,19 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   grid-template-columns: auto auto;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
   color: var(--tomato);
 }
 
-.date-block strong { font-size: 3rem; line-height: 0.8; letter-spacing: -0.08em; }
+.date-block strong { font-size: clamp(2.2rem, 3.5vw, 3rem); line-height: 0.8; letter-spacing: -0.08em; }
 .date-block span { font-family: var(--mono); font-size: 0.59rem; font-weight: 800; line-height: 1.2; }
 .date-block-dark { color: var(--ink); }
+
+@container (max-width: 400px) {
+  .service-brief-header h2 { font-size: 2.1rem; }
+  .date-block strong { font-size: 2.1rem; }
+  .date-block { gap: 6px; }
+}
 
 .brief-summary {
   margin: 30px 0 12px;
@@ -340,6 +344,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   min-height: 72px;
   padding: 16px clamp(20px, 4vw, 64px);
   display: grid;
+  grid-template-columns: 1fr auto;
   gap: 12px;
   align-items: center;
   color: var(--ink);
@@ -349,7 +354,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
-.landing-footer strong { font-family: var(--serif); font-size: 0.9rem; font-style: italic; text-align: center; text-transform: none; }
 .landing-footer > span:last-child { text-align: right; }
 
 .app-shell {
@@ -936,7 +940,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .review-fields { grid-template-columns: repeat(2, 1fr); }
   .line-card { grid-template-columns: repeat(3, 1fr); }
   .line-card label:first-child { grid-column: 1 / -1; }
-  .landing-footer { grid-template-columns: 1fr 2fr 1fr; }
+  .landing-footer { grid-template-columns: 1fr auto; }
   .setup-action { grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; }
   .invoice-grid { grid-template-columns: minmax(300px, 0.75fr) minmax(360px, 1.25fr); }
   .menu-grid { grid-template-columns: minmax(300px, .8fr) minmax(360px, 1.2fr); }
@@ -957,6 +961,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
 @media (min-width: 960px) {
   .landing-hero { grid-template-columns: minmax(0, 1.25fr) minmax(390px, 0.75fr); }
+  .service-brief {
+    transform: none;
+    padding-right: clamp(36px, 4vw, 52px);
+  }
   .app-workspace { grid-template-columns: 112px 1fr; }
   .shift-rail {
     padding: 34px 0 28px;
@@ -980,9 +988,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .header-note { display: none; }
   .landing-header, .app-header { min-height: 74px; padding-block: 12px; }
   .header-actions { min-width: 0; }
-  .edition-label { font-size: 0.55rem; }
   .landing-hero { min-height: auto; padding-top: 48px; grid-template-columns: minmax(0, 1fr); }
-  .hero-kicker { grid-template-columns: 1fr; gap: 8px; }
   .hero-copy h1 { font-size: clamp(3.2rem, 17vw, 5.4rem); line-height: 0.82; }
   .hero-command > span { display: block; }
   .hero-copy h1 em { margin-top: 7px; font-size: 0.82em; line-height: 0.92; }

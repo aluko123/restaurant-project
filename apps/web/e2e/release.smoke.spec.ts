@@ -25,9 +25,9 @@ for (const route of releaseRoutes) {
 
     expect(response?.status()).toBe(200);
     await expect(page).toHaveTitle("Parline — Know what changed. Protect the next shift.");
-    await expect(page.getByRole("heading", { level: 1 })).toContainText("Know what changed.");
+    await expect(page.getByRole("heading", { level: 1 })).toContainText("Know what changed");
     await expect(page.getByRole("button", { name: /Start with Parline/i })).toBeDisabled();
-    await expect(page.getByText("Dallas pilot · 01").first()).toBeVisible();
+    await expect(page.getByText("© 2026 Parline").first()).toBeVisible();
     expect(apiRequests).toEqual([]);
     expect(pageErrors).toEqual([]);
   });
