@@ -872,10 +872,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let chicago_today = restaurant_local_today("America/Chicago", now);
-        assert_eq!(
-            chicago_today,
-            NaiveDate::from_ymd_opt(2026, 7, 24).unwrap()
-        );
+        assert_eq!(chicago_today, NaiveDate::from_ymd_opt(2026, 7, 24).unwrap());
         assert!(validate_date("2026-07-24", chicago_today).is_ok());
         assert!(validate_date("2026-07-25", chicago_today).is_err());
 
