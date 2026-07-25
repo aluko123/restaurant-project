@@ -935,27 +935,24 @@ function Welcome({ authConfigured, onSignIn, onSignUp }: WelcomeProps) {
     <main className="landing-shell">
       <header className="landing-header">
         <Wordmark />
-        <p className="header-note">The daily operating brief<br />for independent restaurants</p>
+        <p className="header-note">The daily operating brief for restaurants</p>
         <div className="header-actions">
           {authConfigured ? (
-            <button className="text-button" type="button" onClick={onSignIn}>Operator sign in</button>
-          ) : (
-            <span className="edition-label">Dallas pilot · 01</span>
-          )}
+            <button className="text-button" type="button" onClick={onSignIn}>Sign in</button>
+          ) : null}
         </div>
       </header>
 
       <section className="landing-hero" aria-labelledby="hero-heading">
         <div className="hero-copy">
-          <p className="hero-kicker"><span>Service intelligence</span><span>Not another dashboard</span></p>
-          <h1 id="hero-heading"><span className="hero-command">Know what <span>changed.</span></span><em>Protect the next shift.</em></h1>
+          <h1 id="hero-heading"><span className="hero-command">Know what <span>changed</span></span><em>Protect the next shift.</em></h1>
           <p className="hero-lede">Parline keeps invoice reviews, supplier price evidence, and inventory count follow-ups in one short list.</p>
 
           <div className="hero-actions">
             <button className="ledger-button ledger-button-light" type="button" onClick={onSignUp} disabled={!authConfigured}>
               Start with Parline <span aria-hidden="true">→</span>
             </button>
-            <span>Keep your POS.<br />Skip the spreadsheet.</span>
+            <span>See the whole business at a glance</span>
           </div>
 
           <div className="signal-chain" aria-label="How Parline works">
@@ -970,8 +967,7 @@ function Welcome({ authConfigured, onSignIn, onSignUp }: WelcomeProps) {
 
       <footer className="landing-footer">
         <span>Invoices → cost changes → action</span>
-        <strong>Built for the back office that is actually a corner of the kitchen.</strong>
-        <span>Dallas pilot · Edition 01</span>
+        <span>© 2026 Parline</span>
       </footer>
     </main>
   );
