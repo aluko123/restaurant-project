@@ -24,7 +24,7 @@ for (const route of releaseRoutes) {
     const response = await page.goto(route);
 
     expect(response?.status()).toBe(200);
-    await expect(page).toHaveTitle("Parline — Know what changed. Protect the next shift.");
+    await expect(page).toHaveTitle("parline:the best restaurant inventory management app");
     await expect(page.getByRole("heading", { level: 1 })).toContainText("Know what changed");
     await expect(page.getByRole("button", { name: /Start with Parline/i })).toBeDisabled();
     await expect(page.getByText("© 2026 Parline").first()).toBeVisible();
