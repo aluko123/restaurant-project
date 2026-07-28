@@ -4,6 +4,8 @@
 
 Parline is a mobile-first restaurant operations app that helps independent restaurants turn invoices, inventory counts, and waste logs into a short list of daily actions and provide insights into their operations.
 
+Product direction and phased roadmap: [docs/product-roadmap.md](docs/product-roadmap.md).
+
 ## Architecture
 
 - `apps/web`: TypeScript, Clouflare Pages

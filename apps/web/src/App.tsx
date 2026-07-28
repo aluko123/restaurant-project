@@ -41,6 +41,24 @@ type LossEventType = "waste" | "stockout";
 type LossEvent = { id: string; inventoryItemId: string; eventType: LossEventType; inventoryItemName: string; countUnit: string; quantity: string | null; severity: string | null; reason: string; note: string | null; createdAt: string };
 type ServiceStyle = "counter_service" | "full_service" | "fast_casual" | "cafe_bakery" | "bar";
 type AppState = { status: "loading" } | { status: "error"; message: string } | { status: "ready"; restaurant: Restaurant | null };
+type Workspace = "today" | "brief" | "invoices" | "sales" | "menu" | "inventory" | "losses" | "settings";
+
+const LANDING_TITLE = "parline:the best restaurant inventory management app";
+
+const workspaceTitles: Record<Workspace, string> = {
+  today: "Today",
+  brief: "Brief",
+  invoices: "Invoices",
+  sales: "Sales",
+  menu: "Menu",
+  inventory: "Inventory",
+  losses: "Losses",
+  settings: "Settings",
+};
+
+function pageTitle(section: string, restaurantName?: string) {
+  return restaurantName ? `${section} · ${restaurantName} · Parline` : `${section} · Parline`;
+}
 
 const serviceStyles: { value: ServiceStyle; label: string }[] = [
   { value: "counter_service", label: "Counter service" },
@@ -69,7 +87,6 @@ export function App({ authConfigured }: AppProps) {
 function AuthenticatedApp() {
   const { isLoading, user, signIn, signUp, signOut, getAccessToken } = useAuth();
   const [appState, setAppState] = useState<AppState>({ status: "loading" });
-  type Workspace = "today" | "brief" | "invoices" | "sales" | "menu" | "inventory" | "losses" | "settings";
   const workspaceForPath = (): Workspace => window.location.pathname === "/brief" ? "brief" : window.location.pathname === "/invoices" ? "invoices" : window.location.pathname === "/sales" ? "sales" : window.location.pathname === "/menu" ? "menu" : window.location.pathname === "/inventory" ? "inventory" : window.location.pathname === "/losses" ? "losses" : window.location.pathname === "/settings" ? "settings" : "today";
   const [workspace, setWorkspace] = useState<Workspace>(workspaceForPath);
   const apiUrl = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
@@ -77,6 +94,26 @@ function AuthenticatedApp() {
   const handleSignOut = () => {
     void signOut({ returnTo: `${window.location.origin}/` });
   };
+
+  useEffect(() => {
+    if (isLoading) {
+      document.title = "Parline";
+      return;
+    }
+    if (!user) {
+      document.title = LANDING_TITLE;
+      return;
+    }
+    if (appState.status === "loading" || appState.status === "error") {
+      document.title = "Parline";
+      return;
+    }
+    if (!appState.restaurant) {
+      document.title = pageTitle("Get started");
+      return;
+    }
+    document.title = pageTitle(workspaceTitles[workspace], appState.restaurant.name);
+  }, [appState, isLoading, user, workspace]);
 
   useEffect(() => {
     if (!isLoading && !user && window.location.pathname === "/login") {
@@ -931,6 +968,10 @@ type WelcomeProps = {
 };
 
 function Welcome({ authConfigured, onSignIn, onSignUp }: WelcomeProps) {
+  useEffect(() => {
+    document.title = LANDING_TITLE;
+  }, []);
+
   return (
     <main className="landing-shell">
       <header className="landing-header">
