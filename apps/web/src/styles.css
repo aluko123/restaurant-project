@@ -117,7 +117,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .hero-copy h1 {
   max-width: 820px;
   margin: 0;
-  font-size: clamp(3.7rem, 9.4vw, 8.8rem);
+  font-size: clamp(3.4rem, 7vw, 7.3rem);
   font-weight: 950;
   line-height: 0.86;
   letter-spacing: -0.018em;
@@ -135,6 +135,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 }
 
 .hero-command { display: block; }
+.hero-command > span { display: block; }
 
 .hero-lede {
   max-width: 610px;
@@ -340,6 +341,23 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   transform: rotate(7deg);
 }
 
+.landing-faq {
+  padding: clamp(42px, 6vw, 72px) clamp(20px, 5vw, 78px);
+  display: grid;
+  grid-template-columns: minmax(180px, 0.45fr) minmax(0, 1fr);
+  gap: clamp(32px, 7vw, 100px);
+  border-top: 1px solid rgba(247, 240, 226, 0.34);
+  background: rgba(18, 17, 14, 0.9);
+}
+.faq-heading h2 { margin: 10px 0 0; color: #e8a53a; font-family: var(--serif); font-size: clamp(2rem, 4vw, 3.5rem); font-weight: 400; line-height: 1; }
+.faq-list details { border-top: 1px solid rgba(247, 240, 226, 0.34); }
+.faq-list details:last-child { border-bottom: 1px solid rgba(247, 240, 226, 0.34); }
+.faq-list summary { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 20px; font-weight: 800; cursor: pointer; }
+.faq-list summary::-webkit-details-marker { display: none; }
+.faq-list summary::after { content: "+"; flex: 0 0 auto; color: #e8a53a; font-family: var(--mono); font-size: 1.2rem; }
+.faq-list details[open] summary::after { content: "−"; }
+.faq-list p { max-width: 680px; margin: 0; padding: 0 36px 20px 0; font-family: var(--serif); line-height: 1.55; }
+
 .landing-footer {
   min-height: 72px;
   padding: 16px clamp(20px, 4vw, 64px);
@@ -437,6 +455,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .today-empty { margin-top: 30px; padding: 24px; border: 1px dashed var(--ink); background: var(--paper-light); }
 .today-empty h2 { margin: 8px 0; font-size: clamp(1.55rem,7vw,2.5rem); line-height: 1; text-transform: uppercase; }
 .today-empty > p:not(.section-code) { max-width: 620px; font-family: var(--serif); line-height: 1.5; }
+.today-empty-actions { margin-top: 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 .today-actions { margin-top: 28px; display: grid; gap: 18px; }
 .today-action { padding: 20px; display: grid; gap: 18px; border: 1px solid var(--ink); background: rgba(247,240,226,.84); box-shadow: var(--panel-shadow); backdrop-filter: blur(8px); }
 .today-priority-urgent { border-left: 8px solid var(--tomato); }
@@ -989,13 +1008,14 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .landing-header, .app-header { min-height: 74px; padding-block: 12px; }
   .header-actions { min-width: 0; }
   .landing-hero { min-height: auto; padding-top: 48px; grid-template-columns: minmax(0, 1fr); }
-  .hero-copy h1 { font-size: clamp(3.2rem, 17vw, 5.4rem); line-height: 0.82; }
-  .hero-command > span { display: block; }
+  .hero-copy h1 { font-size: clamp(2.6rem, 12.5vw, 4.4rem); line-height: 0.82; }
   .hero-copy h1 em { margin-top: 7px; font-size: 0.82em; line-height: 0.92; }
   .hero-lede { max-width: 100%; }
+  .signal-chain { display: grid; gap: 12px; }
   .service-brief { width: 100%; min-width: 0; padding: 28px 20px; box-shadow: 9px 9px 0 var(--tomato); transform: none; }
   .brief-list li { grid-template-columns: 26px minmax(0, 1fr); }
   .task-mark { grid-column: 2; justify-self: start; }
+  .landing-faq { grid-template-columns: minmax(0, 1fr); }
   .landing-footer > *, .landing-footer > span:last-child { text-align: left; }
   .restaurant-label { display: none; }
   .today-brief { padding-top: 48px; }

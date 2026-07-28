@@ -208,7 +208,7 @@ function AuthenticatedApp() {
         <button type="button" aria-current={workspace === "losses" ? "page" : undefined} onClick={() => openWorkspace("losses")}>Losses</button>
         <button type="button" aria-current={workspace === "settings" ? "page" : undefined} onClick={() => openWorkspace("settings")}>Settings</button>
       </nav>
-      <div hidden={workspace !== "today"}><TodayWorkspace request={request} active={workspace === "today"} onNavigate={openTarget} /></div>
+      <div hidden={workspace !== "today"}><TodayWorkspace request={request} active={workspace === "today"} canManageInvoices={restaurant.role !== "staff"} onNavigate={openTarget} /></div>
       {restaurant.role === "owner" && <div hidden={workspace !== "brief"}><WeeklyBriefWorkspace request={request} active={workspace === "brief"} /></div>}
       {restaurant.role !== "staff" && <div hidden={workspace !== "invoices"}><InvoiceWorkspace restaurant={restaurant} request={request} active={workspace === "invoices"} /></div>}
       <div hidden={workspace !== "sales"}><SalesWorkspace restaurant={restaurant} request={request} active={workspace === "sales"} /></div>
@@ -560,7 +560,7 @@ function MenuWorkspace({ restaurant, request, active }: { restaurant: Restaurant
       <div className="menu-list">
         <div className="list-heading"><h2>Active menu items</h2><button className="text-button" type="button" onClick={loadMenu}>Refresh</button></div>
         {!loading&&items.length>0&&<div className="collection-toolbar" aria-label="Filter menu items"><label className="collection-search">Search all menu items<input type="search" placeholder="Menu item name" value={menuSearch} onChange={event=>{const value=event.target.value;if(!menuSearch.trim()&&value.trim())setMenuCategory("all");setMenuSearch(value)}}/></label><label>Category<select value={menuCategory} onChange={event=>setMenuCategory(event.target.value)}><option value="all">All categories ({items.length})</option>{menuCategories.map(option=><option key={option.name} value={option.name}>{option.name} ({option.count})</option>)}</select></label><div className="collection-toolbar-summary"><strong>{filteredMenuItems.length} {filteredMenuItems.length===1?"item":"items"}</strong>{menuFiltersActive&&<button className="text-button" type="button" onClick={()=>{setMenuSearch("");setMenuCategory("all")}}>Clear filters</button>}</div></div>}
-        {loading?<p role="status">Loading menu…</p>:items.length===0?<p className="empty-state">No menu items yet.</p>:filteredMenuItems.length===0?<div className="filtered-empty"><h3>No menu items match</h3><p>Try another name or category.</p><button className="file-button" type="button" onClick={()=>{setMenuSearch("");setMenuCategory("all")}}>Show all menu items</button></div>:<div className="menu-category-groups">{groupByCategory(filteredMenuItems).map(([groupCategory,group])=><section className="menu-category-group" key={groupCategory}><h3>{groupCategory}<span>{group.length}</span></h3><div className="menu-cards">{group.map(item=><article className="menu-card" key={item.id}><div className="menu-card-main"><div><p className="invoice-status">{item.ingredientCount>0?"Costing connected":"Costing not set up"}</p><h4>{item.name}</h4></div><strong>{formatMoney(item.sellingPrice,item.currency)}</strong></div>{canManageCosting&&<button className="file-button costing-card-action" type="button" onClick={()=>setCostingItem(item)}>{item.ingredientCount>0?"Review ingredient cost":"Set up ingredient cost"}</button>}</article>)}</div></section>)}</div>}
+        {loading?<p role="status">Loading menu…</p>:items.length===0?<p className="empty-state">No menu items yet. Add your first item to record daily sales and connect ingredient costs later.</p>:filteredMenuItems.length===0?<div className="filtered-empty"><h3>No menu items match</h3><p>Try another name or category.</p><button className="file-button" type="button" onClick={()=>{setMenuSearch("");setMenuCategory("all")}}>Show all menu items</button></div>:<div className="menu-category-groups">{groupByCategory(filteredMenuItems).map(([groupCategory,group])=><section className="menu-category-group" key={groupCategory}><h3>{groupCategory}<span>{group.length}</span></h3><div className="menu-cards">{group.map(item=><article className="menu-card" key={item.id}><div className="menu-card-main"><div><p className="invoice-status">{item.ingredientCount>0?"Costing connected":"Costing not set up"}</p><h4>{item.name}</h4></div><strong>{formatMoney(item.sellingPrice,item.currency)}</strong></div>{canManageCosting&&<button className="file-button costing-card-action" type="button" onClick={()=>setCostingItem(item)}>{item.ingredientCount>0?"Review ingredient cost":"Set up ingredient cost"}</button>}</article>)}</div></section>)}</div>}
         {canManageMenu&&<><div className="list-heading import-heading"><h2>Menu imports</h2></div>{imports.length===0?<p className="empty-state">No menu imports yet.</p>:<div className="menu-cards">{imports.map(value=><article className="menu-card" key={value.id}><div className="menu-card-copy"><p className="invoice-status">{importStatusLabel(value.status, value.delayed, "menu")}</p><h3>{value.originalFilename}</h3></div><div className="card-actions">{value.status==="needs_review"&&<button className="file-button" type="button" onClick={()=>void openReview(value.id)}>Review menu</button>}{value.status==="failed"&&<button className="file-button" type="button" disabled={retryingId===value.id} onClick={()=>void retryMenu(value)}>{retryingId===value.id?"Trying again…":"Retry"}</button>}<button className="text-button" type="button" disabled={openingId===value.id} onClick={()=>void openOriginal(value)}>{openingId===value.id?"Opening…":"Original"}</button></div></article>)}</div>}</>}
       </div>
     </div>
@@ -689,7 +689,7 @@ function MenuItemCosting({ item, request, onBack, onSaved }: { item: MenuItem; r
             <button className="text-button" type="button" disabled={saving} onClick={() => setDrafts(current => current.filter((_, draftIndex) => draftIndex !== index))}>Remove ingredient</button>
           </fieldset>;
         })}</div>}
-        {response.inventoryItems.length === 0 && <p className="empty-state">No active inventory items are available. Add or reactivate an item in Inventory first.</p>}
+        {response.inventoryItems.length === 0 && <p className="empty-state">No active inventory items are available. Open the Inventory tab to add or reactivate an item; linked purchases can then provide its cost.</p>}
         <button className="file-button add-ingredient-button" type="button" disabled={!canAdd || saving} onClick={addIngredient}>{drafts.length >= 30 ? "30 ingredient limit reached" : canAdd ? "Add ingredient" : "No more active items"}</button>
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="ingredient-save-actions"><p>Saving replaces this menu item's full current ingredient setup.</p><button className="ledger-button" type="submit" disabled={saving}>{saving ? "Saving…" : drafts.length ? "Save ingredient setup" : "Save empty setup"}</button></div>
@@ -856,7 +856,7 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
       <div className="invoice-list"><div className="list-heading"><h2>Recent invoices</h2>{!loading && <button className="text-button" type="button" onClick={loadInvoices}>Refresh</button>}</div>
         {listError && <p className="form-error" role="alert">{listError}</p>}
         {!loading&&invoices.length>0&&<div className="collection-toolbar invoice-toolbar" aria-label="Filter invoices"><label className="collection-search">Search all invoices<input type="search" placeholder="Supplier or filename" value={invoiceSearch} onChange={event=>{const value=event.target.value;if(!invoiceSearch.trim()&&value.trim()){setInvoiceStatus("all");setInvoicePeriod("all")}setInvoiceSearch(value)}}/></label><label>Status<select value={invoiceStatus} onChange={event=>setInvoiceStatus(event.target.value as typeof invoiceStatus)}><option value="action">Needs action</option><option value="processing">Processing</option><option value="approved">Approved</option><option value="all">All statuses</option></select></label><label>Period<select value={invoicePeriod} onChange={event=>setInvoicePeriod(event.target.value as typeof invoicePeriod)}><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="year">This year</option><option value="all">All history</option></select></label><div className="collection-toolbar-summary"><strong>{filteredInvoices.length} {filteredInvoices.length===1?"invoice":"invoices"}</strong>{invoiceFiltersActive&&<button className="text-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("action");setInvoicePeriod("90")}}>Clear filters</button>}</div></div>}
-        {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload your first supplier invoice.</p> : filteredInvoices.length===0 ? <div className="filtered-empty"><h3>{invoiceStatus === "action" && !invoiceSearch.trim() ? "No invoices need action" : "No invoices match"}</h3><p>{invoiceStatus === "action" && !invoiceSearch.trim() ? "You're caught up for this period. Approved invoices remain available in history." : "Try a different status, period, or search."}</p><button className="file-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("all");setInvoicePeriod("all")}}>Show all invoices</button></div> : <div className="invoice-results">
+        {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload one to capture its purchases, compare supplier prices, and create supported Today actions.</p> : filteredInvoices.length===0 ? <div className="filtered-empty"><h3>{invoiceStatus === "action" && !invoiceSearch.trim() ? "No invoices need action" : "No invoices match"}</h3><p>{invoiceStatus === "action" && !invoiceSearch.trim() ? "You're caught up for this period. Approved invoices remain available in history." : "Try a different status, period, or search."}</p><button className="file-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("all");setInvoicePeriod("all")}}>Show all invoices</button></div> : <div className="invoice-results">
           {operationalInvoices.length>0&&<section className="invoice-result-group"><h3>Current work<span>{operationalInvoices.length}</span></h3><div className="invoice-cards">{operationalInvoices.map(invoice=><InvoiceCard key={invoice.id} invoice={invoice} openingId={openingId} retryingId={retryingId} onReview={setReviewId} onRetry={retry} onPriceChanges={id=>{setApprovedPriceChanges(null);setPriceChangeId(id)}} onPurchases={setPurchaseId} onOriginal={openOriginal}/>)}</div></section>}
           {invoiceMonths.map(([month,monthInvoices],index)=><details className="invoice-month" key={month} open={index===0}><summary><span>{formatInvoiceMonth(month)}</span><strong>{monthInvoices.length}</strong></summary><div className="invoice-cards">{monthInvoices.map(invoice=><InvoiceCard key={invoice.id} invoice={invoice} openingId={openingId} retryingId={retryingId} onReview={setReviewId} onRetry={retry} onPriceChanges={id=>{setApprovedPriceChanges(null);setPriceChangeId(id)}} onPurchases={setPurchaseId} onOriginal={openOriginal}/>)}</div></details>)}
         </div>}
@@ -941,15 +941,15 @@ function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string;
   return <main className="app-shell">
     <AppHeader onSignOut={onSignOut} />
     <section className="onboarding-shell" aria-labelledby="onboarding-heading">
-      <p className="section-code">Setup</p>
-      <h1 id="onboarding-heading">Set up <em>your restaurant.</em></h1>
-      <p className="brief-intro">Three details now. Invoices, ingredients, and the rest can wait until your next shift.</p>
+      <p className="section-code">First step</p>
+      <h1 id="onboarding-heading">Tell us about <em>your restaurant.</em></h1>
+      <p className="brief-intro">Add three basic details now. Next, upload a supplier invoice or complete an inventory count to create your first Today actions.</p>
       <form className="onboarding-form" onSubmit={submit} noValidate>
         <div className="ledger-field"><label htmlFor="restaurant-name">Restaurant name</label><p id="name-help">Use the name your crew knows.</p><input id="restaurant-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={120} autoComplete="organization" aria-describedby="name-help form-error" required /></div>
         <div className="ledger-field"><label htmlFor="city">City</label><p id="city-help">The city for this first location.</p><input id="city" value={city} onChange={(event) => setCity(event.target.value)} maxLength={100} autoComplete="address-level2" aria-describedby="city-help form-error" required /></div>
         <div className="ledger-field"><label htmlFor="service-style">Service style</label><p id="style-help">Choose the closest fit. You can keep setup simple.</p><select id="service-style" value={serviceStyle} onChange={(event) => setServiceStyle(event.target.value as ServiceStyle)} aria-describedby="style-help form-error">{serviceStyles.map((style) => <option key={style.value} value={style.value}>{style.label}</option>)}</select></div>
         {error && <p className="form-error" id="form-error" role="alert">{error}</p>}
-        <button className="ledger-button" type="submit" disabled={submitting}>{submitting ? "Opening Parline…" : "Open Parline"}<span aria-hidden="true">→</span></button>
+        <button className="ledger-button" type="submit" disabled={submitting}>{submitting ? "Creating restaurant…" : "Create restaurant"}<span aria-hidden="true">→</span></button>
       </form>
     </section>
   </main>;
@@ -976,7 +976,7 @@ function Welcome({ authConfigured, onSignIn, onSignUp }: WelcomeProps) {
     <main className="landing-shell">
       <header className="landing-header">
         <Wordmark />
-        <p className="header-note">The daily operating brief for restaurants</p>
+        <p className="header-note">Daily inventory and purchasing actions for restaurants</p>
         <div className="header-actions">
           {authConfigured ? (
             <button className="text-button" type="button" onClick={onSignIn}>Sign in</button>
@@ -986,28 +986,49 @@ function Welcome({ authConfigured, onSignIn, onSignUp }: WelcomeProps) {
 
       <section className="landing-hero" aria-labelledby="hero-heading">
         <div className="hero-copy">
-          <h1 id="hero-heading"><span className="hero-command">Know what <span>changed</span></span><em>Protect the next shift.</em></h1>
-          <p className="hero-lede">Parline keeps invoice reviews, supplier price evidence, and inventory count follow-ups in one short list.</p>
+          <h1 id="hero-heading"><span className="hero-command">Count <span>accurately.</span></span><em>Purchase confidently.</em></h1>
+          <p className="hero-lede">Parline turns supplier invoices and inventory counts into a short daily list of what needs attention next—from supplier price changes to unfinished counts.</p>
 
           <div className="hero-actions">
             <button className="ledger-button ledger-button-light" type="button" onClick={onSignUp} disabled={!authConfigured}>
-              Start with Parline <span aria-hidden="true">→</span>
+              Set up your restaurant <span aria-hidden="true">→</span>
             </button>
-            <span>See the whole business at a glance</span>
+            <span>Built for independent restaurants</span>
           </div>
 
           <div className="signal-chain" aria-label="How Parline works">
-            <span>01 · Snap invoices</span>
-            <span>02 · Count what matters</span>
-            <span>03 · Work the brief</span>
+            <span>01 · Upload supplier invoices</span>
+            <span>02 · Count key inventory</span>
+            <span>03 · Get daily actions</span>
           </div>
         </div>
 
         <ServiceBrief />
       </section>
 
+      <section className="landing-faq" aria-labelledby="faq-heading">
+        <div className="faq-heading">
+          <p className="section-code">Quick answers</p>
+          <h2 id="faq-heading">Before you start</h2>
+        </div>
+        <div className="faq-list">
+          <details>
+            <summary>What does Parline do?</summary>
+            <p>Parline turns restaurant records into a short list of daily actions. It currently focuses on supplier invoices, inventory counts, price changes, and purchasing follow-ups.</p>
+          </details>
+          <details>
+            <summary>What do I need to get started?</summary>
+            <p>Start with a recent supplier invoice and the inventory items that matter most. You do not need to enter everything before Parline becomes useful.</p>
+          </details>
+          <details>
+            <summary>How does Parline fit with my current setup?</summary>
+            <p>Keep your POS for sales and your accounting workflow for the books. Parline gives the team one place to turn supplier invoices and inventory counts into day-to-day purchasing actions.</p>
+          </details>
+        </div>
+      </section>
+
       <footer className="landing-footer">
-        <span>Invoices → cost changes → action</span>
+        <span>Invoices + counts → daily actions</span>
         <span>© 2026 Parline</span>
       </footer>
     </main>
