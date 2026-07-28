@@ -24,9 +24,9 @@ for (const route of releaseRoutes) {
     const response = await page.goto(route);
 
     expect(response?.status()).toBe(200);
-    await expect(page).toHaveTitle("Parline — Know what changed. Protect the next shift.");
-    await expect(page.getByRole("heading", { level: 1 })).toContainText("Know what changed");
-    await expect(page.getByRole("button", { name: /Start with Parline/i })).toBeDisabled();
+    await expect(page).toHaveTitle("Parline — Daily restaurant inventory and purchasing actions");
+    await expect(page.getByRole("heading", { level: 1 })).toContainText("Count accurately");
+    await expect(page.getByRole("button", { name: /Set up your restaurant/i })).toBeDisabled();
     await expect(page.getByText("© 2026 Parline").first()).toBeVisible();
     expect(apiRequests).toEqual([]);
     expect(pageErrors).toEqual([]);
@@ -38,9 +38,11 @@ test("landing shell remains usable at a kitchen-phone viewport", async ({ page }
   await page.goto("/");
 
   await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
-  await expect(page.getByText("01 · Snap invoices")).toBeVisible();
-  await expect(page.getByText("02 · Count what matters")).toBeVisible();
-  await expect(page.getByText("03 · Work the brief")).toBeVisible();
+  await expect(page.getByText("01 · Upload supplier invoices")).toBeVisible();
+  await expect(page.getByText("02 · Count key inventory")).toBeVisible();
+  await expect(page.getByText("03 · Get daily actions")).toBeVisible();
+  await page.getByText("What does Parline do?").click();
+  await expect(page.getByText("Parline turns restaurant records into a short list of daily actions.")).toBeVisible();
   expect(
     await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
   ).toBe(true);

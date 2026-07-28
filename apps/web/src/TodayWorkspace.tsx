@@ -33,10 +33,12 @@ type TodayState =
 export function TodayWorkspace({
   request,
   active,
+  canManageInvoices,
   onNavigate,
 }: {
   request: ApiRequest;
   active: boolean;
+  canManageInvoices: boolean;
   onNavigate: (path: string) => void;
 }) {
   const [state, setState] = useState<TodayState>({ status: "loading" });
@@ -86,9 +88,12 @@ export function TodayWorkspace({
       ) : state.response.actions.length === 0 ? (
         <div className="today-empty">
           <p className="section-code">0 actions</p>
-          <h2>Nothing needs attention here right now.</h2>
-          <p>Today only shows actions supported by current reviews, invoice price evidence, and completed inventory counts.</p>
-          <button className="file-button" type="button" onClick={load}>Check again</button>
+          <h2>No actions yet.</h2>
+          <p>{canManageInvoices ? "Today builds this list from reviewed invoices and completed inventory counts. Add a current record to give Parline something to work with." : "Today builds this list from records prepared by your managers and from completed inventory counts. Open Inventory to see what is ready to count."}</p>
+          <div className="today-empty-actions">
+            {canManageInvoices && <button className="file-button" type="button" onClick={() => onNavigate("/invoices")}>Upload an invoice</button>}
+            <button className="file-button" type="button" onClick={() => onNavigate("/inventory")}>{canManageInvoices ? "Open inventory" : "Open inventory counts"}</button>
+          </div>
         </div>
       ) : (
         <div className="today-actions" aria-label={`${state.response.actions.length} actions`}>

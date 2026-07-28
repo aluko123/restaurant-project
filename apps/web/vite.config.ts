@@ -10,7 +10,7 @@ export default defineConfig({
       manifest: {
         name: "Parline — Restaurant Operations",
         short_name: "Parline",
-        description: "Know what changed and protect the next shift with source-backed restaurant operations insights.",
+        description: "Turn supplier invoices and inventory counts into clear daily actions for independent restaurant teams.",
         theme_color: "#173f35",
         background_color: "#f7f4ed",
         display: "standalone",

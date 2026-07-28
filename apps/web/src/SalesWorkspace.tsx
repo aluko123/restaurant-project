@@ -494,6 +494,7 @@ export function SalesWorkspace({
         <SalesEntry
           businessDate={loadedDate}
           day={day}
+          canManageMenu={restaurant.role !== "staff"}
           entries={entries}
           rows={rows}
           search={salesSearch}
@@ -812,6 +813,7 @@ function SalesImportSourceRow({
 function SalesEntry({
   businessDate,
   day,
+  canManageMenu,
   rows,
   entries,
   search,
@@ -827,6 +829,7 @@ function SalesEntry({
 }: {
   businessDate: string;
   day: SalesDay | null;
+  canManageMenu: boolean;
   rows: SalesRow[];
   entries: Record<string, Entry>;
   search: string;
@@ -863,8 +866,9 @@ function SalesEntry({
       </div>
       {rows.length === 0 ? (
         <p className="empty-state">
-          No active menu items are ready. Add the restaurant's first active item in Menu, then
-          return here.
+          {canManageMenu
+            ? "No active menu items are ready. Add the restaurant's first active item in Menu, then return here to record sales."
+            : "No active menu items are ready. Ask an owner or manager to add the restaurant's first item, then return here."}
         </p>
       ) : (
         <>
