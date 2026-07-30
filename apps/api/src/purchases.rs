@@ -339,6 +339,8 @@ pub(crate) async fn record(
                 category: category.clone(),
                 count_unit: count_unit.clone(),
                 par_level: None,
+                storage_area_id: None,
+                shelf_order: 0,
                 active: true,
             }
             .validated()?;

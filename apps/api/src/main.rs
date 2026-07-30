@@ -270,6 +270,18 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             axum::routing::put(inventory::update_item),
         )
         .route(
+            "/v1/storage-areas",
+            get(inventory::list_areas).post(inventory::create_area),
+        )
+        .route(
+            "/v1/storage-areas/reorder",
+            axum::routing::put(inventory::reorder_areas),
+        )
+        .route(
+            "/v1/storage-areas/{id}",
+            axum::routing::put(inventory::update_area),
+        )
+        .route(
             "/v1/inventory-imports",
             post(inventory_imports::create).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
         )
@@ -288,10 +300,13 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/v1/order-guides/{id}/cancel", post(order_guides::cancel))
         .route("/v1/loss-events", get(losses::list).post(losses::create))
         .route("/v1/inventory-counts/draft", get(inventory::draft))
-        .route("/v1/inventory-counts", post(inventory::start))
+        .route(
+            "/v1/inventory-counts",
+            get(inventory::list_counts).post(inventory::start),
+        )
         .route(
             "/v1/inventory-counts/{id}",
-            axum::routing::put(inventory::save),
+            get(inventory::get_count).put(inventory::save),
         )
         .route(
             "/v1/inventory-counts/{id}/complete",
