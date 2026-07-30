@@ -30,6 +30,16 @@ type TodayState =
   | { status: "error"; message: string }
   | { status: "ready"; response: TodayResponse };
 
+type MigrationSetup = {
+  posSystem: string | null;
+  accountingSystem: string | null;
+  completedAt: string | null;
+  inventoryItemCount: number;
+  menuItemCount: number;
+  invoiceCount: number;
+  salesDayCount: number;
+};
+
 export function TodayWorkspace({
   request,
   active,
@@ -42,6 +52,9 @@ export function TodayWorkspace({
   onNavigate: (path: string) => void;
 }) {
   const [state, setState] = useState<TodayState>({ status: "loading" });
+  const [setup, setSetup] = useState<MigrationSetup | null>(null);
+  const [finishingSetup, setFinishingSetup] = useState(false);
+  const [setupError, setSetupError] = useState("");
 
   const load = useCallback(() => {
     setState({ status: "loading" });
@@ -59,8 +72,18 @@ export function TodayWorkspace({
   }, [request]);
 
   useEffect(() => {
-    if (active) load();
-  }, [active, load]);
+    if (!active) return;
+    load();
+    if (canManageInvoices) void request<MigrationSetup>("/v1/migration-setup").then(setSetup).catch(()=>setSetup(null));
+  }, [active, canManageInvoices, load, request]);
+
+  async function finishSetup() {
+    if (!setup) return;
+    setFinishingSetup(true);setSetupError("");
+    try { setSetup(await request<MigrationSetup>("/v1/migration-setup",{method:"PUT",body:JSON.stringify({posSystem:setup.posSystem,accountingSystem:setup.accountingSystem,markComplete:true})})); }
+    catch (cause) { setSetupError(cause instanceof Error?cause.message:"Setup couldn't be finished. Try again."); }
+    finally { setFinishingSetup(false); }
+  }
 
   return (
     <section className="today-workspace" aria-labelledby="today-heading">
@@ -78,6 +101,10 @@ export function TodayWorkspace({
         )}
       </header>
 
+      {canManageInvoices&&setup&&!setup.completedAt&&(
+        <MigrationSetupGuide setup={setup} busy={finishingSetup} error={setupError} onNavigate={onNavigate} onFinish={()=>void finishSetup()}/>
+      )}
+
       {state.status === "loading" ? (
         <p className="today-status" role="status">Checking current records…</p>
       ) : state.status === "error" ? (
@@ -89,11 +116,8 @@ export function TodayWorkspace({
         <div className="today-empty">
           <p className="section-code">0 actions</p>
           <h2>No actions yet.</h2>
-          <p>{canManageInvoices ? "Today builds this list from reviewed invoices and completed inventory counts. Add a current record to give Parline something to work with." : "Today builds this list from records prepared by your managers and from completed inventory counts. Open Inventory to see what is ready to count."}</p>
-          <div className="today-empty-actions">
-            {canManageInvoices && <button className="file-button" type="button" onClick={() => onNavigate("/invoices")}>Upload an invoice</button>}
-            <button className="file-button" type="button" onClick={() => onNavigate("/inventory")}>{canManageInvoices ? "Open inventory" : "Open inventory counts"}</button>
-          </div>
+          <p>{canManageInvoices ? "Bring in one current record above, then Parline can begin turning it into work for the next shift." : "Today builds this list from records prepared by your managers and from completed inventory counts. Open Inventory to see what is ready to count."}</p>
+          {!canManageInvoices&&<div className="today-empty-actions"><button className="file-button" type="button" onClick={() => onNavigate("/inventory")}>Open inventory counts</button></div>}
         </div>
       ) : (
         <div className="today-actions" aria-label={`${state.response.actions.length} actions`}>
@@ -110,6 +134,15 @@ export function TodayWorkspace({
       )}
     </section>
   );
+}
+
+function MigrationSetupGuide({setup,busy,error,onNavigate,onFinish}:{setup:MigrationSetup;busy:boolean;error:string;onNavigate:(path:string)=>void;onFinish:()=>void}) {
+  const total=setup.inventoryItemCount+setup.menuItemCount+setup.invoiceCount+setup.salesDayCount;
+  return <section className="migration-setup" aria-labelledby="migration-setup-heading"><p className="section-code">Bring your records</p><h2 id="migration-setup-heading">Start with what you already have.</h2><p>Connect what you have and upload what you can. You do not need every source before Parline becomes useful.</p>{(setup.posSystem||setup.accountingSystem)&&<p className="setup-tools">Existing tools: {[setup.posSystem,setup.accountingSystem].filter(Boolean).join(" · ")}</p>}<div className="today-setup-list"><SetupAction number="01" title="Inventory spreadsheet" description="Import item names, count units, categories, and pars, then begin the first physical count." action={setup.inventoryItemCount?`${setup.inventoryItemCount} added`:"Import inventory"} complete={setup.inventoryItemCount>0} onClick={() => onNavigate("/inventory")}/><SetupAction number="02" title="Menu photo or PDF" description="Bring in the menu so sales can be matched to the items the restaurant actually sells." action={setup.menuItemCount?`${setup.menuItemCount} added`:"Import menu"} complete={setup.menuItemCount>0} onClick={() => onNavigate("/menu")}/><SetupAction number="03" title="Supplier invoices" description="Upload recent invoices to seed suppliers, purchase prices, and product mappings." action={setup.invoiceCount?`${setup.invoiceCount} uploaded`:"Upload invoices"} complete={setup.invoiceCount>0} onClick={() => onNavigate("/invoices")}/><SetupAction number="04" title="Recent sales" description="Import a complete POS sales day after menu items are available, or enter the day manually." action={setup.salesDayCount?`${setup.salesDayCount} days added`:"Import sales"} complete={setup.salesDayCount>0} onClick={() => onNavigate("/sales")}/></div>{error&&<p className="form-error" role="alert">{error}</p>}<div className="setup-finish"><p>{total?"You can finish setup now or add another source.":"Add at least one source before finishing setup."}</p><button className="ledger-button" type="button" disabled={busy||total===0} onClick={onFinish}>{busy?"Finishing…":"Finish setup for now"}</button></div></section>;
+}
+
+function SetupAction({number,title,description,action,complete,onClick}:{number:string;title:string;description:string;action:string;complete:boolean;onClick:()=>void}) {
+  return <article className={`setup-action${complete?" setup-action-complete":""}`}><span className="setup-action-number">{complete?"✓":number}</span><div className="setup-action-copy"><h3>{title}</h3><p>{description}</p></div><button className={complete?"text-button":"file-button"} type="button" onClick={onClick}>{action}</button></article>;
 }
 
 function TodayActionCard({

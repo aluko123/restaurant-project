@@ -341,6 +341,11 @@ pub(crate) async fn complete(
 ) -> Result<Json<Count>, ApiError> {
     let m = membership(&state, &headers).await?;
     let mut tx = state.pool.begin().await.map_err(database_error)?;
+    sqlx::query("SELECT id FROM restaurants WHERE id=$1 FOR UPDATE")
+        .bind(m.restaurant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
     let session = sqlx::query_as::<_, (String, i64)>(
         "SELECT status,revision FROM inventory_count_sessions WHERE id=$1 AND restaurant_id=$2 FOR UPDATE",
     )
