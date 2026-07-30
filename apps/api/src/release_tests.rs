@@ -997,17 +997,19 @@ async fn inventory_backend_import_and_order_guide_loop() {
         Some(&staff),
         Method::PUT,
         &count_uri,
-        Some(json!({"revision": 0, "entries": [{"id": entry_id, "quantity": "3.100000"}]})),
+        Some(json!({"revision": 0, "entries": [{"id": entry_id, "quantity": "3.100000", "skipped": false}]})),
     )
     .await;
     assert_eq!(saved.status, StatusCode::OK);
     assert_decimal_json(&saved.body["entries"][0]["quantity"], "3.1");
+    assert_eq!(saved.body["entries"][0]["skipped"], false);
+    assert_eq!(saved.body["scope"], "all");
     let completed = request(
         fixture.app.clone(),
         Some(&staff),
         Method::POST,
         &format!("{count_uri}/complete"),
-        Some(json!({"revision": 1, "confirmMissing": false})),
+        Some(json!({"revision": 1, "confirmSkipped": false})),
     )
     .await;
     assert_eq!(completed.status, StatusCode::OK);
@@ -1449,6 +1451,317 @@ async fn exact_decimals_and_concurrent_replays_remain_stable() {
     .await
     .unwrap();
     assert_eq!(drafts, 1);
+
+    fixture.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn inventory_walk_order_scope_skip_and_history() {
+    let fixture = ApiFixture::create("inventory_walk_count").await;
+    let owner = fixture.auth.token("owner-a");
+    let staff = fixture.auth.token("staff-a");
+
+    // Staff cannot manage storage areas.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::POST,
+            "/v1/storage-areas",
+            Some(json!({"name": "Walk-in", "active": true})),
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Create areas out of alphabetical walk order: Walk-in first, then Bar.
+    let walk_in = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/storage-areas",
+        Some(json!({"name": "Walk-in", "active": true})),
+    )
+    .await;
+    assert_eq!(walk_in.status, StatusCode::CREATED);
+    let walk_in_id = walk_in.body["id"].as_str().unwrap().to_owned();
+    let bar = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/storage-areas",
+        Some(json!({"name": "Bar", "active": true})),
+    )
+    .await;
+    assert_eq!(bar.status, StatusCode::CREATED);
+    let bar_id = bar.body["id"].as_str().unwrap().to_owned();
+
+    // Reorder so Walk-in stays first (sort 0), Bar second even though Bar < Walk-in alphabetically.
+    let reordered = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        "/v1/storage-areas/reorder",
+        Some(json!({"areaIds": [walk_in_id, bar_id]})),
+    )
+    .await;
+    assert_eq!(reordered.status, StatusCode::OK);
+    assert_eq!(reordered.body[0]["name"], "Walk-in");
+    assert_eq!(reordered.body[1]["name"], "Bar");
+
+    // Place seed item in Walk-in; add a Bar item that would sort first alphabetically by area name.
+    let tomatoes = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        &format!("/v1/inventory-items/{}", fixture.ids.inventory_a),
+        Some(json!({
+            "name": "Tenant A Tomatoes",
+            "category": null,
+            "countUnit": "lb",
+            "parLevel": "10",
+            "storageAreaId": walk_in_id,
+            "shelfOrder": 2,
+            "active": true
+        })),
+    )
+    .await;
+    assert_eq!(tomatoes.status, StatusCode::OK);
+    assert_eq!(tomatoes.body["storageAreaName"], "Walk-in");
+
+    let vodka = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-items",
+        Some(json!({
+            "name": "Bar Vodka",
+            "category": null,
+            "countUnit": "bottle",
+            "parLevel": null,
+            "storageAreaId": bar_id,
+            "shelfOrder": 0,
+            "active": true
+        })),
+    )
+    .await;
+    assert_eq!(vodka.status, StatusCode::CREATED);
+    let vodka_id = vodka.body["id"].as_str().unwrap().to_owned();
+
+    let chicken = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-items",
+        Some(json!({
+            "name": "Chicken",
+            "category": null,
+            "countUnit": "lb",
+            "parLevel": null,
+            "storageAreaId": walk_in_id,
+            "shelfOrder": 1,
+            "active": true
+        })),
+    )
+    .await;
+    assert_eq!(chicken.status, StatusCode::CREATED);
+
+    // Whole-house count walks Walk-in (shelf 1 chicken, shelf 2 tomatoes) then Bar (vodka).
+    let whole = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(whole.status, StatusCode::CREATED);
+    assert_eq!(whole.body["scope"], "all");
+    let whole_names: Vec<&str> = whole.body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        whole_names,
+        vec!["Chicken", "Tenant A Tomatoes", "Bar Vodka"]
+    );
+    assert_eq!(whole.body["entries"][0]["storageAreaName"], "Walk-in");
+    assert_eq!(whole.body["entries"][2]["storageAreaName"], "Bar");
+
+    // Discard draft via SQL so we can start a scoped count (API has no cancel-draft yet).
+    sqlx::query("DELETE FROM inventory_count_sessions WHERE restaurant_id=$1 AND status='draft'")
+        .bind(fixture.ids.restaurant_a)
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+
+    // Area-scoped count: Bar only.
+    let scoped = request(
+        fixture.app.clone(),
+        Some(&staff),
+        Method::POST,
+        "/v1/inventory-counts",
+        Some(json!({"storageAreaIds": [bar_id]})),
+    )
+    .await;
+    assert_eq!(scoped.status, StatusCode::CREATED);
+    assert_eq!(scoped.body["scope"], "areas");
+    assert_eq!(scoped.body["storageAreaIds"].as_array().unwrap().len(), 1);
+    assert_eq!(scoped.body["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(scoped.body["entries"][0]["name"], "Bar Vodka");
+    assert_eq!(
+        scoped.body["entries"][0]["inventoryItemId"]
+            .as_str()
+            .unwrap(),
+        vodka_id
+    );
+
+    let count_id = scoped.body["id"].as_str().unwrap().to_owned();
+    let entry_id = scoped.body["entries"][0]["id"].as_str().unwrap().to_owned();
+    let count_uri = format!("/v1/inventory-counts/{count_id}");
+
+    // Cannot complete while open (not counted, not skipped).
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::POST,
+            &format!("{count_uri}/complete"),
+            Some(json!({"revision": 0, "confirmSkipped": false})),
+        )
+        .await
+        .status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    // Skip requires confirmSkipped.
+    let skipped = request(
+        fixture.app.clone(),
+        Some(&staff),
+        Method::PUT,
+        &count_uri,
+        Some(json!({
+            "revision": 0,
+            "entries": [{"id": entry_id, "quantity": null, "skipped": true}]
+        })),
+    )
+    .await;
+    assert_eq!(skipped.status, StatusCode::OK);
+    assert_eq!(skipped.body["entries"][0]["skipped"], true);
+    assert!(skipped.body["entries"][0]["quantity"].is_null());
+
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::POST,
+            &format!("{count_uri}/complete"),
+            Some(json!({"revision": 1, "confirmSkipped": false})),
+        )
+        .await
+        .status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let completed = request(
+        fixture.app.clone(),
+        Some(&staff),
+        Method::POST,
+        &format!("{count_uri}/complete"),
+        Some(json!({"revision": 1, "confirmSkipped": true})),
+    )
+    .await;
+    assert_eq!(completed.status, StatusCode::OK);
+    assert_eq!(completed.body["status"], "completed");
+    assert_eq!(completed.body["entries"][0]["skipped"], true);
+
+    // History lists the completed session; detail matches.
+    let history = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/inventory-counts?limit=10",
+        None,
+    )
+    .await;
+    assert_eq!(history.status, StatusCode::OK);
+    let rows = history.body.as_array().unwrap();
+    assert!(!rows.is_empty());
+    assert_eq!(rows[0]["id"], count_id);
+    assert_eq!(rows[0]["scope"], "areas");
+    assert_eq!(rows[0]["skippedCount"], 1);
+    assert_eq!(rows[0]["countedCount"], 0);
+    assert!(rows[0]["areaNames"].as_str().unwrap().contains("Bar"));
+
+    let detail = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        &count_uri,
+        None,
+    )
+    .await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert_eq!(detail.body["status"], "completed");
+    assert_eq!(detail.body["entries"][0]["name"], "Bar Vodka");
+    assert_eq!(detail.body["entries"][0]["skipped"], true);
+
+    // Previous quantity snapshots on the next count for that item.
+    let next = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        Some(json!({"storageAreaIds": [bar_id]})),
+    )
+    .await;
+    // Skipped items do not create a previous quantity.
+    assert_eq!(next.status, StatusCode::CREATED);
+    assert!(next.body["entries"][0]["previousQuantity"].is_null());
+
+    // Count with a quantity, complete, then previous appears.
+    let next_id = next.body["id"].as_str().unwrap().to_owned();
+    let next_entry = next.body["entries"][0]["id"].as_str().unwrap().to_owned();
+    let next_uri = format!("/v1/inventory-counts/{next_id}");
+    let saved = request(
+        fixture.app.clone(),
+        Some(&staff),
+        Method::PUT,
+        &next_uri,
+        Some(json!({
+            "revision": 0,
+            "entries": [{"id": next_entry, "quantity": "6", "skipped": false}]
+        })),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK);
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::POST,
+            &format!("{next_uri}/complete"),
+            Some(json!({"revision": 1, "confirmSkipped": false})),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+
+    let third = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        Some(json!({"storageAreaIds": [bar_id]})),
+    )
+    .await;
+    assert_eq!(third.status, StatusCode::CREATED);
+    assert_decimal_json(&third.body["entries"][0]["previousQuantity"], "6");
 
     fixture.drop().await;
 }

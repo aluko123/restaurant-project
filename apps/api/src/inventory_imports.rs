@@ -210,6 +210,8 @@ pub(crate) async fn apply(
             category: r.category,
             count_unit: r.count_unit,
             par_level: r.par_level,
+            storage_area_id: None,
+            shelf_order: 0,
             active: true,
         };
         let v = input.validated()?;
@@ -282,6 +284,8 @@ fn parse(b: &[u8]) -> Result<Vec<(Row, Vec<String>)>, ApiError> {
             count_unit: count_unit.clone(),
             category: category.clone(),
             par_level: par_level.clone(),
+            storage_area_id: None,
+            shelf_order: 0,
             active: true,
         };
         let mut es = vec![];
