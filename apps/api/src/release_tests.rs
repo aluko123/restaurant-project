@@ -1614,7 +1614,9 @@ async fn inventory_walk_order_scope_skip_and_history() {
     assert_eq!(scoped.body["entries"].as_array().unwrap().len(), 1);
     assert_eq!(scoped.body["entries"][0]["name"], "Bar Vodka");
     assert_eq!(
-        scoped.body["entries"][0]["inventoryItemId"].as_str().unwrap(),
+        scoped.body["entries"][0]["inventoryItemId"]
+            .as_str()
+            .unwrap(),
         vodka_id
     );
 
@@ -1693,10 +1695,7 @@ async fn inventory_walk_order_scope_skip_and_history() {
     assert_eq!(rows[0]["scope"], "areas");
     assert_eq!(rows[0]["skippedCount"], 1);
     assert_eq!(rows[0]["countedCount"], 0);
-    assert!(rows[0]["areaNames"]
-        .as_str()
-        .unwrap()
-        .contains("Bar"));
+    assert!(rows[0]["areaNames"].as_str().unwrap().contains("Bar"));
 
     let detail = request(
         fixture.app.clone(),
