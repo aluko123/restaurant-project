@@ -2,10 +2,12 @@ mod auth;
 mod costing;
 mod extraction;
 mod inventory;
+mod inventory_imports;
 mod invoices;
 mod losses;
 mod menu;
 mod menu_imports;
+mod order_guides;
 mod purchases;
 mod sales;
 mod settings;
@@ -76,6 +78,28 @@ struct CreateRestaurant {
     name: String,
     city: String,
     service_style: String,
+    pos_system: Option<String>,
+    accounting_system: Option<String>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+struct MigrationSetup {
+    pos_system: Option<String>,
+    accounting_system: Option<String>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    inventory_item_count: i64,
+    menu_item_count: i64,
+    invoice_count: i64,
+    sales_day_count: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateMigrationSetup {
+    pos_system: Option<String>,
+    accounting_system: Option<String>,
+    mark_complete: bool,
 }
 
 #[derive(Serialize)]
@@ -178,6 +202,10 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/v1/today", get(today::get))
         .route("/v1/weekly-brief", get(weekly_brief::get))
         .route("/v1/restaurants", post(create_restaurant))
+        .route(
+            "/v1/migration-setup",
+            get(migration_setup).put(update_migration_setup),
+        )
         .route("/v1/settings", get(settings::get).put(settings::update))
         .route("/v1/settings/invitations", post(settings::invite))
         .route(
@@ -241,6 +269,23 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             "/v1/inventory-items/{id}",
             axum::routing::put(inventory::update_item),
         )
+        .route(
+            "/v1/inventory-imports",
+            post(inventory_imports::create).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/inventory-imports/{id}",
+            get(inventory_imports::get).put(inventory_imports::apply),
+        )
+        .route("/v1/order-guides", post(order_guides::create))
+        .route("/v1/order-guides/open", get(order_guides::open))
+        .route(
+            "/v1/order-guides/{id}",
+            get(order_guides::get).put(order_guides::update),
+        )
+        .route("/v1/order-guides/{id}/ordered", post(order_guides::ordered))
+        .route("/v1/order-guides/{id}/receive", post(order_guides::receive))
+        .route("/v1/order-guides/{id}/cancel", post(order_guides::cancel))
         .route("/v1/loss-events", get(losses::list).post(losses::create))
         .route("/v1/inventory-counts/draft", get(inventory::draft))
         .route("/v1/inventory-counts", post(inventory::start))
@@ -301,6 +346,86 @@ async fn me(
         .map_err(database_error)?;
     }
     Ok(Json(MeResponse { restaurant }))
+}
+
+async fn migration_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MigrationSetup>, ApiError> {
+    let restaurant_id = migration_setup_restaurant(&state, &headers).await?;
+    Ok(Json(load_migration_setup(&state, restaurant_id).await?))
+}
+
+async fn update_migration_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<UpdateMigrationSetup>,
+) -> Result<Json<MigrationSetup>, ApiError> {
+    let restaurant_id = migration_setup_restaurant(&state, &headers).await?;
+    let input = input.validated()?;
+    let current = load_migration_setup(&state, restaurant_id).await?;
+    if input.mark_complete
+        && current.inventory_item_count
+            + current.menu_item_count
+            + current.invoice_count
+            + current.sales_day_count
+            == 0
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Import or add at least one restaurant record before finishing setup.",
+        ));
+    }
+    sqlx::query(
+        "UPDATE restaurants SET pos_system=$1,accounting_system=$2,
+         migration_setup_completed_at=CASE WHEN $3 THEN COALESCE(migration_setup_completed_at,NOW()) ELSE migration_setup_completed_at END,
+         updated_at=NOW() WHERE id=$4",
+    )
+    .bind(input.pos_system)
+    .bind(input.accounting_system)
+    .bind(input.mark_complete)
+    .bind(restaurant_id)
+    .execute(&state.pool)
+    .await
+    .map_err(database_error)?;
+    Ok(Json(load_migration_setup(&state, restaurant_id).await?))
+}
+
+async fn migration_setup_restaurant(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<uuid::Uuid, ApiError> {
+    let subject = authenticated_subject(state, headers).await?;
+    sqlx::query_scalar(
+        "SELECT m.restaurant_id FROM users u JOIN restaurant_memberships m ON m.user_id=u.id
+         WHERE u.auth_subject=$1 AND m.role IN ('owner','manager')",
+    )
+    .bind(subject)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(database_error)?
+    .ok_or(ApiError(
+        StatusCode::FORBIDDEN,
+        "Owner or manager access is required.",
+    ))
+}
+
+async fn load_migration_setup(
+    state: &AppState,
+    restaurant_id: uuid::Uuid,
+) -> Result<MigrationSetup, ApiError> {
+    sqlx::query_as(
+        "SELECT r.pos_system,r.accounting_system,r.migration_setup_completed_at completed_at,
+         (SELECT COUNT(*) FROM inventory_items WHERE restaurant_id=r.id) inventory_item_count,
+         (SELECT COUNT(*) FROM menu_items WHERE restaurant_id=r.id) menu_item_count,
+         (SELECT COUNT(*) FROM invoices WHERE restaurant_id=r.id) invoice_count,
+         (SELECT COUNT(*) FROM sales_days WHERE restaurant_id=r.id) sales_day_count
+         FROM restaurants r WHERE r.id=$1",
+    )
+    .bind(restaurant_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(database_error)
 }
 
 #[derive(sqlx::FromRow)]
@@ -465,13 +590,15 @@ async fn create_restaurant(
     .map_err(database_error)?;
     let restaurant_id = uuid::Uuid::now_v7();
     let timezone = sqlx::query_scalar::<_, String>(
-        "INSERT INTO restaurants (id, name, city, service_style) VALUES ($1, $2, $3, $4)
+        "INSERT INTO restaurants (id, name, city, service_style, pos_system, accounting_system) VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING timezone",
     )
     .bind(restaurant_id)
     .bind(&input.name)
     .bind(&input.city)
     .bind(&input.service_style)
+    .bind(&input.pos_system)
+    .bind(&input.accounting_system)
     .fetch_one(&mut *tx)
     .await
     .map_err(database_error)?;
@@ -527,6 +654,8 @@ impl CreateRestaurant {
         self.name = self.name.trim().to_owned();
         self.city = self.city.trim().to_owned();
         self.service_style = self.service_style.trim().to_owned();
+        self.pos_system = optional_tool(self.pos_system)?;
+        self.accounting_system = optional_tool(self.accounting_system)?;
         if self.name.is_empty() || self.name.chars().count() > 50 {
             return Err(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -550,6 +679,31 @@ impl CreateRestaurant {
         }
         Ok(self)
     }
+}
+
+impl UpdateMigrationSetup {
+    fn validated(mut self) -> Result<Self, ApiError> {
+        self.pos_system = optional_tool(self.pos_system)?;
+        self.accounting_system = optional_tool(self.accounting_system)?;
+        Ok(self)
+    }
+}
+
+fn optional_tool(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let value = value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    });
+    if value
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 80)
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Tool names must be no more than 80 characters.",
+        ));
+    }
+    Ok(value)
 }
 
 async fn live() -> Json<HealthResponse> {
@@ -617,6 +771,8 @@ mod tests {
             name: name.into(),
             city: city.into(),
             service_style: style.into(),
+            pos_system: None,
+            accounting_system: None,
         }
     }
 
@@ -627,6 +783,17 @@ mod tests {
             .unwrap();
         assert_eq!(value.name, "Marigold");
         assert_eq!(value.city, "Dallas");
+    }
+
+    #[test]
+    fn trims_optional_restaurant_tools() {
+        let mut value = input("Marigold", "Dallas", "fast_casual");
+        value.pos_system = Some("  Toast  ".into());
+        value.accounting_system = Some("   ".into());
+        let value = value.validated().unwrap();
+        assert_eq!(value.pos_system.as_deref(), Some("Toast"));
+        assert_eq!(value.accounting_system, None);
+        assert!(optional_tool(Some("x".repeat(81))).is_err());
     }
 
     #[test]

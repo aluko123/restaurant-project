@@ -4,6 +4,8 @@ import { SalesWorkspace, type ApiRequest } from "./SalesWorkspace";
 import { SettingsWorkspace, type SettingsRestaurant } from "./SettingsWorkspace";
 import { TodayWorkspace } from "./TodayWorkspace";
 import { WeeklyBriefWorkspace } from "./WeeklyBriefWorkspace";
+import { InventoryImportPanel } from "./InventoryImportPanel";
+import { OrderGuidePanel, type OrderGuide } from "./OrderGuidePanel";
 
 type AppProps = {
   authConfigured: boolean;
@@ -175,7 +177,7 @@ function AuthenticatedApp() {
   }
 
   function openTarget(path: string) {
-    const target = path === "/invoices" ? "invoices" : path === "/menu" ? "menu" : path === "/inventory" ? "inventory" : "today";
+    const target = path === "/invoices" ? "invoices" : path === "/sales" ? "sales" : path === "/menu" ? "menu" : path === "/inventory" ? "inventory" : "today";
     openWorkspace(target);
   }
 
@@ -239,6 +241,7 @@ function InventoryWorkspace({ restaurant, request }: { restaurant: Restaurant; r
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventoryView, setInventoryView] = useState<"attention" | "active" | "all" | "archived">("attention");
   const [inventoryCategory, setInventoryCategory] = useState("all");
+  const [guide, setGuide] = useState<OrderGuide | null>(null);
 
   const adoptCount = (value: InventoryCount) => {
     setCount(value);
@@ -247,8 +250,9 @@ function InventoryWorkspace({ restaurant, request }: { restaurant: Restaurant; r
   const loadOverview = useCallback(async () => {
     setLoading(true); setError("");
     try {
-      const [nextItems, draft] = await Promise.all([request<InventoryItem[]>("/v1/inventory-items"), request<InventoryDraftResponse>("/v1/inventory-counts/draft")]);
+      const [nextItems, draft, openGuide] = await Promise.all([request<InventoryItem[]>("/v1/inventory-items"), request<InventoryDraftResponse>("/v1/inventory-counts/draft"), request<OrderGuide | null>("/v1/order-guides/open")]);
       setItems(nextItems); setCount(draft.count);
+      setGuide(openGuide);
       if (draft.count) setQuantities(Object.fromEntries(draft.count.entries.map(entry => [entry.id, entry.quantity ?? ""])));
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Inventory couldn't load. Try again."); }
     finally { setLoading(false); }
@@ -289,9 +293,24 @@ function InventoryWorkspace({ restaurant, request }: { restaurant: Restaurant; r
   }
   async function reviewCount() { const saved = await saveDraft(false); if (saved) { setNotice(""); setMode("review"); } }
   async function backToOverview() { const saved = await saveDraft(false); if (saved) { setMode("overview"); setNotice("Draft saved. Resume when you're ready."); } }
+  async function createOrderGuide(countId?: string) {
+    const next = await request<OrderGuide>("/v1/order-guides", { method:"POST", body:JSON.stringify(countId ? { countId } : {}) });
+    if (next.status === "draft" || next.status === "ordered") {
+      setGuide(next);
+      return "Your order guide is ready to review.";
+    }
+    setGuide(null);
+    return "That count already has a finished order guide. Complete another physical count to create a new one.";
+  }
+  async function createLatestOrderGuide() {
+    setBusy(true); setError(""); setNotice("");
+    try { setNotice(await createOrderGuide()); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "An order guide couldn't be created from the latest count."); }
+    finally { setBusy(false); }
+  }
   async function complete() {
     if (!count) return; const missing = count.entries.filter(entry => !quantities[entry.id]?.trim()); setBusy(true); setError("");
-    try { await request(`/v1/inventory-counts/${count.id}/complete`, { method:"POST", body:JSON.stringify({ confirmMissing:missing.length > 0, revision:count.revision }) }); setCount(null); setQuantities({}); setMode("overview"); setNotice("Inventory count completed."); await loadOverview(); setNotice("Inventory count completed."); }
+    try { const completed=await request<InventoryCount>(`/v1/inventory-counts/${count.id}/complete`, { method:"POST", body:JSON.stringify({ confirmMissing:missing.length > 0, revision:count.revision }) }); setCount(null); setQuantities({}); setMode("overview"); let message="Inventory count completed.";if(manager){try{message=`Inventory count completed. ${await createOrderGuide(completed.id)}`}catch(reason){message=`Inventory count completed. ${reason instanceof Error?reason.message:"No order guide was created from this count."}`}}await loadOverview();setNotice(message); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "The count couldn't be completed."); }
     finally { setBusy(false); }
   }
@@ -299,7 +318,7 @@ function InventoryWorkspace({ restaurant, request }: { restaurant: Restaurant; r
   if (mode !== "overview" && count) {
     const groups = groupByCategory(count.entries); const missing = count.entries.filter(entry => !quantities[entry.id]?.trim());
     if (mode === "review") return <section className="inventory-workspace count-workspace"><button className="text-button" type="button" onClick={() => setMode("count")}>← Back to count</button><header className="inventory-heading"><p className="section-code">Inventory review</p><h1>Review count</h1><p>{count.entries.length - missing.length} counted · {missing.length} missing</p></header>{missing.length > 0 && <div className="missing-list"><h2>Missing quantities</h2><p>These items will stay blank in this count.</p><ul>{missing.map(entry => <li key={entry.id}><strong>{entry.name}</strong> · {entry.countUnit}</li>)}</ul></div>}{error && <p className="form-error" role="alert">{error}</p>}<div className="count-actions"><button className="file-button" type="button" onClick={() => setMode("count")}>Back to count</button><button className="ledger-button" type="button" disabled={busy} onClick={() => void complete()}>{busy ? "Completing…" : missing.length ? "Complete with missing items" : "Complete count"}</button></div></section>;
-    return <section className="inventory-workspace count-workspace"><button className="text-button" type="button" disabled={busy} onClick={() => void backToOverview()}>← Save and return to overview</button><header className="inventory-heading"><p className="section-code">Inventory count</p><h1>Count what is on hand</h1><p>Your saved draft stays here when you return to the overview.</p></header>{groups.map(([category, entries]) => <section className="count-category" key={category}><h2>{category}</h2>{entries.map(entry => <label className="count-row" key={entry.id}><span><strong>{entry.name}</strong><small>Count in {entry.countUnit}</small></span><span className="quantity-field"><input aria-label={`${entry.name}, quantity in ${entry.countUnit}`} inputMode="decimal" value={quantities[entry.id] ?? ""} onChange={event => setQuantities(current => ({...current,[entry.id]:event.target.value}))}/><b>{entry.countUnit}</b></span></label>)}</section>)}{error && <p className="form-error" role="alert">{error}</p>}{notice && <p className="success-notice" role="status">{notice}</p>}<div className="count-actions"><button className="file-button" type="button" disabled={busy} onClick={() => void saveDraft()}>{busy ? "Saving…" : "Save draft"}</button><button className="ledger-button" type="button" disabled={busy} onClick={() => void reviewCount()}>Review count</button></div></section>;
+    return <section className="inventory-workspace count-workspace"><button className="text-button" type="button" disabled={busy} onClick={() => void backToOverview()}>← Save and return to overview</button><header className="inventory-heading"><p className="section-code">Inventory count</p><h1>Record a physical count</h1><p>Your saved draft stays here when you return to the overview.</p></header>{groups.map(([category, entries]) => <section className="count-category" key={category}><h2>{category}</h2>{entries.map(entry => <label className="count-row" key={entry.id}><span><strong>{entry.name}</strong><small>Count in {entry.countUnit}</small></span><span className="quantity-field"><input aria-label={`${entry.name}, quantity in ${entry.countUnit}`} inputMode="decimal" value={quantities[entry.id] ?? ""} onChange={event => setQuantities(current => ({...current,[entry.id]:event.target.value}))}/><b>{entry.countUnit}</b></span></label>)}</section>)}{error && <p className="form-error" role="alert">{error}</p>}{notice && <p className="success-notice" role="status">{notice}</p>}<div className="count-actions"><button className="file-button" type="button" disabled={busy} onClick={() => void saveDraft()}>{busy ? "Saving…" : "Save draft"}</button><button className="ledger-button" type="button" disabled={busy} onClick={() => void reviewCount()}>Review count</button></div></section>;
   }
 
   const active = items.filter(item => item.active);
@@ -315,9 +334,15 @@ function InventoryWorkspace({ restaurant, request }: { restaurant: Restaurant; r
     return matchesSearch && matchesCategory && matchesView;
   });
   const inventoryFiltersActive = inventorySearch.trim() !== "" || inventoryCategory !== "all" || inventoryView !== "attention";
-  return <section className="inventory-workspace"><header className="inventory-heading"><h1>Inventory</h1><p>See what is on hand and keep the next count moving.</p><button className="ledger-button" type="button" disabled={busy || (!count && active.length === 0)} onClick={() => void startOrResume()}>{busy ? "Opening…" : count ? "Resume count" : "Start count"}</button></header>
+  return <section className="inventory-workspace"><header className="inventory-heading"><h1>Inventory</h1><p>Review the last counted quantities and keep the next count moving.</p><button className="ledger-button" type="button" disabled={busy || (!count && active.length === 0)} onClick={() => void startOrResume()}>{busy ? "Opening…" : count ? "Resume count" : "Start count"}</button></header>
     {error && <p className="form-error inventory-message" role="alert">{error}</p>}{notice && <p className="success-notice inventory-message" role="status">{notice}</p>}
-    {manager && <form className="inventory-item-form" onSubmit={saveItem}><div className="list-heading"><h2>{editing ? "Edit item" : "Add an item"}</h2>{editing && <button className="text-button" type="button" onClick={() => {setEditing(null);setFields(blankItem)}}>Cancel</button>}</div><div className="inventory-form-fields"><label>Name<input required maxLength={50} value={fields.name} onChange={e=>setFields({...fields,name:e.target.value})}/></label><label>Category <span>Optional</span><input maxLength={20} value={fields.category} onChange={e=>setFields({...fields,category:e.target.value})}/></label><label>Count unit<select required value={fields.countUnit} onChange={e=>setFields({...fields,countUnit:e.target.value})}>{inventoryUnits.map(unit=><option key={unit} value={unit}>{unit}</option>)}</select></label><label>Par level <span>Optional</span><input inputMode="decimal" value={fields.parLevel} onChange={e=>setFields({...fields,parLevel:e.target.value})}/></label></div>{editing && <label className="active-toggle"><input type="checkbox" checked={fields.active} onChange={e=>setFields({...fields,active:e.target.checked})}/> Active item</label>}<button className="ledger-button" disabled={busy}>{busy ? "Saving…" : editing ? "Save item" : "Add item"}</button></form>}
+    {guide&&<OrderGuidePanel guide={guide} manager={manager} request={request} onChange={(next,message)=>{setGuide(next);if(message)setNotice(message)}}/>}
+    {manager&&!guide&&!count&&items.some(item=>item.lastCountedAt)&&<section className="order-guide-prompt"><div><p className="section-code">Purchasing</p><h2>Create an order guide</h2><p>Use the latest completed count and current par levels to see what may need ordering.</p></div><button className="file-button" type="button" disabled={busy} onClick={()=>void createLatestOrderGuide()}>{busy?"Checking…":"Use latest count"}</button></section>}
+    {manager&&<InventoryImportPanel
+      request={request}
+      onApplied={async()=>{if(count){await loadOverview();setNotice("Inventory items imported. They will enter the next count because a draft is already in progress.");return}try{const next=await request<InventoryCount>("/v1/inventory-counts",{method:"POST",body:"{}"});adoptCount(next);setNotice("Inventory items imported. Your first count is ready to record.");setMode("count")}catch(reason){setError(`Inventory items were imported, but the first count could not start. ${reason instanceof Error?reason.message:"Start it from Inventory when you're ready."}`)}}}
+    />}
+    {manager && <form className="inventory-item-form" onSubmit={saveItem}><div className="list-heading"><h2>{editing ? "Edit item" : "Add one item"}</h2>{editing && <button className="text-button" type="button" onClick={() => {setEditing(null);setFields(blankItem)}}>Cancel</button>}</div><div className="inventory-form-fields"><label>Name<input required maxLength={50} value={fields.name} onChange={e=>setFields({...fields,name:e.target.value})}/></label><label>Category <span>Optional</span><input maxLength={20} value={fields.category} onChange={e=>setFields({...fields,category:e.target.value})}/></label><label>Count unit<select required value={fields.countUnit} onChange={e=>setFields({...fields,countUnit:e.target.value})}>{inventoryUnits.map(unit=><option key={unit} value={unit}>{unit}</option>)}</select></label><label>Par level <span>Optional</span><input inputMode="decimal" value={fields.parLevel} onChange={e=>setFields({...fields,parLevel:e.target.value})}/></label></div>{editing && <label className="active-toggle"><input type="checkbox" checked={fields.active} onChange={e=>setFields({...fields,active:e.target.checked})}/> Active item</label>}<button className="ledger-button" disabled={busy}>{busy ? "Saving…" : editing ? "Save item" : "Add item"}</button></form>}
     <div className="inventory-list"><div className="list-heading"><h2>Inventory items</h2><button className="text-button" type="button" onClick={() => void loadOverview()}>Refresh</button></div>
       {!loading && items.length > 0 && <div className="collection-toolbar" aria-label="Filter inventory items">
         <label className="collection-search">Search all inventory<input type="search" placeholder="Item name" value={inventorySearch} onChange={event => { const value=event.target.value; if (!inventorySearch.trim() && value.trim()) { setInventoryView("all"); setInventoryCategory("all"); } setInventorySearch(value); }}/></label>
@@ -332,7 +357,7 @@ function InventoryWorkspace({ restaurant, request }: { restaurant: Restaurant; r
 function categoryName(value: string | null) { return value?.trim() || "Uncategorized"; }
 function categoryOptions<T extends { category: string | null }>(values: T[]) { const counts = new Map<string, number>(); values.forEach(value => { const name = categoryName(value.category); counts.set(name, (counts.get(name) ?? 0) + 1); }); return [...counts].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name)); }
 function groupByCategory<T extends {category:string|null}>(values:T[]): [string,T[]][] { const groups = new Map<string,T[]>(); values.forEach(value => { const key=categoryName(value.category); groups.set(key,[...(groups.get(key)??[]),value]); }); return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)); }
-function InventoryCategory({category,items,manager,busy,onEdit,onToggle}:{category:string;items:InventoryItem[];manager:boolean;busy:boolean;onEdit:(item:InventoryItem)=>void;onToggle:(item:InventoryItem)=>void}) { return <section className="inventory-category"><h3>{category}</h3><div className="inventory-cards">{items.map(item=><article className={`inventory-card${item.lowStock?" low-stock":""}`} key={item.id}><div className="inventory-card-head"><div><h4>{item.name}</h4>{!item.active?<strong className="archived-label">Archived</strong>:item.lowStock&&<strong className="low-stock-label">Low stock</strong>}</div><p className="current-quantity">{item.latestQuantity===null?"Not counted":`${formatInventoryNumber(item.latestQuantity)} ${item.countUnit}`}</p></div><div className="inventory-metrics"><p><span>Previous</span>{item.previousQuantity===null?"—":`${formatInventoryNumber(item.previousQuantity)} ${item.countUnit}`}</p><p><span>Change</span>{item.change===null?"—":`${formatSigned(item.change)} ${item.countUnit}`}</p><p><span>Last counted</span>{item.lastCountedAt?formatInventoryDate(item.lastCountedAt):"Not yet"}</p></div>{manager&&<div className="card-actions"><button className="file-button" type="button" disabled={busy} onClick={()=>onEdit(item)}>Edit</button><button className="text-button" type="button" disabled={busy} onClick={()=>void onToggle(item)}>{item.active?"Archive":"Reactivate"}</button></div>}</article>)}</div></section> }
+function InventoryCategory({category,items,manager,busy,onEdit,onToggle}:{category:string;items:InventoryItem[];manager:boolean;busy:boolean;onEdit:(item:InventoryItem)=>void;onToggle:(item:InventoryItem)=>void}) { return <section className="inventory-category"><h3>{category}</h3><div className="inventory-cards">{items.map(item=><article className={`inventory-card${item.lowStock?" low-stock":""}`} key={item.id}><div className="inventory-card-head"><div><h4>{item.name}</h4>{!item.active?<strong className="archived-label">Archived</strong>:item.lowStock&&<strong className="low-stock-label">Below par at last count</strong>}</div><p className="current-quantity">{item.latestQuantity===null?"Not counted":`${formatInventoryNumber(item.latestQuantity)} ${item.countUnit}`}</p></div><div className="inventory-metrics"><p><span>Previous</span>{item.previousQuantity===null?"—":`${formatInventoryNumber(item.previousQuantity)} ${item.countUnit}`}</p><p><span>Change</span>{item.change===null?"—":`${formatSigned(item.change)} ${item.countUnit}`}</p><p><span>Last counted</span>{item.lastCountedAt?formatInventoryDate(item.lastCountedAt):"Not yet"}</p></div>{manager&&<div className="card-actions"><button className="file-button" type="button" disabled={busy} onClick={()=>onEdit(item)}>Edit</button><button className="text-button" type="button" disabled={busy} onClick={()=>void onToggle(item)}>{item.active?"Archive":"Reactivate"}</button></div>}</article>)}</div></section> }
 function formatInventoryNumber(value:string) { const number=Number(value); return Number.isFinite(number) ? new Intl.NumberFormat(undefined,{maximumFractionDigits:6}).format(number) : value; }
 function formatSigned(value:string) { const number=Number(value); if (!Number.isFinite(number)) return value; return `${number>0?"+":""}${formatInventoryNumber(value)}`; }
 function formatInventoryDate(value:string) { const date=new Date(value); return Number.isNaN(date.getTime())?value:new Intl.DateTimeFormat(undefined,{dateStyle:"medium",timeStyle:"short"}).format(date); }
@@ -923,10 +948,12 @@ function formatBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.max(1
 function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`)); }
 function formatMoney(value:string,currency:string){return new Intl.NumberFormat(undefined,{style:"currency",currency}).format(Number(value));}
 
-function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string; city: string; serviceStyle: ServiceStyle }) => Promise<void>; onSignOut: () => void }) {
+function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string; city: string; serviceStyle: ServiceStyle; posSystem: string | null; accountingSystem: string | null }) => Promise<void>; onSignOut: () => void }) {
   const [name, setName] = useState("");
   const [city, setCity] = useState("");
   const [serviceStyle, setServiceStyle] = useState<ServiceStyle>("fast_casual");
+  const [posSystem, setPosSystem] = useState("");
+  const [accountingSystem, setAccountingSystem] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -934,7 +961,7 @@ function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string;
     event.preventDefault();
     if (!name.trim() || !city.trim()) { setError("Add your restaurant name and city to continue."); return; }
     setSubmitting(true); setError("");
-    try { await onCreate({ name, city, serviceStyle }); }
+    try { await onCreate({ name, city, serviceStyle, posSystem:posSystem.trim()||null, accountingSystem:accountingSystem.trim()||null }); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "We couldn't open Parline. Please try again."); setSubmitting(false); }
   }
 
@@ -948,6 +975,7 @@ function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string;
         <div className="ledger-field"><label htmlFor="restaurant-name">Restaurant name</label><p id="name-help">Use the name your crew knows.</p><input id="restaurant-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={120} autoComplete="organization" aria-describedby="name-help form-error" required /></div>
         <div className="ledger-field"><label htmlFor="city">City</label><p id="city-help">The city for this first location.</p><input id="city" value={city} onChange={(event) => setCity(event.target.value)} maxLength={100} autoComplete="address-level2" aria-describedby="city-help form-error" required /></div>
         <div className="ledger-field"><label htmlFor="service-style">Service style</label><p id="style-help">Choose the closest fit. You can keep setup simple.</p><select id="service-style" value={serviceStyle} onChange={(event) => setServiceStyle(event.target.value as ServiceStyle)} aria-describedby="style-help form-error">{serviceStyles.map((style) => <option key={style.value} value={style.value}>{style.label}</option>)}</select></div>
+        <fieldset className="onboarding-tools"><legend>Tools you already use <span>Optional</span></legend><p>This helps Parline show the right connection or import path. Nothing is replaced.</p><div className="ledger-field"><label htmlFor="pos-system">POS or ordering system</label><input id="pos-system" list="pos-systems" value={posSystem} onChange={event=>setPosSystem(event.target.value)} maxLength={80} placeholder="For example, Toast or Square"/><datalist id="pos-systems"><option value="Toast"/><option value="Square"/><option value="Clover"/><option value="Lightspeed"/><option value="SpotOn"/><option value="TouchBistro"/><option value="Revel"/></datalist></div><div className="ledger-field"><label htmlFor="accounting-system">Accounting system</label><input id="accounting-system" list="accounting-systems" value={accountingSystem} onChange={event=>setAccountingSystem(event.target.value)} maxLength={80} placeholder="For example, QuickBooks"/><datalist id="accounting-systems"><option value="QuickBooks Online"/><option value="QuickBooks Desktop"/><option value="Xero"/><option value="FreshBooks"/><option value="Spreadsheet or bookkeeper"/></datalist></div></fieldset>
         {error && <p className="form-error" id="form-error" role="alert">{error}</p>}
         <button className="ledger-button" type="submit" disabled={submitting}>{submitting ? "Creating restaurant…" : "Create restaurant"}<span aria-hidden="true">→</span></button>
       </form>

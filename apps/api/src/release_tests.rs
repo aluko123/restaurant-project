@@ -229,6 +229,36 @@ async fn request(
     ApiResponse { status, body }
 }
 
+async fn multipart_csv(app: Router, token: &str, csv: &str) -> ApiResponse {
+    let boundary = "release-test-inventory-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"inventory.csv\"\r\nContent-Type: text/csv\r\n\r\n{csv}\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/inventory-imports")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .expect("router request failed");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .expect("response body could not be read");
+    ApiResponse {
+        status,
+        body: serde_json::from_slice(&bytes).expect("response was not JSON"),
+    }
+}
+
 fn decimal(value: &str) -> BigDecimal {
     BigDecimal::from_str(value).unwrap()
 }
@@ -779,6 +809,378 @@ async fn api_enforces_tenant_and_role_boundaries() {
     assert_eq!(tenant_b_losses.status, StatusCode::OK);
     assert!(tenant_b_losses.body.as_array().unwrap().is_empty());
 
+    fixture.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn inventory_backend_import_and_order_guide_loop() {
+    let fixture = ApiFixture::create("inventory_backend_loop").await;
+    let owner = fixture.token("owner-a");
+    let manager = fixture.token("manager-a");
+    let staff = fixture.token("staff-a");
+    let other = fixture.token("owner-b");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::GET,
+            "/v1/migration-setup",
+            None,
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    let setup = request(
+        fixture.app.clone(),
+        Some(&manager),
+        Method::GET,
+        "/v1/migration-setup",
+        None,
+    )
+    .await;
+    assert_eq!(setup.status, StatusCode::OK);
+    assert_eq!(setup.body["inventoryItemCount"], 1);
+    assert!(setup.body["completedAt"].is_null());
+    let setup = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        "/v1/migration-setup",
+        Some(json!({
+            "posSystem": "  Toast  ",
+            "accountingSystem": "QuickBooks Online",
+            "markComplete": true
+        })),
+    )
+    .await;
+    assert_eq!(setup.status, StatusCode::OK);
+    assert_eq!(setup.body["posSystem"], "Toast");
+    assert_eq!(setup.body["accountingSystem"], "QuickBooks Online");
+    assert!(!setup.body["completedAt"].is_null());
+    let other_setup = request(
+        fixture.app.clone(),
+        Some(&other),
+        Method::GET,
+        "/v1/migration-setup",
+        None,
+    )
+    .await;
+    assert_eq!(other_setup.status, StatusCode::OK);
+    assert!(other_setup.body["posSystem"].is_null());
+    assert!(other_setup.body["completedAt"].is_null());
+    let csv = "name,count_unit,category,par_level\nRelease Beans,lb,Dry,8.25\nRelease Oil,liter,Pantry,3.5\n,each,Bad,2\n";
+    assert_eq!(
+        multipart_csv(fixture.app.clone(), &staff, csv).await.status,
+        StatusCode::FORBIDDEN
+    );
+    let preview = multipart_csv(fixture.app.clone(), &manager, csv).await;
+    assert_eq!(preview.status, StatusCode::CREATED);
+    let import_id = preview.body["id"].as_str().unwrap();
+    let rows = preview.body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["validationErrors"].as_array().unwrap().is_empty())
+            .count(),
+        2
+    );
+    let apply_rows = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r["id"], "selected": r["validationErrors"].as_array().unwrap().is_empty(),
+                "name": r["name"], "category": r["category"], "countUnit": r["countUnit"],
+                "parLevel": r["parLevel"]
+            })
+        })
+        .collect::<Vec<_>>();
+    let apply_body = json!({"revision": 0, "rows": apply_rows});
+    let import_uri = format!("/v1/inventory-imports/{import_id}");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&other),
+            Method::GET,
+            &import_uri,
+            None
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&other),
+            Method::PUT,
+            &import_uri,
+            Some(apply_body.clone())
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    let applied = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        &import_uri,
+        Some(apply_body.clone()),
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::OK);
+    assert_eq!(applied.body["status"], "applied");
+    assert_eq!(
+        applied.body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["selected"] == true && !r["createdInventoryItemId"].is_null())
+            .count(),
+        2
+    );
+    let duplicate = multipart_csv(fixture.app.clone(), &owner, csv).await;
+    assert_eq!(duplicate.status, StatusCode::OK);
+    assert_eq!(duplicate.body["id"], import_id);
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&manager),
+            Method::PUT,
+            &import_uri,
+            Some(apply_body)
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM inventory_items WHERE restaurant_id=$1 AND name LIKE 'Release %'"
+        )
+        .bind(fixture.ids.restaurant_a)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap(),
+        2
+    );
+
+    // Keep the imported items out of this count so the guide has one focused, fully counted line.
+    sqlx::query(
+        "UPDATE inventory_items SET active=false WHERE restaurant_id=$1 AND name LIKE 'Release %'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE inventory_items SET par_level=10.25 WHERE id=$1")
+        .bind(fixture.ids.inventory_a)
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    let started = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        None,
+    )
+    .await;
+    assert_eq!(started.status, StatusCode::CREATED);
+    let count_id = started.body["id"].as_str().unwrap();
+    let entry_id = started.body["entries"][0]["id"].as_str().unwrap();
+    let count_uri = format!("/v1/inventory-counts/{count_id}");
+    let saved = request(
+        fixture.app.clone(),
+        Some(&staff),
+        Method::PUT,
+        &count_uri,
+        Some(json!({"revision": 0, "entries": [{"id": entry_id, "quantity": "3.100000"}]})),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK);
+    assert_decimal_json(&saved.body["entries"][0]["quantity"], "3.1");
+    let completed = request(
+        fixture.app.clone(),
+        Some(&staff),
+        Method::POST,
+        &format!("{count_uri}/complete"),
+        Some(json!({"revision": 1, "confirmMissing": false})),
+    )
+    .await;
+    assert_eq!(completed.status, StatusCode::OK);
+    assert_eq!(completed.body["status"], "completed");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::POST,
+            "/v1/order-guides",
+            Some(json!({}))
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    let guide = request(
+        fixture.app.clone(),
+        Some(&manager),
+        Method::POST,
+        "/v1/order-guides",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(guide.status, StatusCode::CREATED);
+    assert_eq!(guide.body["sourceCountId"], count_id);
+    assert_eq!(guide.body["lines"].as_array().unwrap().len(), 1);
+    let line = &guide.body["lines"][0];
+    assert_eq!(line["inventoryItemName"], "Tenant A Tomatoes");
+    assert_eq!(line["countUnit"], "lb");
+    assert_decimal_json(&line["countedQuantity"], "3.1");
+    assert_decimal_json(&line["parLevel"], "10.25");
+    assert_decimal_json(&line["shortage"], "7.15");
+    assert_decimal_json(&line["suggestedOrderQuantity"], "7.15");
+    let guide_id = guide.body["id"].as_str().unwrap();
+    let line_id = line["id"].as_str().unwrap();
+    let guide_uri = format!("/v1/order-guides/{guide_id}");
+    let edit = json!({"revision": 0, "lines": [{"id": line_id, "supplierName": "Release Supplier", "orderUnit": "case", "conversion": "2.5", "orderQuantity": "3.000000"}]});
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::PUT,
+            &guide_uri,
+            Some(edit.clone())
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    let edited = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        &guide_uri,
+        Some(edit),
+    )
+    .await;
+    assert_eq!(edited.status, StatusCode::OK);
+    assert_eq!(edited.body["revision"], 1);
+    assert_decimal_json(&edited.body["lines"][0]["suggestedOrderQuantity"], "2.86");
+    let ordered_uri = format!("{guide_uri}/ordered");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::POST,
+            &ordered_uri,
+            Some(json!({"revision": 1}))
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    let ordered = request(
+        fixture.app.clone(),
+        Some(&manager),
+        Method::POST,
+        &ordered_uri,
+        Some(json!({"revision": 1})),
+    )
+    .await;
+    assert_eq!(ordered.status, StatusCode::OK);
+    assert_eq!(ordered.body["status"], "ordered");
+    assert_eq!(ordered.body["revision"], 2);
+    let receive_uri = format!("{guide_uri}/receive");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::POST,
+            &receive_uri,
+            Some(json!({"lines": []}))
+        )
+        .await
+        .status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let received = request(
+        fixture.app.clone(),
+        Some(&staff),
+        Method::POST,
+        &receive_uri,
+        Some(json!({"lines": [{"id": line_id, "receivedQuantity": "0"}]})),
+    )
+    .await;
+    assert_eq!(received.status, StatusCode::OK);
+    assert_eq!(received.body["status"], "received");
+    assert_eq!(received.body["revision"], 3);
+    assert_eq!(received.body["lines"][0]["receiptStatus"], "missing");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&other),
+            Method::GET,
+            &guide_uri,
+            None
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            &guide_uri,
+            Some(json!({"revision": 3, "lines": []}))
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::POST,
+            &receive_uri,
+            Some(json!({"lines": [{"id": line_id, "receivedQuantity": "1"}]}))
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    let replay = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/order-guides",
+        Some(json!({"countId": count_id})),
+    )
+    .await;
+    assert_eq!(replay.status, StatusCode::OK);
+    assert_eq!(replay.body["id"], guide_id);
+    assert_eq!(replay.body["status"], "received");
+    let items = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/inventory-items",
+        None,
+    )
+    .await;
+    let item = items
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == fixture.ids.inventory_a.to_string())
+        .unwrap();
+    assert_decimal_json(&item["latestQuantity"], "3.1");
     fixture.drop().await;
 }
 
