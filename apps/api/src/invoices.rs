@@ -17,6 +17,8 @@ use crate::{
 };
 
 const MAX_SUPPLIER_CHARS: usize = 120;
+/// Placeholder until extraction (or review) supplies the real supplier name.
+pub(crate) const READING_SUPPLIER: &str = "Reading invoice…";
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct Membership {
@@ -94,7 +96,7 @@ pub(crate) async fn create(
         })?;
 
     let result = async {
-        let mut tx = state.pool.begin().await?;
+        let mut tx = state.pool.begin().await.map_err(crate::database_error)?;
         let invoice = sqlx::query_as::<_, Invoice>(
             "INSERT INTO invoices
          (id, restaurant_id, uploaded_by, supplier_name, invoice_date, original_filename,
@@ -108,34 +110,40 @@ pub(crate) async fn create(
         .bind(id)
         .bind(membership.restaurant_id)
         .bind(membership.user_id)
-        .bind(upload.supplier_name)
+        .bind(&upload.supplier_name)
         .bind(upload.invoice_date)
         .bind(upload.original_filename)
         .bind(upload.content_type)
         .bind(size_bytes)
         .bind(&key)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(crate::database_error)?;
         sqlx::query("INSERT INTO invoice_extraction_jobs (invoice_id) VALUES ($1)")
             .bind(id)
             .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok::<_, sqlx::Error>(invoice)
+            .await
+            .map_err(crate::database_error)?;
+        // Canonical suppliers are created only after human review approve.
+        tx.commit().await.map_err(crate::database_error)?;
+        Ok::<_, ApiError>(invoice)
     }
     .await;
 
     match result {
         Ok(invoice) => Ok((StatusCode::CREATED, Json(invoice))),
         Err(error) => {
-            tracing::error!(%error, "invoice metadata insert failed");
+            tracing::error!("invoice metadata insert failed");
             if let Err(delete_error) = state.storage.delete(&key).await {
                 tracing::error!(%delete_error, object_key = %key, "invoice R2 cleanup failed");
             }
-            Err(ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "We couldn't save this invoice. Please try again.",
-            ))
+            Err(match error {
+                ApiError(StatusCode::INTERNAL_SERVER_ERROR, _) => ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "We couldn't save this invoice. Please try again.",
+                ),
+                other => other,
+            })
         }
     }
 }
@@ -490,6 +498,14 @@ pub(crate) async fn put_review(
         .bind(id).bind(&input.supplier_name).bind(&input.invoice_number).bind(invoice_date).bind(&input.currency)
         .bind(subtotal).bind(tax).bind(fees).bind(discount).bind(total).bind(member.user_id)
         .execute(&mut *tx).await.map_err(crate::database_error)?;
+    // Final corrected supplier name from review becomes the canonical supplier.
+    crate::suppliers::ensure_supplier(
+        &mut tx,
+        member.restaurant_id,
+        member.user_id,
+        &input.supplier_name,
+    )
+    .await?;
     sqlx::query("DELETE FROM invoice_line_items WHERE invoice_id=$1")
         .bind(id)
         .execute(&mut *tx)
@@ -623,11 +639,9 @@ pub(crate) async fn retry(
 }
 
 fn validate_review(mut i: ReviewInput, today: NaiveDate) -> Result<ReviewInput, ApiError> {
-    i.supplier_name = i.supplier_name.trim().to_owned();
+    i.supplier_name = validate_supplier(&i.supplier_name)?;
     i.currency = i.currency.trim().to_ascii_uppercase();
-    if i.supplier_name.is_empty()
-        || i.supplier_name.chars().count() > 120
-        || i.currency.len() != 3
+    if i.currency.len() != 3
         || !i.currency.bytes().all(|c| c.is_ascii_uppercase())
         || i.line_items.len() > 200
     {
@@ -771,12 +785,14 @@ fn trim_optional(value: Option<String>) -> Option<String> {
 }
 
 async fn parse_upload(mut multipart: Multipart, today: NaiveDate) -> Result<Upload, ApiError> {
-    let mut supplier = None;
     let mut date = None;
     let mut file = None;
     while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
         match field.name() {
-            Some("supplierName") => supplier = Some(field.text().await.map_err(multipart_error)?),
+            // Legacy clients may still send supplierName; ignore it — extraction is source of truth.
+            Some("supplierName") => {
+                let _ = field.text().await.map_err(multipart_error)?;
+            }
             Some("invoiceDate") => date = Some(field.text().await.map_err(multipart_error)?),
             Some("file") => {
                 let filename = field.file_name().unwrap_or("").to_owned();
@@ -786,15 +802,17 @@ async fn parse_upload(mut multipart: Multipart, today: NaiveDate) -> Result<Uplo
             _ => {}
         }
     }
-    let supplier_name = validate_supplier(supplier.as_deref().unwrap_or(""))?;
-    let invoice_date = validate_date(date.as_deref().unwrap_or(""), today)?;
+    let invoice_date = match date.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => validate_date(value, today)?,
+        None => today,
+    };
     let (original_filename, bytes) = file.ok_or(ApiError(
         StatusCode::UNPROCESSABLE_ENTITY,
         "Choose an invoice file.",
     ))?;
     let file = UploadedFile::validate(original_filename, bytes)?;
     Ok(Upload {
-        supplier_name,
+        supplier_name: READING_SUPPLIER.to_owned(),
         invoice_date,
         original_filename: file.original_filename,
         content_type: file.content_type,
@@ -809,6 +827,12 @@ fn validate_supplier(value: &str) -> Result<String, ApiError> {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Supplier name must be between 1 and 120 characters.",
+        ));
+    }
+    if value == READING_SUPPLIER {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Enter the supplier name from the invoice before approving.",
         ));
     }
     Ok(value.to_owned())
@@ -849,6 +873,12 @@ fn object_key(restaurant_id: Uuid, invoice_id: Uuid, extension: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_placeholder_is_stable() {
+        assert_eq!(READING_SUPPLIER, "Reading invoice…");
+        assert!(READING_SUPPLIER.chars().count() <= MAX_SUPPLIER_CHARS);
+    }
 
     #[test]
     fn validates_supplier_and_date() {

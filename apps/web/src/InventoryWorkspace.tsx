@@ -1,7 +1,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import type { ApiRequest } from "./SalesWorkspace";
 import { InventoryImportPanel } from "./InventoryImportPanel";
-import { OrderGuidePanel, type OrderGuide } from "./OrderGuidePanel";
+import { OrderGuidePanel, type OrderGuide, type SupplierOption } from "./OrderGuidePanel";
 
 export type InventoryItem = {
   id: string;
@@ -13,11 +13,19 @@ export type InventoryItem = {
   storageAreaId: string | null;
   storageAreaName: string | null;
   shelfOrder: number;
+  preferredSupplierId: string | null;
+  preferredSupplierName: string | null;
   latestQuantity: string | null;
   previousQuantity: string | null;
   change: string | null;
   lastCountedAt: string | null;
   lowStock: boolean;
+};
+
+type Supplier = SupplierOption & {
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
 };
 
 type StorageArea = {
@@ -77,6 +85,7 @@ type ItemFields = {
   parLevel: string;
   storageAreaId: string;
   shelfOrder: string;
+  preferredSupplierId: string;
   active: boolean;
 };
 
@@ -93,6 +102,7 @@ const blankItem: ItemFields = {
   parLevel: "",
   storageAreaId: "",
   shelfOrder: "0",
+  preferredSupplierId: "",
   active: true,
 };
 
@@ -119,6 +129,9 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
   const [inventoryCategory, setInventoryCategory] = useState("all");
   const [inventoryArea, setInventoryArea] = useState("all");
   const [guide, setGuide] = useState<OrderGuide | null>(null);
+  const [suppliers, setSuppliers] = useState<Supplier[]>([]);
+  const [supplierName, setSupplierName] = useState("");
+  const [editingSupplier, setEditingSupplier] = useState<Supplier | null>(null);
   const [startAreaIds, setStartAreaIds] = useState<string[]>([]);
   const [confirmSkipped, setConfirmSkipped] = useState(false);
   const [areaName, setAreaName] = useState("");
@@ -139,20 +152,25 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
     );
   };
 
-  const loadOverview = useCallback(async () => {
-    setLoading(true);
+  const clearFeedback = useCallback(() => {
+    clearFeedback();
+  }, []);
+  const showError = useCallback((message: string) => {
+    setNotice("");
+    setError(message);
+  }, []);
+  const showNotice = useCallback((message: string) => {
     setError("");
-    try {
-      const [nextItems, draft, openGuide, nextAreas] = await Promise.all([
-        request<InventoryItem[]>("/v1/inventory-items"),
-        request<InventoryDraftResponse>("/v1/inventory-counts/draft"),
-        request<OrderGuide | null>("/v1/order-guides/open"),
-        request<StorageArea[]>("/v1/storage-areas"),
-      ]);
+    setNotice(message);
+  }, []);
+
+  const applyOverview = useCallback(
+    (nextItems: InventoryItem[], draft: InventoryDraftResponse, openGuide: OrderGuide | null, nextAreas: StorageArea[], nextSuppliers: Supplier[]) => {
       setItems(nextItems);
       setCount(draft.count);
       setGuide(openGuide);
       setAreas(nextAreas);
+      setSuppliers(nextSuppliers);
       if (draft.count) {
         setEntryState(
           Object.fromEntries(
@@ -163,12 +181,41 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
           ),
         );
       }
+    },
+    [],
+  );
+
+  const fetchOverview = useCallback(async () => {
+    const [nextItems, draft, openGuide, nextAreas, nextSuppliers] = await Promise.all([
+      request<InventoryItem[]>("/v1/inventory-items"),
+      request<InventoryDraftResponse>("/v1/inventory-counts/draft"),
+      request<OrderGuide | null>("/v1/order-guides/open"),
+      request<StorageArea[]>("/v1/storage-areas"),
+      request<Supplier[]>("/v1/suppliers"),
+    ]);
+    return { nextItems, draft, openGuide, nextAreas, nextSuppliers };
+  }, [request]);
+
+  const softRefresh = useCallback(async () => {
+    try {
+      const data = await fetchOverview();
+      applyOverview(data.nextItems, data.draft, data.openGuide, data.nextAreas, data.nextSuppliers);
+    } catch {
+      // Keep current screen state; user can hit Refresh.
+    }
+  }, [applyOverview, fetchOverview]);
+
+  const loadOverview = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await fetchOverview();
+      applyOverview(data.nextItems, data.draft, data.openGuide, data.nextAreas, data.nextSuppliers);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Inventory couldn't load. Try again.");
+      showError(reason instanceof Error ? reason.message : "Inventory couldn't load. Try again.");
     } finally {
       setLoading(false);
     }
-  }, [request]);
+  }, [applyOverview, fetchOverview, showError]);
 
   useEffect(() => {
     void loadOverview();
@@ -176,6 +223,13 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
 
   const activeAreas = useMemo(() => areas.filter((area) => area.active), [areas]);
   const active = items.filter((item) => item.active);
+
+  function upsertSupplier(saved: Supplier) {
+    setSuppliers((current) => {
+      const without = current.filter((row) => row.id !== saved.id);
+      return [...without, saved].sort((a, b) => a.name.localeCompare(b.name));
+    });
+  }
 
   function payload(activeValue = fields.active) {
     return {
@@ -185,16 +239,67 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
       parLevel: fields.parLevel || null,
       storageAreaId: fields.storageAreaId || null,
       shelfOrder: Number(fields.shelfOrder || "0"),
+      preferredSupplierId: fields.preferredSupplierId || null,
       active: activeValue,
     };
   }
 
+  async function saveSupplier(event: FormEvent) {
+    event.preventDefault();
+    if (!supplierName.trim()) {
+      showError("Add a supplier name.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const saved = await request<Supplier>(
+        editingSupplier ? `/v1/suppliers/${editingSupplier.id}` : "/v1/suppliers",
+        {
+          method: editingSupplier ? "PUT" : "POST",
+          body: JSON.stringify({ name: supplierName.trim() }),
+        },
+      );
+      upsertSupplier(saved);
+      showNotice(
+        editingSupplier
+          ? `${saved.name} updated.`
+          : `${saved.name} added to your suppliers.`,
+      );
+      setSupplierName("");
+      setEditingSupplier(null);
+      await softRefresh();
+    } catch (reason) {
+      showError(reason instanceof Error ? reason.message : "The supplier couldn't be saved.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function archiveSupplier(supplier: Supplier) {
+    if (!window.confirm(`Archive ${supplier.name}? Preferred settings that use it will clear.`)) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await request(`/v1/suppliers/${supplier.id}/archive`, { method: "POST", body: "{}" });
+      setSuppliers((current) => current.filter((row) => row.id !== supplier.id));
+      showNotice(`${supplier.name} archived.`);
+      if (editingSupplier?.id === supplier.id) {
+        setEditingSupplier(null);
+        setSupplierName("");
+      }
+      await softRefresh();
+    } catch (reason) {
+      showError(reason instanceof Error ? reason.message : "The supplier couldn't be archived.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function saveItem(event: FormEvent) {
     event.preventDefault();
-    setError("");
-    setNotice("");
     if (!fields.name.trim() || !fields.countUnit.trim()) {
-      setError("Add an item name and count unit.");
+      showError("Add an item name and count unit.");
       return;
     }
     setBusy(true);
@@ -203,12 +308,12 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
         method: editing ? "PUT" : "POST",
         body: JSON.stringify(payload()),
       });
-      setNotice(editing ? `${fields.name.trim()} updated.` : `${fields.name.trim()} added.`);
+      showNotice(editing ? `${fields.name.trim()} updated.` : `${fields.name.trim()} added.`);
       setFields(blankItem);
       setEditing(null);
-      await loadOverview();
+      await softRefresh();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The item couldn't be saved.");
+      showError(reason instanceof Error ? reason.message : "The item couldn't be saved.");
     } finally {
       setBusy(false);
     }
@@ -223,6 +328,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
       parLevel: item.parLevel ?? "",
       storageAreaId: item.storageAreaId ?? "",
       shelfOrder: String(item.shelfOrder ?? 0),
+      preferredSupplierId: item.preferredSupplierId ?? "",
       active: item.active,
     });
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -230,7 +336,6 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
 
   async function toggle(item: InventoryItem) {
     setBusy(true);
-    setError("");
     try {
       await request(`/v1/inventory-items/${item.id}`, {
         method: "PUT",
@@ -241,23 +346,24 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
           parLevel: item.parLevel,
           storageAreaId: item.storageAreaId,
           shelfOrder: item.shelfOrder,
+          preferredSupplierId: item.preferredSupplierId,
           active: !item.active,
         }),
       });
-      setNotice(`${item.name} ${item.active ? "archived" : "reactivated"}.`);
-      await loadOverview();
+      showNotice(`${item.name} ${item.active ? "archived" : "reactivated"}.`);
+      await softRefresh();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The item couldn't be updated.");
+      showError(reason instanceof Error ? reason.message : "The item couldn't be updated.");
     } finally {
       setBusy(false);
     }
   }
 
-  async function saveDraft(showNotice = true) {
+  async function saveDraft(announce = true) {
     if (!count) return null;
     setBusy(true);
-    setError("");
-    if (showNotice) setNotice("");
+    if (announce) clearFeedback();
+    else setError("");
     try {
       const value = await request<InventoryCount>(`/v1/inventory-counts/${count.id}`, {
         method: "PUT",
@@ -274,10 +380,10 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
         }),
       });
       adoptCount(value);
-      if (showNotice) setNotice("Draft saved.");
+      if (announce) showNotice("Draft saved.");
       return value;
     } catch (reason) {
-      setError(
+      showError(
         reason instanceof Error
           ? reason.message
           : "The draft couldn't be saved. Check the quantities and try again.",
@@ -289,8 +395,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
   }
 
   async function openStart() {
-    setError("");
-    setNotice("");
+    clearFeedback();
     if (count) {
       setMode("count");
       return;
@@ -305,8 +410,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
 
   async function startCount(storageAreaIds: string[]) {
     setBusy(true);
-    setError("");
-    setNotice("");
+    clearFeedback();
     try {
       const body =
         storageAreaIds.length > 0
@@ -319,7 +423,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
       adoptCount(value);
       setMode("count");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The count couldn't start.");
+      showError(reason instanceof Error ? reason.message : "The count couldn't start.");
     } finally {
       setBusy(false);
     }
@@ -338,7 +442,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
     const saved = await saveDraft(false);
     if (saved) {
       setMode("overview");
-      setNotice("Draft saved. Resume when you're ready.");
+      showNotice("Draft saved. Resume when you're ready.");
     }
   }
 
@@ -357,12 +461,11 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
 
   async function createLatestOrderGuide() {
     setBusy(true);
-    setError("");
-    setNotice("");
+    clearFeedback();
     try {
-      setNotice(await createOrderGuide());
+      showNotice(await createOrderGuide());
     } catch (reason) {
-      setError(
+      showError(
         reason instanceof Error
           ? reason.message
           : "An order guide couldn't be created from the latest count.",
@@ -397,7 +500,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
       }
     }
     await loadOverview();
-    setNotice(message);
+    showNotice(message);
   }
 
   async function complete() {
@@ -407,18 +510,18 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
       return !state.skipped && !state.quantity.trim();
     });
     if (open.length > 0) {
-      setError("Finish or skip every item before completing this count.");
+      showError("Finish or skip every item before completing this count.");
       return;
     }
     const skipped = count.entries.filter((entry) => entryState[entry.id]?.skipped);
     if (skipped.length > 0 && !confirmSkipped) {
-      setError("Confirm the skipped items to complete this count.");
+      showError("Confirm the skipped items to complete this count.");
       return;
     }
     const saved = await saveDraft(false);
     if (!saved) return;
     setBusy(true);
-    setError("");
+    clearFeedback();
     try {
       const completed = await request<InventoryCount>(`/v1/inventory-counts/${saved.id}/complete`, {
         method: "POST",
@@ -429,7 +532,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
       });
       await finishAfterCount(completed);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The count couldn't be completed.");
+      showError(reason instanceof Error ? reason.message : "The count couldn't be completed.");
     } finally {
       setBusy(false);
     }
@@ -450,33 +553,32 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
       }
     }
     await loadOverview();
-    setNotice(message);
+    showNotice(message);
   }
 
   async function saveArea(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
-    setError("");
-    setNotice("");
+    clearFeedback();
     try {
       if (editingArea) {
         await request(`/v1/storage-areas/${editingArea.id}`, {
           method: "PUT",
           body: JSON.stringify({ name: areaName, active: editingArea.active }),
         });
-        setNotice(`${areaName.trim()} updated.`);
+        showNotice(`${areaName.trim()} updated.`);
       } else {
         await request("/v1/storage-areas", {
           method: "POST",
           body: JSON.stringify({ name: areaName, active: true }),
         });
-        setNotice(`${areaName.trim()} added.`);
+        showNotice(`${areaName.trim()} added.`);
       }
       setAreaName("");
       setEditingArea(null);
       await loadOverview();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The storage area couldn't be saved.");
+      showError(reason instanceof Error ? reason.message : "The storage area couldn't be saved.");
     } finally {
       setBusy(false);
     }
@@ -484,7 +586,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
 
   async function addSuggestedArea(name: string) {
     if (areas.some((area) => area.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
-      setNotice(`${name} is already on your list.`);
+      showNotice(`${name} is already on your list.`);
       return;
     }
     setBusy(true);
@@ -494,10 +596,10 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
         method: "POST",
         body: JSON.stringify({ name, active: true }),
       });
-      setNotice(`${name} added.`);
+      showNotice(`${name} added.`);
       await loadOverview();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The storage area couldn't be saved.");
+      showError(reason instanceof Error ? reason.message : "The storage area couldn't be saved.");
     } finally {
       setBusy(false);
     }
@@ -511,10 +613,10 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
         method: "PUT",
         body: JSON.stringify({ name: area.name, active: !area.active }),
       });
-      setNotice(`${area.name} ${area.active ? "archived" : "reactivated"}.`);
+      showNotice(`${area.name} ${area.active ? "archived" : "reactivated"}.`);
       await loadOverview();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The storage area couldn't be updated.");
+      showError(reason instanceof Error ? reason.message : "The storage area couldn't be updated.");
     } finally {
       setBusy(false);
     }
@@ -535,9 +637,9 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
         body: JSON.stringify({ areaIds: next.map((area) => area.id) }),
       });
       setAreas(updated);
-      setNotice("Walk order updated.");
+      showNotice("Walk order updated.");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The walk order couldn't be saved.");
+      showError(reason instanceof Error ? reason.message : "The walk order couldn't be saved.");
     } finally {
       setBusy(false);
     }
@@ -545,14 +647,13 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
 
   async function openHistory() {
     setBusy(true);
-    setError("");
-    setNotice("");
+    clearFeedback();
     try {
       const rows = await request<CountSummary[]>("/v1/inventory-counts?limit=20");
       setHistory(rows);
       setMode("history");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Past counts couldn't load.");
+      showError(reason instanceof Error ? reason.message : "Past counts couldn't load.");
     } finally {
       setBusy(false);
     }
@@ -566,7 +667,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
       setHistoryDetail(detail);
       setMode("historyDetail");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "That count couldn't load.");
+      showError(reason instanceof Error ? reason.message : "That count couldn't load.");
     } finally {
       setBusy(false);
     }
@@ -1170,11 +1271,92 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
           guide={guide}
           manager={manager}
           request={request}
+          suppliers={suppliers}
           onChange={(next, message) => {
             setGuide(next);
-            if (message) setNotice(message);
+            if (message) showNotice(message);
           }}
         />
+      )}
+      {manager && (
+        <section className="suppliers-panel" aria-labelledby="suppliers-heading">
+          <div className="list-heading">
+            <div>
+              <p className="section-code">Who you order from</p>
+              <h2 id="suppliers-heading">Suppliers</h2>
+            </div>
+          </div>
+          <p>
+            Names come from invoices you upload and approve. Use them on order guides and as preferred
+            suppliers on items.
+          </p>
+          {suppliers.length === 0 ? (
+            <p className="empty-state">
+              No suppliers yet. Upload an invoice to add who you order from, or add one manually below.
+            </p>
+          ) : (
+            <div className="supplier-cards">
+              {suppliers.map((supplier) => (
+                <article className="supplier-card" key={supplier.id}>
+                  <h3>{supplier.name}</h3>
+                  <div className="card-actions">
+                    <button
+                      className="file-button"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => {
+                        setEditingSupplier(supplier);
+                        setSupplierName(supplier.name);
+                      }}
+                    >
+                      Rename
+                    </button>
+                    <button
+                      className="text-button"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void archiveSupplier(supplier)}
+                    >
+                      Archive
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+          <form className="inventory-item-form suppliers-form" onSubmit={saveSupplier}>
+            <div className="list-heading">
+              <h3>{editingSupplier ? "Rename supplier" : "Add one not on an invoice yet"}</h3>
+              {editingSupplier && (
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => {
+                    setEditingSupplier(null);
+                    setSupplierName("");
+                  }}
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
+            <div className="inventory-form-fields">
+              <label>
+                Name
+                <input
+                  required
+                  maxLength={120}
+                  value={supplierName}
+                  onChange={(e) => setSupplierName(e.target.value)}
+                  placeholder="Local farm, cash-and-carry, …"
+                />
+              </label>
+            </div>
+            <button className="file-button" disabled={busy}>
+              {busy ? "Saving…" : editingSupplier ? "Save supplier" : "Add supplier"}
+            </button>
+          </form>
+        </section>
       )}
       {manager && !guide && !count && items.some((item) => item.lastCountedAt) && (
         <section className="order-guide-prompt">
@@ -1199,7 +1381,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
           onApplied={async () => {
             if (count) {
               await loadOverview();
-              setNotice(
+              showNotice(
                 "Inventory items imported. They will enter the next count because a draft is already in progress.",
               );
               return;
@@ -1210,10 +1392,10 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
                 body: "{}",
               });
               adoptCount(next);
-              setNotice("Inventory items imported. Your first count is ready to record.");
+              showNotice("Inventory items imported. Your first count is ready to record.");
               setMode("count");
             } catch (reason) {
-              setError(
+              showError(
                 `Inventory items were imported, but the first count could not start. ${
                   reason instanceof Error
                     ? reason.message
@@ -1280,6 +1462,27 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
                 value={fields.parLevel}
                 onChange={(e) => setFields({ ...fields, parLevel: e.target.value })}
               />
+            </label>
+            <label>
+              Preferred supplier <span>Optional</span>
+              <select
+                value={fields.preferredSupplierId}
+                onChange={(e) => setFields({ ...fields, preferredSupplierId: e.target.value })}
+              >
+                <option value="">None</option>
+                {suppliers.map((supplier) => (
+                  <option key={supplier.id} value={supplier.id}>
+                    {supplier.name}
+                  </option>
+                ))}
+                {fields.preferredSupplierId &&
+                  !suppliers.some((s) => s.id === fields.preferredSupplierId) &&
+                  editing?.preferredSupplierName && (
+                    <option value={fields.preferredSupplierId}>
+                      {editing.preferredSupplierName}
+                    </option>
+                  )}
+              </select>
             </label>
             <label>
               Storage area <span>Optional</span>
@@ -1551,8 +1754,8 @@ function InventoryAreaGroup({
                 {item.lastCountedAt ? formatInventoryDate(item.lastCountedAt) : "Not yet"}
               </p>
               <p>
-                <span>Shelf</span>
-                {item.shelfOrder}
+                <span>Preferred</span>
+                {item.preferredSupplierName ?? "—"}
               </p>
             </div>
             {manager && (

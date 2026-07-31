@@ -980,6 +980,71 @@ async fn inventory_backend_import_and_order_guide_loop() {
         .execute(&fixture.database.pool)
         .await
         .unwrap();
+    let preferred = request(
+        fixture.app.clone(),
+        Some(&manager),
+        Method::POST,
+        "/v1/suppliers",
+        Some(json!({"name": "Preferred Produce"})),
+    )
+    .await;
+    assert_eq!(preferred.status, StatusCode::CREATED);
+    let preferred_id = preferred.body["id"].as_str().unwrap();
+    let alternate = request(
+        fixture.app.clone(),
+        Some(&manager),
+        Method::POST,
+        "/v1/suppliers",
+        Some(json!({"name": "Other Broadline"})),
+    )
+    .await;
+    assert_eq!(alternate.status, StatusCode::CREATED);
+    let alternate_id = alternate.body["id"].as_str().unwrap();
+    for (supplier_id, supplier_name, key, unit) in [
+        (preferred_id, "Preferred Produce", "tomato-a", "case"),
+        (alternate_id, "Other Broadline", "tomato-b", "bag"),
+    ] {
+        sqlx::query(
+            "INSERT INTO supplier_product_mappings
+             (id,restaurant_id,supplier_name,supplier_key,comparison_key,comparison_unit,
+              product_description,purchase_unit,inventory_item_id,count_units_per_purchase_unit,
+              created_by,supplier_id)
+             VALUES($1,$2,$3,LOWER(BTRIM($3)),$4,$5,$6,$7,$8,2.5,$9,$10)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(fixture.ids.restaurant_a)
+        .bind(supplier_name)
+        .bind(key)
+        .bind(unit)
+        .bind(format!("{supplier_name} tomatoes"))
+        .bind(unit)
+        .bind(fixture.ids.inventory_a)
+        .bind(fixture.ids.owner_a)
+        .bind(Uuid::parse_str(supplier_id).unwrap())
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    }
+    let prefer = request(
+        fixture.app.clone(),
+        Some(&manager),
+        Method::PUT,
+        &format!("/v1/inventory-items/{}", fixture.ids.inventory_a),
+        Some(json!({
+            "name": "Tenant A Tomatoes",
+            "category": null,
+            "countUnit": "lb",
+            "parLevel": "10.25",
+            "storageAreaId": null,
+            "shelfOrder": 0,
+            "preferredSupplierId": preferred_id,
+            "active": true
+        })),
+    )
+    .await;
+    assert_eq!(prefer.status, StatusCode::OK);
+    assert_eq!(prefer.body["preferredSupplierId"], preferred_id);
+    assert_eq!(prefer.body["preferredSupplierName"], "Preferred Produce");
     let started = request(
         fixture.app.clone(),
         Some(&owner),
@@ -1040,14 +1105,18 @@ async fn inventory_backend_import_and_order_guide_loop() {
     let line = &guide.body["lines"][0];
     assert_eq!(line["inventoryItemName"], "Tenant A Tomatoes");
     assert_eq!(line["countUnit"], "lb");
+    assert_eq!(line["supplierId"], preferred_id);
+    assert_eq!(line["supplierName"], "Preferred Produce");
+    assert_eq!(line["orderUnit"], "case");
     assert_decimal_json(&line["countedQuantity"], "3.1");
     assert_decimal_json(&line["parLevel"], "10.25");
     assert_decimal_json(&line["shortage"], "7.15");
-    assert_decimal_json(&line["suggestedOrderQuantity"], "7.15");
+    assert_decimal_json(&line["conversion"], "2.5");
+    assert_decimal_json(&line["suggestedOrderQuantity"], "2.86");
     let guide_id = guide.body["id"].as_str().unwrap();
     let line_id = line["id"].as_str().unwrap();
     let guide_uri = format!("/v1/order-guides/{guide_id}");
-    let edit = json!({"revision": 0, "lines": [{"id": line_id, "supplierName": "Release Supplier", "orderUnit": "case", "conversion": "2.5", "orderQuantity": "3.000000"}]});
+    let edit = json!({"revision": 0, "lines": [{"id": line_id, "supplierId": preferred_id, "orderUnit": "case", "conversion": "2.5", "orderQuantity": "3.000000"}]});
     assert_eq!(
         request(
             fixture.app.clone(),
@@ -1120,6 +1189,7 @@ async fn inventory_backend_import_and_order_guide_loop() {
     assert_eq!(received.body["status"], "received");
     assert_eq!(received.body["revision"], 3);
     assert_eq!(received.body["lines"][0]["receiptStatus"], "missing");
+    assert_eq!(received.body["lines"][0]["discrepancyKind"], "missing");
     assert_eq!(
         request(
             fixture.app.clone(),
