@@ -5,6 +5,7 @@ import { SettingsWorkspace, type SettingsRestaurant } from "./SettingsWorkspace"
 import { TodayWorkspace } from "./TodayWorkspace";
 import { WeeklyBriefWorkspace } from "./WeeklyBriefWorkspace";
 import { InventoryWorkspace, type InventoryItem } from "./InventoryWorkspace";
+import { SourcesWorkspace, type MigrationSetup } from "./SourcesWorkspace";
 
 type AppProps = {
   authConfigured: boolean;
@@ -38,12 +39,13 @@ type LossEventType = "waste" | "stockout";
 type LossEvent = { id: string; inventoryItemId: string; eventType: LossEventType; inventoryItemName: string; countUnit: string; quantity: string | null; severity: string | null; reason: string; note: string | null; createdAt: string };
 type ServiceStyle = "counter_service" | "full_service" | "fast_casual" | "cafe_bakery" | "bar";
 type AppState = { status: "loading" } | { status: "error"; message: string } | { status: "ready"; restaurant: Restaurant | null };
-type Workspace = "today" | "brief" | "invoices" | "sales" | "menu" | "inventory" | "losses" | "settings";
+type Workspace = "today" | "sources" | "brief" | "invoices" | "sales" | "menu" | "inventory" | "losses" | "settings";
 
 const LANDING_TITLE = "parline:the best restaurant inventory management app";
 
 const workspaceTitles: Record<Workspace, string> = {
   today: "Today",
+  sources: "Sources",
   brief: "Brief",
   invoices: "Invoices",
   sales: "Sales",
@@ -84,8 +86,18 @@ export function App({ authConfigured }: AppProps) {
 function AuthenticatedApp() {
   const { isLoading, user, signIn, signUp, signOut, getAccessToken } = useAuth();
   const [appState, setAppState] = useState<AppState>({ status: "loading" });
-  const workspaceForPath = (): Workspace => window.location.pathname === "/brief" ? "brief" : window.location.pathname === "/invoices" ? "invoices" : window.location.pathname === "/sales" ? "sales" : window.location.pathname === "/menu" ? "menu" : window.location.pathname === "/inventory" ? "inventory" : window.location.pathname === "/losses" ? "losses" : window.location.pathname === "/settings" ? "settings" : "today";
+  const workspaceForPath = (): Workspace =>
+    window.location.pathname === "/sources" ? "sources"
+    : window.location.pathname === "/brief" ? "brief"
+    : window.location.pathname === "/invoices" ? "invoices"
+    : window.location.pathname === "/sales" ? "sales"
+    : window.location.pathname === "/menu" ? "menu"
+    : window.location.pathname === "/inventory" ? "inventory"
+    : window.location.pathname === "/losses" ? "losses"
+    : window.location.pathname === "/settings" ? "settings"
+    : "today";
   const [workspace, setWorkspace] = useState<Workspace>(workspaceForPath);
+  const [setupIncomplete, setSetupIncomplete] = useState<boolean | null>(null);
   const apiUrl = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
 
   const handleSignOut = () => {
@@ -158,12 +170,38 @@ function AuthenticatedApp() {
   useEffect(() => {
     const role = appState.status === "ready" ? appState.restaurant?.role : undefined;
     const unavailable = role !== "owner" && workspace === "brief"
-      || role === "staff" && (workspace === "invoices" || workspace === "menu");
+      || role === "staff" && (workspace === "invoices" || workspace === "menu" || workspace === "sources");
     if (role && unavailable) {
       window.history.replaceState({}, "", "/today");
       setWorkspace("today");
     }
   }, [appState, workspace]);
+
+  useEffect(() => {
+    if (appState.status !== "ready" || !appState.restaurant) return;
+    if (appState.restaurant.role === "staff") {
+      setSetupIncomplete(false);
+      return;
+    }
+    let cancelled = false;
+    void request<MigrationSetup>("/v1/migration-setup")
+      .then((setup) => {
+        if (cancelled) return;
+        const incomplete = !setup.completedAt;
+        setSetupIncomplete(incomplete);
+        const path = window.location.pathname;
+        if (incomplete && (path === "/" || path === "/today" || path === "")) {
+          window.history.replaceState({}, "", "/sources");
+          setWorkspace("sources");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSetupIncomplete(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [appState, request]);
 
   function openWorkspace(next: Workspace) {
     const path = `/${next}`;
@@ -172,7 +210,14 @@ function AuthenticatedApp() {
   }
 
   function openTarget(path: string) {
-    const target = path === "/invoices" ? "invoices" : path === "/sales" ? "sales" : path === "/menu" ? "menu" : path === "/inventory" ? "inventory" : "today";
+    const target =
+      path === "/sources" ? "sources"
+      : path === "/invoices" ? "invoices"
+      : path === "/sales" ? "sales"
+      : path === "/menu" ? "menu"
+      : path === "/inventory" ? "inventory"
+      : path === "/brief" ? "brief"
+      : "today";
     openWorkspace(target);
   }
 
@@ -197,6 +242,7 @@ function AuthenticatedApp() {
       <AppHeader restaurantName={restaurant.name} onSignOut={handleSignOut} />
       <nav className="workspace-nav" aria-label="Parline sections">
         <button type="button" aria-current={workspace === "today" ? "page" : undefined} onClick={() => openWorkspace("today")}>Today</button>
+        {restaurant.role !== "staff" && <button type="button" aria-current={workspace === "sources" ? "page" : undefined} onClick={() => openWorkspace("sources")}>Sources</button>}
         {restaurant.role === "owner" && <button type="button" aria-current={workspace === "brief" ? "page" : undefined} onClick={() => openWorkspace("brief")}>Brief</button>}
         {restaurant.role !== "staff" && <button type="button" aria-current={workspace === "invoices" ? "page" : undefined} onClick={() => openWorkspace("invoices")}>Invoices</button>}
         <button type="button" aria-current={workspace === "sales" ? "page" : undefined} onClick={() => openWorkspace("sales")}>Sales</button>
@@ -206,6 +252,20 @@ function AuthenticatedApp() {
         <button type="button" aria-current={workspace === "settings" ? "page" : undefined} onClick={() => openWorkspace("settings")}>Settings</button>
       </nav>
       <div hidden={workspace !== "today"}><TodayWorkspace request={request} active={workspace === "today"} canManageInvoices={restaurant.role !== "staff"} onNavigate={openTarget} /></div>
+      {restaurant.role !== "staff" && (
+        <div hidden={workspace !== "sources"}>
+          <SourcesWorkspace
+            request={request}
+            active={workspace === "sources"}
+            firstRun={setupIncomplete === true}
+            onNavigate={openTarget}
+            onFinished={() => {
+              setSetupIncomplete(false);
+              openWorkspace("today");
+            }}
+          />
+        </div>
+      )}
       {restaurant.role === "owner" && <div hidden={workspace !== "brief"}><WeeklyBriefWorkspace request={request} active={workspace === "brief"} /></div>}
       {restaurant.role !== "staff" && <div hidden={workspace !== "invoices"}><InvoiceWorkspace restaurant={restaurant} request={request} active={workspace === "invoices"} /></div>}
       <div hidden={workspace !== "sales"}><SalesWorkspace restaurant={restaurant} request={request} active={workspace === "sales"} /></div>
@@ -639,8 +699,6 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [loading, setLoading] = useState(true);
   const [listError, setListError] = useState("");
-  const [supplier, setSupplier] = useState("");
-  const [date, setDate] = useState(() => new Date().toLocaleDateString("en-CA"));
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [notice, setNotice] = useState("");
@@ -672,15 +730,15 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
   async function upload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setNotice(""); setUploadError("");
     const form = event.currentTarget;
-    if (!supplier.trim() || !date || !file) { setUploadError("Add the supplier, invoice date, and a PDF or photo."); return; }
+    if (!file) { setUploadError("Choose a PDF or photo of the invoice."); return; }
     if (file.size > 10 * 1024 * 1024) { setUploadError("Choose a file smaller than 10 MiB."); return; }
-    const body = new FormData(); body.append("supplierName", supplier); body.append("invoiceDate", date); body.append("file", file);
+    const body = new FormData(); body.append("file", file);
     setUploading(true);
     try {
       const invoice = await request<Invoice>("/v1/invoices", { method: "POST", body });
-      setInvoices((current) => [invoice, ...current]); setSupplier(""); setFile(null);
-      setNotice("Invoice uploaded successfully.");
-      form.reset(); setDate(new Date().toLocaleDateString("en-CA"));
+      setInvoices((current) => [invoice, ...current]); setFile(null);
+      setNotice("Invoice uploaded. We’re reading the supplier and line items.");
+      form.reset();
     } catch (error) { setUploadError(error instanceof Error ? error.message : "Invoice upload failed. Please try again."); }
     finally { setUploading(false); }
   }
@@ -728,9 +786,8 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
     <header className="invoice-heading"><h1 id="invoices-heading">Invoices</h1><p>{restaurant.name} · {restaurant.city} · {formatServiceStyle(restaurant.serviceStyle)}</p></header>
     <div className="invoice-grid">
       <form className="invoice-form" onSubmit={upload} noValidate>
-        <h2>Upload an invoice</h2><p>Save one supplier PDF or photo. Maximum 10 MiB.</p>
-        <div className="ledger-field"><label htmlFor="supplier-name">Supplier name</label><input id="supplier-name" value={supplier} onChange={(event) => setSupplier(event.target.value)} maxLength={120} required /></div>
-        <div className="ledger-field"><label htmlFor="invoice-date">Invoice date</label><input id="invoice-date" type="date" value={date} max={new Date().toLocaleDateString("en-CA")} onChange={(event) => setDate(event.target.value)} required /></div>
+        <h2>Upload an invoice</h2>
+        <p>Snap or upload a PDF/photo. We’ll read the supplier and details — maximum 10 MiB.</p>
         <div className="file-actions">
           <input className="visually-hidden" id="invoice-camera" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => setFile(event.target.files?.[0] ?? null)} /><label className="file-button" htmlFor="invoice-camera">Take a photo</label>
           <input className="visually-hidden" id="invoice-file" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" onChange={(event) => setFile(event.target.files?.[0] ?? null)} /><label className="file-button" htmlFor="invoice-file">Choose a file</label>
@@ -752,7 +809,16 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
   </section>;
 }
 
-function InvoiceCard({invoice,openingId,retryingId,onReview,onRetry,onPriceChanges,onPurchases,onOriginal}:{invoice:Invoice;openingId:string;retryingId:string;onReview:(id:string)=>void;onRetry:(invoice:Invoice)=>void;onPriceChanges:(id:string)=>void;onPurchases:(id:string)=>void;onOriginal:(invoice:Invoice)=>void}) { return <article className="invoice-card"><div><p className="invoice-status">{invoice.status === "ready" && invoice.purchaseReceiptRecorded ? "Approved · purchases connected" : importStatusLabel(invoice.status, invoice.delayed, "invoice")}</p><h3>{invoice.supplierName}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><div className="card-actions">{invoice.status === "needs_review" && <button className="ledger-button" type="button" onClick={() => onReview(invoice.id)}>Review invoice</button>}{invoice.status === "failed" && <button className="ledger-button" type="button" disabled={retryingId===invoice.id} onClick={() => void onRetry(invoice)}>{retryingId===invoice.id ? "Trying again…" : "Try again"}</button>}{invoice.status === "ready" && invoice.priceChangeCount > 0 && <button className="price-change-alert" type="button" onClick={() => onPriceChanges(invoice.id)}><span aria-hidden="true">!</span>{invoice.priceChangeCount} {invoice.priceChangeCount === 1 ? "price" : "prices"} changed</button>}{invoice.status === "ready" && <button className={invoice.purchaseReceiptRecorded ? "file-button" : "ledger-button"} type="button" onClick={() => onPurchases(invoice.id)}>{invoice.purchaseReceiptRecorded ? "View receipt" : "Connect purchases"}</button>}<button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void onOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></div></article>; }
+function invoiceDisplayName(invoice: Invoice) {
+  if (invoice.status === "processing" || invoice.status === "uploaded") {
+    if (!invoice.supplierName || invoice.supplierName === "Reading invoice…") {
+      return "Reading invoice…";
+    }
+  }
+  if (invoice.supplierName === "Reading invoice…") return "Supplier needs review";
+  return invoice.supplierName;
+}
+function InvoiceCard({invoice,openingId,retryingId,onReview,onRetry,onPriceChanges,onPurchases,onOriginal}:{invoice:Invoice;openingId:string;retryingId:string;onReview:(id:string)=>void;onRetry:(invoice:Invoice)=>void;onPriceChanges:(id:string)=>void;onPurchases:(id:string)=>void;onOriginal:(invoice:Invoice)=>void}) { return <article className="invoice-card"><div><p className="invoice-status">{invoice.status === "ready" && invoice.purchaseReceiptRecorded ? "Approved · purchases connected" : importStatusLabel(invoice.status, invoice.delayed, "invoice")}</p><h3>{invoiceDisplayName(invoice)}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><div className="card-actions">{invoice.status === "needs_review" && <button className="ledger-button" type="button" onClick={() => onReview(invoice.id)}>Review invoice</button>}{invoice.status === "failed" && <button className="ledger-button" type="button" disabled={retryingId===invoice.id} onClick={() => void onRetry(invoice)}>{retryingId===invoice.id ? "Trying again…" : "Try again"}</button>}{invoice.status === "ready" && invoice.priceChangeCount > 0 && <button className="price-change-alert" type="button" onClick={() => onPriceChanges(invoice.id)}><span aria-hidden="true">!</span>{invoice.priceChangeCount} {invoice.priceChangeCount === 1 ? "price" : "prices"} changed</button>}{invoice.status === "ready" && <button className={invoice.purchaseReceiptRecorded ? "file-button" : "ledger-button"} type="button" onClick={() => onPurchases(invoice.id)}>{invoice.purchaseReceiptRecorded ? "View receipt" : "Connect purchases"}</button>}<button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void onOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></div></article>; }
 function groupInvoicesByMonth(invoices: Invoice[]): [string, Invoice[]][] { const groups=new Map<string,Invoice[]>(); invoices.forEach(invoice=>{const month=invoice.invoiceDate.slice(0,7);groups.set(month,[...(groups.get(month)??[]),invoice])}); return [...groups.entries()].sort(([a],[b])=>b.localeCompare(a)); }
 function formatInvoiceMonth(value:string) { const [year,month]=value.split("-").map(Number); return new Intl.DateTimeFormat(undefined,{month:"long",year:"numeric",timeZone:"UTC"}).format(new Date(Date.UTC(year,month-1,1))); }
 
@@ -837,7 +903,7 @@ function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string;
         <div className="ledger-field"><label htmlFor="restaurant-name">Restaurant name</label><p id="name-help">Use the name your crew knows.</p><input id="restaurant-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={120} autoComplete="organization" aria-describedby="name-help form-error" required /></div>
         <div className="ledger-field"><label htmlFor="city">City</label><p id="city-help">The city for this first location.</p><input id="city" value={city} onChange={(event) => setCity(event.target.value)} maxLength={100} autoComplete="address-level2" aria-describedby="city-help form-error" required /></div>
         <div className="ledger-field"><label htmlFor="service-style">Service style</label><p id="style-help">Choose the closest fit. You can keep setup simple.</p><select id="service-style" value={serviceStyle} onChange={(event) => setServiceStyle(event.target.value as ServiceStyle)} aria-describedby="style-help form-error">{serviceStyles.map((style) => <option key={style.value} value={style.value}>{style.label}</option>)}</select></div>
-        <fieldset className="onboarding-tools"><legend>Tools you already use <span>Optional</span></legend><p>This helps Parline show the right connection or import path. Nothing is replaced.</p><div className="ledger-field"><label htmlFor="pos-system">POS or ordering system</label><input id="pos-system" list="pos-systems" value={posSystem} onChange={event=>setPosSystem(event.target.value)} maxLength={80} placeholder="For example, Toast or Square"/><datalist id="pos-systems"><option value="Toast"/><option value="Square"/><option value="Clover"/><option value="Lightspeed"/><option value="SpotOn"/><option value="TouchBistro"/><option value="Revel"/></datalist></div><div className="ledger-field"><label htmlFor="accounting-system">Accounting system</label><input id="accounting-system" list="accounting-systems" value={accountingSystem} onChange={event=>setAccountingSystem(event.target.value)} maxLength={80} placeholder="For example, QuickBooks"/><datalist id="accounting-systems"><option value="QuickBooks Online"/><option value="QuickBooks Desktop"/><option value="Xero"/><option value="FreshBooks"/><option value="Spreadsheet or bookkeeper"/></datalist></div></fieldset>
+        <fieldset className="onboarding-tools"><legend>Tools you already use <span>Optional</span></legend><p>This helps Parline show the right import path — or connect it for you later. Nothing is replaced.</p><div className="ledger-field"><label htmlFor="pos-system">POS or ordering system</label><select id="pos-system" value={posSystem} onChange={event=>setPosSystem(event.target.value)}><option value="">Not set</option><option value="Toast">Toast</option><option value="Square">Square</option><option value="Clover">Clover</option><option value="Lightspeed">Lightspeed</option><option value="SpotOn">SpotOn</option><option value="TouchBistro">TouchBistro</option><option value="Revel">Revel</option>{posSystem&&!["Toast","Square","Clover","Lightspeed","SpotOn","TouchBistro","Revel"].includes(posSystem)&&<option value={posSystem}>{posSystem}</option>}</select></div><div className="ledger-field"><label htmlFor="accounting-system">Accounting system</label><select id="accounting-system" value={accountingSystem} onChange={event=>setAccountingSystem(event.target.value)}><option value="">Not set</option><option value="QuickBooks Online">QuickBooks Online</option><option value="QuickBooks Desktop">QuickBooks Desktop</option><option value="Xero">Xero</option><option value="FreshBooks">FreshBooks</option><option value="Spreadsheet or bookkeeper">Spreadsheet or bookkeeper</option>{accountingSystem&&!["QuickBooks Online","QuickBooks Desktop","Xero","FreshBooks","Spreadsheet or bookkeeper"].includes(accountingSystem)&&<option value={accountingSystem}>{accountingSystem}</option>}</select></div></fieldset>
         {error && <p className="form-error" id="form-error" role="alert">{error}</p>}
         <button className="ledger-button" type="submit" disabled={submitting}>{submitting ? "Creating restaurant…" : "Create restaurant"}<span aria-hidden="true">→</span></button>
       </form>
