@@ -56,6 +56,8 @@ pub(crate) struct InventoryItem {
     storage_area_id: Option<Uuid>,
     storage_area_name: Option<String>,
     shelf_order: i32,
+    preferred_supplier_id: Option<Uuid>,
+    preferred_supplier_name: Option<String>,
     latest_quantity: Option<String>,
     previous_quantity: Option<String>,
     change: Option<String>,
@@ -73,6 +75,8 @@ pub(crate) struct ItemInput {
     pub(crate) storage_area_id: Option<Uuid>,
     #[serde(default)]
     pub(crate) shelf_order: i32,
+    #[serde(default)]
+    pub(crate) preferred_supplier_id: Option<Uuid>,
     #[serde(default = "yes")]
     pub(crate) active: bool,
 }
@@ -86,6 +90,7 @@ pub(crate) struct ValidItem {
     pub(crate) par_level: Option<BigDecimal>,
     pub(crate) storage_area_id: Option<Uuid>,
     pub(crate) shelf_order: i32,
+    preferred_supplier_id: Option<Uuid>,
     active: bool,
 }
 
@@ -363,11 +368,13 @@ pub(crate) async fn list_items(
           MAX(quantity) FILTER(WHERE n=2) previous,MAX(completed_at) FILTER(WHERE n=1) counted FROM history WHERE n<=2 GROUP BY inventory_item_id)
         SELECT i.id,i.name,i.category,i.count_unit,i.par_level::text par_level,i.active,
           i.storage_area_id,a.name storage_area_name,i.shelf_order,
+          i.preferred_supplier_id,ps.name preferred_supplier_name,
           l.latest::text latest_quantity,l.previous::text previous_quantity,
           CASE WHEN l.latest IS NOT NULL AND l.previous IS NOT NULL THEN (l.latest-l.previous)::text END change,
           l.counted last_counted_at,(l.latest IS NOT NULL AND i.par_level IS NOT NULL AND l.latest<i.par_level) low_stock
         FROM inventory_items i
         LEFT JOIN storage_areas a ON a.id=i.storage_area_id
+        LEFT JOIN suppliers ps ON ps.id=i.preferred_supplier_id
         LEFT JOIN latest l ON l.inventory_item_id=i.id
         WHERE i.restaurant_id=$1
         ORDER BY i.active DESC,
@@ -391,10 +398,12 @@ pub(crate) async fn create_item(
     let v = input.validated()?;
     let mut tx = state.pool.begin().await.map_err(database_error)?;
     let area_name = validate_area(&mut tx, m.restaurant_id, v.storage_area_id).await?;
+    let preferred_name =
+        validate_preferred_supplier(&mut tx, m.restaurant_id, v.preferred_supplier_id).await?;
     let id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO inventory_items(id,restaurant_id,name,category,count_unit,par_level,active,storage_area_id,shelf_order)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        "INSERT INTO inventory_items(id,restaurant_id,name,category,count_unit,par_level,active,storage_area_id,shelf_order,preferred_supplier_id)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
     )
     .bind(id)
     .bind(m.restaurant_id)
@@ -405,11 +414,15 @@ pub(crate) async fn create_item(
     .bind(v.active)
     .bind(v.storage_area_id)
     .bind(v.shelf_order)
+    .bind(v.preferred_supplier_id)
     .execute(&mut *tx)
     .await
     .map_err(item_write_error)?;
     tx.commit().await.map_err(database_error)?;
-    Ok((StatusCode::CREATED, Json(empty_item(id, v, area_name))))
+    Ok((
+        StatusCode::CREATED,
+        Json(empty_item(id, v, area_name, preferred_name)),
+    ))
 }
 
 pub(crate) async fn update_item(
@@ -458,9 +471,11 @@ pub(crate) async fn update_item(
         }
     }
     let area_name = validate_area(&mut tx, m.restaurant_id, v.storage_area_id).await?;
+    let preferred_name =
+        validate_preferred_supplier(&mut tx, m.restaurant_id, v.preferred_supplier_id).await?;
     sqlx::query(
         "UPDATE inventory_items SET name=$3,category=$4,count_unit=$5,par_level=$6,active=$7,
-         storage_area_id=$8,shelf_order=$9,updated_at=NOW()
+         storage_area_id=$8,shelf_order=$9,preferred_supplier_id=$10,updated_at=NOW()
          WHERE id=$1 AND restaurant_id=$2",
     )
     .bind(id)
@@ -472,11 +487,12 @@ pub(crate) async fn update_item(
     .bind(v.active)
     .bind(v.storage_area_id)
     .bind(v.shelf_order)
+    .bind(v.preferred_supplier_id)
     .execute(&mut *tx)
     .await
     .map_err(item_write_error)?;
     tx.commit().await.map_err(database_error)?;
-    Ok(Json(empty_item(id, v, area_name)))
+    Ok(Json(empty_item(id, v, area_name, preferred_name)))
 }
 
 pub(crate) async fn draft(
@@ -1000,7 +1016,12 @@ fn area_write_error(e: sqlx::Error) -> ApiError {
     }
 }
 
-fn empty_item(id: Uuid, v: ValidItem, area_name: Option<String>) -> InventoryItem {
+fn empty_item(
+    id: Uuid,
+    v: ValidItem,
+    area_name: Option<String>,
+    preferred_name: Option<String>,
+) -> InventoryItem {
     InventoryItem {
         id,
         name: v.name,
@@ -1011,12 +1032,27 @@ fn empty_item(id: Uuid, v: ValidItem, area_name: Option<String>) -> InventoryIte
         storage_area_id: v.storage_area_id,
         storage_area_name: area_name,
         shelf_order: v.shelf_order,
+        preferred_supplier_id: v.preferred_supplier_id,
+        preferred_supplier_name: preferred_name,
         latest_quantity: None,
         previous_quantity: None,
         change: None,
         last_counted_at: None,
         low_stock: false,
     }
+}
+
+async fn validate_preferred_supplier(
+    tx: &mut Transaction<'_, Postgres>,
+    restaurant_id: Uuid,
+    preferred_supplier_id: Option<Uuid>,
+) -> Result<Option<String>, ApiError> {
+    let Some(id) = preferred_supplier_id else {
+        return Ok(None);
+    };
+    crate::suppliers::require_active_supplier(tx, restaurant_id, id)
+        .await
+        .map(Some)
 }
 
 fn normalize_area_name(name: &str) -> Result<String, ApiError> {
@@ -1084,6 +1120,7 @@ impl ItemInput {
             par_level: par,
             storage_area_id: self.storage_area_id,
             shelf_order: self.shelf_order,
+            preferred_supplier_id: self.preferred_supplier_id,
             active: self.active,
         })
     }
@@ -1169,6 +1206,7 @@ mod tests {
             par_level: par.map(Into::into),
             storage_area_id: None,
             shelf_order: 0,
+            preferred_supplier_id: None,
             active: true,
         }
     }

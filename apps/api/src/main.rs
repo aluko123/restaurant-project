@@ -10,6 +10,8 @@ mod menu_imports;
 mod order_guides;
 mod purchases;
 mod sales;
+mod square;
+mod suppliers;
 mod settings;
 mod storage;
 mod today;
@@ -49,6 +51,7 @@ struct AppState {
     verifier: JwtVerifier,
     storage: ObjectStorage,
     workos: WorkosClient,
+    square: Option<square::SquareConfig>,
 }
 
 #[derive(Serialize)]
@@ -92,6 +95,10 @@ struct MigrationSetup {
     menu_item_count: i64,
     invoice_count: i64,
     sales_day_count: i64,
+    last_invoice_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_sales_date: Option<chrono::NaiveDate>,
+    last_completed_count_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_menu_import_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +167,13 @@ async fn main() -> Result<()> {
         storage.clone(),
         gemini,
     ));
+    let square_config = square::SquareConfig::from_env(&web_origin);
+    if square_config.is_some() {
+        info!("Square connect configured");
+    } else {
+        info!("Square connect not configured (set SQUARE_* env vars to enable)");
+    }
+    tokio::spawn(square::run_worker(pool.clone(), square_config.clone()));
 
     let app = router(
         AppState {
@@ -167,6 +181,7 @@ async fn main() -> Result<()> {
             verifier,
             storage,
             workos,
+            square: square_config,
         },
         web_origin
             .parse::<HeaderValue>()
@@ -288,6 +303,24 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route(
             "/v1/inventory-imports/{id}",
             get(inventory_imports::get).put(inventory_imports::apply),
+        )
+        .route("/v1/suppliers", get(suppliers::list).post(suppliers::create))
+        .route(
+            "/v1/suppliers/{id}",
+            axum::routing::put(suppliers::update),
+        )
+        .route(
+            "/v1/suppliers/{id}/archive",
+            post(suppliers::archive),
+        )
+        .route("/v1/connections", get(square::list))
+        .route("/v1/connections/square/status", get(square::square_status))
+        .route("/v1/connections/square/authorize", get(square::authorize))
+        .route("/v1/connections/square/callback", get(square::callback))
+        .route("/v1/connections/square/sync", post(square::sync_now))
+        .route(
+            "/v1/connections/square/disconnect",
+            post(square::disconnect),
         )
         .route("/v1/order-guides", post(order_guides::create))
         .route("/v1/order-guides/open", get(order_guides::open))
@@ -434,7 +467,12 @@ async fn load_migration_setup(
          (SELECT COUNT(*) FROM inventory_items WHERE restaurant_id=r.id) inventory_item_count,
          (SELECT COUNT(*) FROM menu_items WHERE restaurant_id=r.id) menu_item_count,
          (SELECT COUNT(*) FROM invoices WHERE restaurant_id=r.id) invoice_count,
-         (SELECT COUNT(*) FROM sales_days WHERE restaurant_id=r.id) sales_day_count
+         (SELECT COUNT(*) FROM sales_days WHERE restaurant_id=r.id) sales_day_count,
+         (SELECT MAX(created_at) FROM invoices WHERE restaurant_id=r.id) last_invoice_at,
+         (SELECT MAX(business_date) FROM sales_days WHERE restaurant_id=r.id) last_sales_date,
+         (SELECT MAX(completed_at) FROM inventory_count_sessions
+           WHERE restaurant_id=r.id AND status='completed') last_completed_count_at,
+         (SELECT MAX(created_at) FROM menu_imports WHERE restaurant_id=r.id) last_menu_import_at
          FROM restaurants r WHERE r.id=$1",
     )
     .bind(restaurant_id)

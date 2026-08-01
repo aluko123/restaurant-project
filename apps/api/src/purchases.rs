@@ -341,6 +341,7 @@ pub(crate) async fn record(
                 par_level: None,
                 storage_area_id: None,
                 shelf_order: 0,
+                preferred_supplier_id: None,
                 active: true,
             }
             .validated()?;
@@ -606,22 +607,29 @@ async fn save_mappings(
         })
         .collect::<Vec<_>>();
     eligible.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+    let (supplier_id, supplier_name) = crate::suppliers::ensure_supplier(
+        tx,
+        invoice.restaurant_id,
+        user_id,
+        &invoice.supplier_name,
+    )
+    .await?;
     for (key, unit, line) in eligible {
         sqlx::query(
             "INSERT INTO supplier_product_mappings
              (id,restaurant_id,supplier_name,supplier_key,comparison_key,comparison_unit,
               product_description,supplier_sku,purchase_unit,inventory_item_id,
-              count_units_per_purchase_unit,created_by)
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+              count_units_per_purchase_unit,created_by,supplier_id)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
              ON CONFLICT (restaurant_id,supplier_key,comparison_key,comparison_unit)
-             DO UPDATE SET supplier_name=EXCLUDED.supplier_name,
+             DO UPDATE SET supplier_name=EXCLUDED.supplier_name,supplier_id=EXCLUDED.supplier_id,
                product_description=EXCLUDED.product_description,supplier_sku=EXCLUDED.supplier_sku,
                purchase_unit=EXCLUDED.purchase_unit,inventory_item_id=EXCLUDED.inventory_item_id,
                count_units_per_purchase_unit=EXCLUDED.count_units_per_purchase_unit,updated_at=NOW()",
         )
         .bind(Uuid::now_v7())
         .bind(invoice.restaurant_id)
-        .bind(&invoice.supplier_name)
+        .bind(&supplier_name)
         .bind(&invoice.supplier_key)
         .bind(key)
         .bind(unit)
@@ -631,6 +639,7 @@ async fn save_mappings(
         .bind(line.inventory_item_id.expect("linked line has an item"))
         .bind(line.conversion.as_ref().expect("linked line has a conversion"))
         .bind(user_id)
+        .bind(supplier_id)
         .execute(&mut **tx)
         .await
         .map_err(database_error)?;

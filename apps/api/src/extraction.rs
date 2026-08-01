@@ -670,10 +670,31 @@ async fn persist(
             .bind(decimal(&line.quantity, 6)?).bind(&line.unit).bind(decimal(&line.unit_price, 4)?).bind(decimal(&line.line_total, 4)?)
             .bind(warnings.lines[position]).execute(&mut *tx).await?;
     }
-    sqlx::query("UPDATE invoices SET status='needs_review',updated_at=NOW() WHERE id=$1 AND status='processing'")
+    // Promote extracted header onto the invoice for list display (canonical supplier only after review).
+    let extracted_date = e.invoice_date.as_deref().map(parse_date).transpose()?;
+    if !e.supplier_name.is_empty() && e.supplier_name.chars().count() <= 120 {
+        sqlx::query(
+            "UPDATE invoices SET supplier_name=$2,
+             invoice_date=COALESCE($3,invoice_date),
+             status='needs_review',updated_at=NOW()
+             WHERE id=$1 AND status='processing'",
+        )
         .bind(id)
+        .bind(&e.supplier_name)
+        .bind(extracted_date)
         .execute(&mut *tx)
         .await?;
+    } else {
+        sqlx::query(
+            "UPDATE invoices SET invoice_date=COALESCE($2,invoice_date),
+             status='needs_review',updated_at=NOW()
+             WHERE id=$1 AND status='processing'",
+        )
+        .bind(id)
+        .bind(extracted_date)
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query("UPDATE invoice_extraction_jobs SET status='completed',locked_at=NULL,lock_token=NULL,last_error=NULL,updated_at=NOW() WHERE invoice_id=$1 AND lock_token=$2").bind(id).bind(job.lock_token).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())

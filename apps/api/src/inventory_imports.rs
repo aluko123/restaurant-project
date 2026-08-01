@@ -212,6 +212,7 @@ pub(crate) async fn apply(
             par_level: r.par_level,
             storage_area_id: None,
             shelf_order: 0,
+            preferred_supplier_id: None,
             active: true,
         };
         let v = input.validated()?;
@@ -286,6 +287,7 @@ fn parse(b: &[u8]) -> Result<Vec<(Row, Vec<String>)>, ApiError> {
             par_level: par_level.clone(),
             storage_area_id: None,
             shelf_order: 0,
+            preferred_supplier_id: None,
             active: true,
         };
         let mut es = vec![];
