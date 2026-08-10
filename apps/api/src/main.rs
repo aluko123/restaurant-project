@@ -10,9 +10,9 @@ mod menu_imports;
 mod order_guides;
 mod purchases;
 mod sales;
-mod suppliers;
 mod settings;
 mod storage;
+mod suppliers;
 mod today;
 mod uploads;
 mod weekly_brief;
@@ -294,15 +294,12 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             "/v1/inventory-imports/{id}",
             get(inventory_imports::get).put(inventory_imports::apply),
         )
-        .route("/v1/suppliers", get(suppliers::list).post(suppliers::create))
         .route(
-            "/v1/suppliers/{id}",
-            axum::routing::put(suppliers::update),
+            "/v1/suppliers",
+            get(suppliers::list).post(suppliers::create),
         )
-        .route(
-            "/v1/suppliers/{id}/archive",
-            post(suppliers::archive),
-        )
+        .route("/v1/suppliers/{id}", axum::routing::put(suppliers::update))
+        .route("/v1/suppliers/{id}/archive", post(suppliers::archive))
         .route("/v1/order-guides", post(order_guides::create))
         .route("/v1/order-guides/open", get(order_guides::open))
         .route(
