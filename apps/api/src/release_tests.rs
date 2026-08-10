@@ -168,6 +168,7 @@ impl ApiFixture {
                 verifier,
                 storage: ObjectStorage::inert_for_tests(),
                 workos: WorkosClient::mock(workos.clone()),
+                square: None,
             },
             HeaderValue::from_static("http://localhost:5173"),
         );

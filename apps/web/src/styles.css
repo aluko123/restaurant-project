@@ -475,6 +475,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .sources-tools { margin: 28px 0; padding: 20px; display: grid; gap: 14px; border: 1px solid var(--ink); background: rgba(247,240,226,.86); box-shadow: var(--panel-shadow); }
 .sources-tools h2 { margin: 0; font-size: 1.35rem; text-transform: uppercase; }
 .sources-tools > p { margin: 0; font-family: var(--serif); line-height: 1.45; }
+.square-connect-panel { border-left: 7px solid var(--herb); }
+.square-connect-panel .card-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .sources-list .setup-action { align-items: start; }
 .source-recency { margin-top: 8px !important; font-family: var(--mono) !important; font-size: .62rem !important; font-weight: 800; text-transform: uppercase; opacity: .7; }
 .source-nudge { margin-top: 8px !important; padding: 8px 10px; border-left: 4px solid #9a6514; font-family: var(--serif) !important; font-size: .95rem !important; line-height: 1.4; background: rgba(255,248,230,.9); }

@@ -11,6 +11,7 @@ mod order_guides;
 mod purchases;
 mod sales;
 mod settings;
+mod square;
 mod storage;
 mod suppliers;
 mod today;
@@ -50,6 +51,7 @@ struct AppState {
     verifier: JwtVerifier,
     storage: ObjectStorage,
     workos: WorkosClient,
+    square: Option<square::SquareConfig>,
 }
 
 #[derive(Serialize)]
@@ -165,6 +167,13 @@ async fn main() -> Result<()> {
         storage.clone(),
         gemini,
     ));
+    let square_config = square::SquareConfig::from_env(&web_origin);
+    if square_config.is_some() {
+        info!("Square connect configured");
+    } else {
+        info!("Square connect not configured (set SQUARE_* env vars to enable)");
+    }
+    tokio::spawn(square::run_worker(pool.clone(), square_config.clone()));
 
     let app = router(
         AppState {
@@ -172,6 +181,7 @@ async fn main() -> Result<()> {
             verifier,
             storage,
             workos,
+            square: square_config,
         },
         web_origin
             .parse::<HeaderValue>()
@@ -300,6 +310,15 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         )
         .route("/v1/suppliers/{id}", axum::routing::put(suppliers::update))
         .route("/v1/suppliers/{id}/archive", post(suppliers::archive))
+        .route("/v1/connections", get(square::list))
+        .route("/v1/connections/square/status", get(square::square_status))
+        .route("/v1/connections/square/authorize", get(square::authorize))
+        .route("/v1/connections/square/callback", get(square::callback))
+        .route("/v1/connections/square/sync", post(square::sync_now))
+        .route(
+            "/v1/connections/square/disconnect",
+            post(square::disconnect),
+        )
         .route("/v1/order-guides", post(order_guides::create))
         .route("/v1/order-guides/open", get(order_guides::open))
         .route(
