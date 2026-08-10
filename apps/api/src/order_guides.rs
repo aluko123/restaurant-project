@@ -27,6 +27,7 @@ struct Line {
     par_level: String,
     shortage: String,
     supplier_mapping_id: Option<Uuid>,
+    supplier_id: Option<Uuid>,
     supplier_name: Option<String>,
     product_description: Option<String>,
     supplier_sku: Option<String>,
@@ -36,6 +37,7 @@ struct Line {
     order_quantity: String,
     received_quantity: Option<String>,
     receipt_status: Option<String>,
+    discrepancy_kind: Option<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +51,9 @@ pub(crate) struct Guide {
     ordered_at: Option<DateTime<Utc>>,
     received_at: Option<DateTime<Utc>>,
     cancelled_at: Option<DateTime<Utc>>,
+    linked_invoice_id: Option<Uuid>,
+    linked_invoice_supplier_name: Option<String>,
+    linked_invoice_date: Option<chrono::NaiveDate>,
     lines: Vec<Line>,
 }
 #[derive(sqlx::FromRow)]
@@ -62,6 +67,9 @@ struct Header {
     ordered_at: Option<DateTime<Utc>>,
     received_at: Option<DateTime<Utc>>,
     cancelled_at: Option<DateTime<Utc>>,
+    linked_invoice_id: Option<Uuid>,
+    linked_invoice_supplier_name: Option<String>,
+    linked_invoice_date: Option<chrono::NaiveDate>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -78,6 +86,8 @@ pub(crate) struct Update {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Edit {
     id: Uuid,
+    #[serde(default)]
+    supplier_id: Option<Uuid>,
     supplier_name: Option<String>,
     order_unit: String,
     conversion: String,
@@ -87,6 +97,8 @@ struct Edit {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Receive {
     lines: Vec<Received>,
+    #[serde(default)]
+    linked_invoice_id: Option<Uuid>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -152,6 +164,26 @@ fn shortage(par: &BigDecimal, count: &BigDecimal) -> BigDecimal {
     let x = par - count;
     if x > 0 { x } else { BigDecimal::from(0) }
 }
+fn discrepancy_kind(ordered: &BigDecimal, received: &BigDecimal) -> &'static str {
+    if *received == 0 {
+        "missing"
+    } else if received < ordered {
+        "short"
+    } else if received > ordered {
+        "over"
+    } else {
+        "none"
+    }
+}
+type MappingRow = (
+    Uuid,
+    Option<Uuid>,
+    String,
+    String,
+    Option<String>,
+    String,
+    BigDecimal,
+);
 
 pub(crate) async fn create(
     State(s): State<AppState>,
@@ -185,7 +217,7 @@ pub(crate) async fn create(
         drop(tx);
         return Ok((StatusCode::OK, Json(load(&s, id, m.restaurant_id).await?)));
     }
-    let candidates=sqlx::query_as::<_,(Uuid,String,String,Option<BigDecimal>,BigDecimal)>("SELECT i.id,COALESCE(e.name,i.name),COALESCE(e.count_unit,i.count_unit),e.quantity,i.par_level FROM inventory_items i LEFT JOIN inventory_count_entries e ON e.inventory_item_id=i.id AND e.session_id=$2 WHERE i.restaurant_id=$1 AND i.active AND i.par_level IS NOT NULL").bind(m.restaurant_id).bind(latest).fetch_all(&mut *tx).await.map_err(database_error)?;
+    let candidates=sqlx::query_as::<_,(Uuid,String,String,Option<BigDecimal>,BigDecimal,Option<Uuid>)>("SELECT i.id,COALESCE(e.name,i.name),COALESCE(e.count_unit,i.count_unit),e.quantity,i.par_level,i.preferred_supplier_id FROM inventory_items i LEFT JOIN inventory_count_entries e ON e.inventory_item_id=i.id AND e.session_id=$2 WHERE i.restaurant_id=$1 AND i.active AND i.par_level IS NOT NULL").bind(m.restaurant_id).bind(latest).fetch_all(&mut *tx).await.map_err(database_error)?;
     if candidates.iter().any(|x| x.3.is_none()) {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -213,19 +245,16 @@ pub(crate) async fn create(
         }
     })?;
     let mut inserted = 0usize;
-    for (item, name, unit, count, par) in candidates {
+    for (item, name, unit, count, par, preferred) in candidates {
         let count = count.expect("missing count quantity was checked");
         let sh = shortage(&par, &count);
         if sh <= 0 {
             continue;
         }
-        let maps=sqlx::query_as::<_,(Uuid,String,String,Option<String>,String,BigDecimal)>("SELECT id,supplier_name,product_description,supplier_sku,purchase_unit,count_units_per_purchase_unit FROM supplier_product_mappings WHERE restaurant_id=$1 AND inventory_item_id=$2 LIMIT 2").bind(m.restaurant_id).bind(item).fetch_all(&mut *tx).await.map_err(database_error)?;
-        let mapped = (maps.len() == 1).then(|| maps[0].clone());
-        let (mid, supplier, desc, sku, ou, conv) = mapped
-            .map(|x| (Some(x.0), Some(x.1), Some(x.2), x.3, x.4, x.5))
-            .unwrap_or((None, None, None, None, unit.clone(), BigDecimal::from(1)));
+        let (mid, sid, supplier, desc, sku, ou, conv) =
+            resolve_line_supplier(&mut tx, m.restaurant_id, item, &unit, preferred).await?;
         let suggested = represented(&sh / &conv)?;
-        sqlx::query("INSERT INTO order_guide_lines(id,restaurant_id,guide_id,inventory_item_id,inventory_item_name,count_unit,counted_quantity,par_level,shortage,supplier_mapping_id,supplier_name,product_description,supplier_sku,order_unit,count_units_per_order_unit,suggested_order_quantity,order_quantity) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)").bind(Uuid::now_v7()).bind(m.restaurant_id).bind(id).bind(item).bind(name).bind(unit).bind(count).bind(par).bind(sh).bind(mid).bind(supplier).bind(desc).bind(sku).bind(ou).bind(conv).bind(suggested).execute(&mut *tx).await.map_err(database_error)?;
+        sqlx::query("INSERT INTO order_guide_lines(id,restaurant_id,guide_id,inventory_item_id,inventory_item_name,count_unit,counted_quantity,par_level,shortage,supplier_mapping_id,supplier_id,supplier_name,product_description,supplier_sku,order_unit,count_units_per_order_unit,suggested_order_quantity,order_quantity) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)").bind(Uuid::now_v7()).bind(m.restaurant_id).bind(id).bind(item).bind(name).bind(unit).bind(count).bind(par).bind(sh).bind(mid).bind(sid).bind(supplier).bind(desc).bind(sku).bind(ou).bind(conv).bind(suggested).execute(&mut *tx).await.map_err(database_error)?;
         inserted += 1;
     }
     if inserted == 0 {
@@ -304,16 +333,23 @@ pub(crate) async fn update(
                 "Order unit must be between 1 and 40 characters.",
             ));
         }
-        let sn = x.supplier_name.and_then(|v| {
-            let v = v.trim().to_owned();
-            (!v.is_empty()).then_some(v)
-        });
-        if sn.as_ref().is_some_and(|v| v.chars().count() > 120) {
-            return Err(ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "Supplier name must be no more than 120 characters.",
-            ));
-        }
+        let item_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT inventory_item_id FROM order_guide_lines WHERE id=$1 AND guide_id=$2",
+        )
+        .bind(x.id)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        let (sid, sn, mid) = resolve_edit_supplier(
+            &mut tx,
+            m.restaurant_id,
+            m.user_id,
+            item_id,
+            x.supplier_id,
+            x.supplier_name,
+        )
+        .await?;
         let shortage = sqlx::query_scalar::<_, BigDecimal>(
             "SELECT shortage FROM order_guide_lines WHERE id=$1 AND guide_id=$2",
         )
@@ -323,7 +359,7 @@ pub(crate) async fn update(
         .await
         .map_err(database_error)?;
         let suggested = represented(shortage / &c)?;
-        sqlx::query("UPDATE order_guide_lines SET supplier_name=$3,order_unit=$4,count_units_per_order_unit=$5,suggested_order_quantity=$6,order_quantity=$7 WHERE id=$1 AND guide_id=$2").bind(x.id).bind(id).bind(sn).bind(u).bind(c).bind(suggested).bind(q).execute(&mut *tx).await.map_err(database_error)?;
+        sqlx::query("UPDATE order_guide_lines SET supplier_id=$3,supplier_name=$4,supplier_mapping_id=$5,order_unit=$6,count_units_per_order_unit=$7,suggested_order_quantity=$8,order_quantity=$9 WHERE id=$1 AND guide_id=$2").bind(x.id).bind(id).bind(sid).bind(sn).bind(mid).bind(u).bind(c).bind(suggested).bind(q).execute(&mut *tx).await.map_err(database_error)?;
     }
     sqlx::query(
         "UPDATE order_guides SET revision=revision+1,updated_at=clock_timestamp() WHERE id=$1",
@@ -425,6 +461,25 @@ pub(crate) async fn receive(
             "Only an ordered guide can be received.",
         ));
     }
+    let linked_invoice_id = if let Some(invoice_id) = i.linked_invoice_id {
+        let ok = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE id=$1 AND restaurant_id=$2 AND status='ready')",
+        )
+        .bind(invoice_id)
+        .bind(m.restaurant_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        if !ok {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Link an approved invoice from this restaurant.",
+            ));
+        }
+        Some(invoice_id)
+    } else {
+        None
+    };
     for x in i.lines {
         let q = crate::invoices::strict_decimal_with_precision(&x.received_quantity, 30, 12)
             .map_err(|_| {
@@ -439,8 +494,36 @@ pub(crate) async fn receive(
                 "Received quantity must be a nonnegative decimal.",
             ));
         }
+        let ordered = sqlx::query_scalar::<_, BigDecimal>(
+            "SELECT order_quantity FROM order_guide_lines
+             WHERE id=$1 AND guide_id=$2 AND received_quantity IS NULL",
+        )
+        .bind(x.id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(database_error)?
+        .ok_or(ApiError(
+            StatusCode::CONFLICT,
+            "Each order guide line can only be received once.",
+        ))?;
+        let kind = discrepancy_kind(&ordered, &q);
         let rs = if q == 0 { "missing" } else { "received" };
-        let n=sqlx::query("UPDATE order_guide_lines SET received_quantity=$3,receipt_status=$4,received_by=$5,received_at=NOW() WHERE id=$1 AND guide_id=$2 AND received_quantity IS NULL").bind(x.id).bind(id).bind(q).bind(rs).bind(m.user_id).execute(&mut *tx).await.map_err(database_error)?.rows_affected();
+        let n = sqlx::query(
+            "UPDATE order_guide_lines SET received_quantity=$3,receipt_status=$4,discrepancy_kind=$5,
+             received_by=$6,received_at=NOW()
+             WHERE id=$1 AND guide_id=$2 AND received_quantity IS NULL",
+        )
+        .bind(x.id)
+        .bind(id)
+        .bind(q)
+        .bind(rs)
+        .bind(kind)
+        .bind(m.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?
+        .rows_affected();
         if n == 0 {
             return Err(ApiError(
                 StatusCode::CONFLICT,
@@ -448,13 +531,187 @@ pub(crate) async fn receive(
             ));
         }
     }
-    sqlx::query("UPDATE order_guides g SET status=CASE WHEN NOT EXISTS(SELECT 1 FROM order_guide_lines WHERE guide_id=g.id AND order_quantity>0 AND received_quantity IS NULL) THEN 'received' ELSE status END,received_by=CASE WHEN NOT EXISTS(SELECT 1 FROM order_guide_lines WHERE guide_id=g.id AND order_quantity>0 AND received_quantity IS NULL) THEN $2 ELSE received_by END,received_at=CASE WHEN NOT EXISTS(SELECT 1 FROM order_guide_lines WHERE guide_id=g.id AND order_quantity>0 AND received_quantity IS NULL) THEN NOW() ELSE received_at END,revision=revision+1,updated_at=NOW() WHERE id=$1").bind(id).bind(m.user_id).execute(&mut *tx).await.map_err(database_error)?;
+    sqlx::query(
+        "UPDATE order_guides g SET
+           linked_invoice_id=COALESCE(g.linked_invoice_id,$3),
+           status=CASE WHEN NOT EXISTS(SELECT 1 FROM order_guide_lines WHERE guide_id=g.id AND order_quantity>0 AND received_quantity IS NULL) THEN 'received' ELSE status END,
+           received_by=CASE WHEN NOT EXISTS(SELECT 1 FROM order_guide_lines WHERE guide_id=g.id AND order_quantity>0 AND received_quantity IS NULL) THEN $2 ELSE received_by END,
+           received_at=CASE WHEN NOT EXISTS(SELECT 1 FROM order_guide_lines WHERE guide_id=g.id AND order_quantity>0 AND received_quantity IS NULL) THEN NOW() ELSE received_at END,
+           revision=revision+1,updated_at=NOW()
+         WHERE id=$1",
+    )
+    .bind(id)
+    .bind(m.user_id)
+    .bind(linked_invoice_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error)?;
     tx.commit().await.map_err(database_error)?;
     Ok(Json(load(&s, id, m.restaurant_id).await?))
 }
+async fn resolve_line_supplier(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    restaurant_id: Uuid,
+    item: Uuid,
+    count_unit: &str,
+    preferred: Option<Uuid>,
+) -> Result<
+    (
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        BigDecimal,
+    ),
+    ApiError,
+> {
+    if let Some(pref) = preferred {
+        if let Some(map) = sqlx::query_as::<_, MappingRow>(
+            "SELECT id,supplier_id,supplier_name,product_description,supplier_sku,purchase_unit,
+                    count_units_per_purchase_unit
+             FROM supplier_product_mappings
+             WHERE restaurant_id=$1 AND inventory_item_id=$2 AND supplier_id=$3
+             ORDER BY updated_at DESC,id DESC LIMIT 1",
+        )
+        .bind(restaurant_id)
+        .bind(item)
+        .bind(pref)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(database_error)?
+        {
+            return Ok((
+                Some(map.0),
+                map.1.or(Some(pref)),
+                Some(map.2),
+                Some(map.3),
+                map.4,
+                map.5,
+                map.6,
+            ));
+        }
+        if let Some(name) = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM suppliers WHERE id=$1 AND restaurant_id=$2 AND archived_at IS NULL",
+        )
+        .bind(pref)
+        .bind(restaurant_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(database_error)?
+        {
+            return Ok((
+                None,
+                Some(pref),
+                Some(name),
+                None,
+                None,
+                count_unit.to_owned(),
+                BigDecimal::from(1),
+            ));
+        }
+    }
+    let maps = sqlx::query_as::<_, MappingRow>(
+        "SELECT id,supplier_id,supplier_name,product_description,supplier_sku,purchase_unit,
+                count_units_per_purchase_unit
+         FROM supplier_product_mappings
+         WHERE restaurant_id=$1 AND inventory_item_id=$2
+         ORDER BY updated_at DESC,id DESC LIMIT 2",
+    )
+    .bind(restaurant_id)
+    .bind(item)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    if maps.len() == 1 {
+        let map = &maps[0];
+        return Ok((
+            Some(map.0),
+            map.1,
+            Some(map.2.clone()),
+            Some(map.3.clone()),
+            map.4.clone(),
+            map.5.clone(),
+            map.6.clone(),
+        ));
+    }
+    Ok((
+        None,
+        None,
+        None,
+        None,
+        None,
+        count_unit.to_owned(),
+        BigDecimal::from(1),
+    ))
+}
+async fn resolve_edit_supplier(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    restaurant_id: Uuid,
+    user_id: Uuid,
+    item_id: Uuid,
+    supplier_id: Option<Uuid>,
+    supplier_name: Option<String>,
+) -> Result<(Option<Uuid>, Option<String>, Option<Uuid>), ApiError> {
+    let (sid, sn) = if let Some(id) = supplier_id {
+        let name = crate::suppliers::require_active_supplier(tx, restaurant_id, id).await?;
+        (Some(id), Some(name))
+    } else if let Some(raw) = supplier_name {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            (None, None)
+        } else {
+            let (id, name) =
+                crate::suppliers::ensure_supplier(tx, restaurant_id, user_id, trimmed).await?;
+            (Some(id), Some(name))
+        }
+    } else {
+        (None, None)
+    };
+    let mid = match sid {
+        Some(id) => sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM supplier_product_mappings
+                 WHERE restaurant_id=$1 AND inventory_item_id=$2 AND supplier_id=$3
+                 ORDER BY updated_at DESC,id DESC LIMIT 1",
+        )
+        .bind(restaurant_id)
+        .bind(item_id)
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(database_error)?,
+        None => None,
+    };
+    Ok((sid, sn, mid))
+}
 async fn load(s: &AppState, id: Uuid, r: Uuid) -> Result<Guide, ApiError> {
-    let h=sqlx::query_as::<_,Header>("SELECT id,source_count_id,status,revision,created_at,updated_at,ordered_at,received_at,cancelled_at FROM order_guides WHERE id=$1 AND restaurant_id=$2").bind(id).bind(r).fetch_optional(&s.pool).await.map_err(database_error)?.ok_or(ApiError(StatusCode::NOT_FOUND,"Order guide not found."))?;
-    let lines=sqlx::query_as::<_,Line>("SELECT id,inventory_item_id,inventory_item_name,count_unit,counted_quantity::text,par_level::text,shortage::text,supplier_mapping_id,supplier_name,product_description,supplier_sku,order_unit,count_units_per_order_unit::text conversion,suggested_order_quantity::text,order_quantity::text,received_quantity::text,receipt_status FROM order_guide_lines WHERE guide_id=$1 ORDER BY inventory_item_name,id").bind(id).fetch_all(&s.pool).await.map_err(database_error)?;
+    let h = sqlx::query_as::<_, Header>(
+        "SELECT g.id,g.source_count_id,g.status,g.revision,g.created_at,g.updated_at,
+                g.ordered_at,g.received_at,g.cancelled_at,g.linked_invoice_id,
+                i.supplier_name linked_invoice_supplier_name,i.invoice_date linked_invoice_date
+         FROM order_guides g
+         LEFT JOIN invoices i ON i.id=g.linked_invoice_id AND i.restaurant_id=g.restaurant_id
+         WHERE g.id=$1 AND g.restaurant_id=$2",
+    )
+    .bind(id)
+    .bind(r)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(database_error)?
+    .ok_or(ApiError(StatusCode::NOT_FOUND, "Order guide not found."))?;
+    let lines = sqlx::query_as::<_, Line>(
+        "SELECT id,inventory_item_id,inventory_item_name,count_unit,counted_quantity::text,
+                par_level::text,shortage::text,supplier_mapping_id,supplier_id,supplier_name,
+                product_description,supplier_sku,order_unit,
+                count_units_per_order_unit::text conversion,suggested_order_quantity::text,
+                order_quantity::text,received_quantity::text,receipt_status,discrepancy_kind
+         FROM order_guide_lines WHERE guide_id=$1 ORDER BY inventory_item_name,id",
+    )
+    .bind(id)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(database_error)?;
     Ok(Guide {
         id: h.id,
         source_count_id: h.source_count_id,
@@ -465,6 +722,9 @@ async fn load(s: &AppState, id: Uuid, r: Uuid) -> Result<Guide, ApiError> {
         ordered_at: h.ordered_at,
         received_at: h.received_at,
         cancelled_at: h.cancelled_at,
+        linked_invoice_id: h.linked_invoice_id,
+        linked_invoice_supplier_name: h.linked_invoice_supplier_name,
+        linked_invoice_date: h.linked_invoice_date,
         lines,
     })
 }
@@ -478,6 +738,14 @@ mod tests {
         let k: BigDecimal = "2.5".parse().unwrap();
         assert_eq!(shortage(&p, &c).to_string(), "7.15");
         assert_eq!((shortage(&p, &c) / k).to_string(), "2.86");
+    }
+    #[test]
+    fn discrepancy_kinds() {
+        let ordered: BigDecimal = "3".parse().unwrap();
+        assert_eq!(discrepancy_kind(&ordered, &"0".parse().unwrap()), "missing");
+        assert_eq!(discrepancy_kind(&ordered, &"2".parse().unwrap()), "short");
+        assert_eq!(discrepancy_kind(&ordered, &"3".parse().unwrap()), "none");
+        assert_eq!(discrepancy_kind(&ordered, &"4".parse().unwrap()), "over");
     }
     #[test]
     fn representation_rounds_and_checks_range() {

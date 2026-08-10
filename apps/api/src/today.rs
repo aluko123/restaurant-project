@@ -18,6 +18,8 @@ use crate::{
 const MAX_ACTIONS: usize = 5;
 const MAX_PER_CATEGORY: usize = 2;
 const COUNT_CADENCE_DAYS: i64 = 7;
+const SALES_STALE_DAYS: i64 = 7;
+const INVOICE_STALE_DAYS: i64 = 14;
 
 const OWNER_WORKFLOW_SQL: &str = "SELECT
     (SELECT COUNT(*) FROM invoices WHERE restaurant_id=$1 AND status='needs_review') AS invoice_review_count,
@@ -25,7 +27,25 @@ const OWNER_WORKFLOW_SQL: &str = "SELECT
     (SELECT COUNT(*) FROM menu_imports WHERE restaurant_id=$1 AND status='needs_review') AS menu_review_count,
     (SELECT MAX(created_at) FROM menu_imports WHERE restaurant_id=$1 AND status='needs_review') AS menu_review_at,
     (SELECT COUNT(*) FROM invoices WHERE restaurant_id=$1 AND status='failed') AS failed_invoice_count,
-    (SELECT MAX(updated_at) FROM invoices WHERE restaurant_id=$1 AND status='failed') AS failed_invoice_at";
+    (SELECT MAX(updated_at) FROM invoices WHERE restaurant_id=$1 AND status='failed') AS failed_invoice_at,
+    (SELECT COUNT(*) FROM inventory_items WHERE restaurant_id=$1 AND active) AS active_inventory_count,
+    (SELECT COUNT(*) FROM inventory_count_sessions WHERE restaurant_id=$1 AND status='completed') AS completed_count_total,
+    (SELECT MAX(created_at) FROM invoices WHERE restaurant_id=$1) AS last_invoice_at,
+    (SELECT MAX(business_date) FROM sales_days WHERE restaurant_id=$1) AS last_sales_date,
+    (SELECT supplier_name FROM (
+        SELECT LOWER(BTRIM(supplier_name)) AS supplier_key, MIN(supplier_name) AS supplier_name, COUNT(*) AS n
+        FROM invoices WHERE restaurant_id=$1 AND status='ready'
+        GROUP BY LOWER(BTRIM(supplier_name))
+        HAVING COUNT(*)=1
+        ORDER BY MIN(created_at) DESC
+        LIMIT 1
+     ) single_invoice_suppliers) AS single_invoice_supplier_name,
+    (SELECT MAX(created_at) FROM (
+        SELECT MIN(created_at) AS created_at
+        FROM invoices WHERE restaurant_id=$1 AND status='ready'
+        GROUP BY LOWER(BTRIM(supplier_name))
+        HAVING COUNT(*)=1
+     ) single_invoice_times) AS single_invoice_supplier_at";
 
 const BELOW_PAR_SQL: &str = "WITH latest_counts AS (
     SELECT item.id,item.name,item.count_unit,item.par_level,entry.quantity,session.completed_at,
@@ -58,6 +78,12 @@ struct WorkflowFacts {
     menu_review_at: Option<DateTime<Utc>>,
     failed_invoice_count: i64,
     failed_invoice_at: Option<DateTime<Utc>>,
+    active_inventory_count: i64,
+    completed_count_total: i64,
+    last_invoice_at: Option<DateTime<Utc>>,
+    last_sales_date: Option<NaiveDate>,
+    single_invoice_supplier_name: Option<String>,
+    single_invoice_supplier_at: Option<DateTime<Utc>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -318,6 +344,7 @@ fn build_actions(role: &str, timezone: Tz, local_date: NaiveDate, sources: Sourc
                 },
             },
         );
+        push_source_nudges(&mut actions, &facts, timezone, local_date);
     }
     if role == "owner" {
         for change in sources.prices {
@@ -588,6 +615,160 @@ fn local_age_days(timestamp: DateTime<Utc>, timezone: Tz, local_date: NaiveDate)
         .num_days()
 }
 
+fn push_source_nudges(
+    actions: &mut Vec<Action>,
+    facts: &WorkflowFacts,
+    timezone: Tz,
+    local_date: NaiveDate,
+) {
+    if facts.active_inventory_count > 0 && facts.completed_count_total == 0 {
+        actions.push(Action {
+            action_id: "today:source:first_count".to_owned(),
+            rule_key: "source_first_count",
+            category: "source_nudge",
+            priority: Priority::Normal,
+            confidence: high_confidence(
+                "Active inventory items exist and no completed physical count has been saved.",
+            ),
+            title: "Start your first count".to_owned(),
+            why_it_matters:
+                "A physical count unlocks your first order guide and below-par actions.".to_owned(),
+            next_action: "Open Inventory and complete a count of tracked items.".to_owned(),
+            evidence: Evidence {
+                timestamp: Utc::now(),
+                value: format!(
+                    "{} active item{}",
+                    facts.active_inventory_count,
+                    if facts.active_inventory_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                source: "inventory_items + inventory_count_sessions".to_owned(),
+            },
+            limitation:
+                "This does not invent stock levels; only a completed count becomes evidence."
+                    .to_owned(),
+            target: Target {
+                workspace: "inventory",
+                path: "/inventory",
+                label: "Open inventory",
+            },
+        });
+    }
+
+    if let (Some(name), Some(at)) = (
+        facts.single_invoice_supplier_name.as_ref(),
+        facts.single_invoice_supplier_at,
+    ) {
+        actions.push(Action {
+            action_id: format!("today:source:second_invoice:{}", canonical_component(name)),
+            rule_key: "source_second_invoice",
+            category: "source_nudge",
+            priority: Priority::Normal,
+            confidence: medium_confidence(
+                "Exactly one approved invoice exists for this supplier name.",
+            ),
+            title: format!("Upload another {name} invoice"),
+            why_it_matters: format!(
+                "A second {name} invoice unlocks supplier price-change tracking for that vendor."
+            ),
+            next_action: "Open Invoices and upload a more recent invoice from this supplier."
+                .to_owned(),
+            evidence: Evidence {
+                timestamp: at,
+                value: format!("1 approved invoice from {name}"),
+                source: "invoices.status = ready grouped by supplier".to_owned(),
+            },
+            limitation: "Price changes need at least two comparable approved invoices.".to_owned(),
+            target: Target {
+                workspace: "invoices",
+                path: "/invoices",
+                label: "Upload invoice",
+            },
+        });
+    }
+
+    let sales_stale = match facts.last_sales_date {
+        None => facts.active_inventory_count > 0 || facts.completed_count_total > 0,
+        Some(date) => local_date.signed_duration_since(date).num_days() > SALES_STALE_DAYS,
+    };
+    if sales_stale {
+        let (value, timestamp) = match facts.last_sales_date {
+            Some(date) => (
+                format!("Last sales day: {date}"),
+                date.and_hms_opt(12, 0, 0)
+                    .map(|naive| naive.and_utc())
+                    .unwrap_or_else(Utc::now),
+            ),
+            None => ("No sales days entered yet".to_owned(), Utc::now()),
+        };
+        actions.push(Action {
+            action_id: "today:source:sales_stale".to_owned(),
+            rule_key: "source_sales_stale",
+            category: "source_nudge",
+            priority: Priority::Normal,
+            confidence: medium_confidence(
+                "No sales day has been entered in the last 7 local calendar days.",
+            ),
+            title: "Add recent sales".to_owned(),
+            why_it_matters: "Fresh sales keep the weekly brief useful for the owner.".to_owned(),
+            next_action: "Open Sales and import a POS day or enter yesterday manually.".to_owned(),
+            evidence: Evidence {
+                timestamp,
+                value,
+                source: "sales_days.business_date".to_owned(),
+            },
+            limitation: "Entered sales are not a full POS feed until a connector is linked."
+                .to_owned(),
+            target: Target {
+                workspace: "sales",
+                path: "/sales",
+                label: "Open sales",
+            },
+        });
+    }
+
+    let invoice_stale = match facts.last_invoice_at {
+        None => facts.active_inventory_count > 0 || facts.completed_count_total > 0,
+        Some(at) => local_age_days(at, timezone, local_date) > INVOICE_STALE_DAYS,
+    };
+    if invoice_stale {
+        let (value, timestamp) = match facts.last_invoice_at {
+            Some(at) => (
+                format!("Last invoice: {}", at.with_timezone(&timezone).date_naive()),
+                at,
+            ),
+            None => ("No invoices uploaded yet".to_owned(), Utc::now()),
+        };
+        actions.push(Action {
+            action_id: "today:source:invoices_stale".to_owned(),
+            rule_key: "source_invoices_stale",
+            category: "source_nudge",
+            priority: Priority::Normal,
+            confidence: medium_confidence(
+                "No invoice has been uploaded in the last 14 local calendar days.",
+            ),
+            title: "Upload recent invoices".to_owned(),
+            why_it_matters: "Recent invoices keep supplier prices and product mappings current."
+                .to_owned(),
+            next_action: "Open Invoices and upload the latest supplier invoices.".to_owned(),
+            evidence: Evidence {
+                timestamp,
+                value,
+                source: "invoices.created_at".to_owned(),
+            },
+            limitation: "Stale age uses upload time, not supplier invoice date.".to_owned(),
+            target: Target {
+                workspace: "invoices",
+                path: "/invoices",
+                label: "Upload invoices",
+            },
+        });
+    }
+}
+
 fn ordered_and_capped(mut actions: Vec<Action>) -> Vec<Action> {
     actions.sort_by(|left, right| {
         priority_rank(left.priority)
@@ -686,7 +867,66 @@ mod tests {
             menu_review_at: Some(at(22, 9)),
             failed_invoice_count: 1,
             failed_invoice_at: Some(at(22, 8)),
+            active_inventory_count: 0,
+            completed_count_total: 0,
+            last_invoice_at: None,
+            last_sales_date: None,
+            single_invoice_supplier_name: None,
+            single_invoice_supplier_at: None,
         }
+    }
+
+    #[test]
+    fn source_nudges_fire_for_first_count_and_stale_sources() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+        let facts = WorkflowFacts {
+            invoice_review_count: 0,
+            invoice_review_at: None,
+            menu_review_count: 0,
+            menu_review_at: None,
+            failed_invoice_count: 0,
+            failed_invoice_at: None,
+            active_inventory_count: 12,
+            completed_count_total: 0,
+            last_invoice_at: Some(at(10, 12)),
+            last_sales_date: Some(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()),
+            single_invoice_supplier_name: Some("Sysco".into()),
+            single_invoice_supplier_at: Some(at(20, 12)),
+        };
+        let actions = build_actions(
+            "manager",
+            chrono_tz::UTC,
+            date,
+            Sources {
+                workflows: Some(facts),
+                prices: Vec::new(),
+                draft: None,
+                last_completed_count: None,
+                below_par: Vec::new(),
+            },
+        );
+        let keys: Vec<_> = actions.iter().map(|a| a.rule_key).collect();
+        assert!(keys.contains(&"source_first_count"));
+        assert!(keys.contains(&"source_second_invoice"));
+        assert!(keys.iter().filter(|k| k.starts_with("source_")).count() <= MAX_PER_CATEGORY);
+    }
+
+    #[test]
+    fn staff_do_not_receive_source_nudges() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+        let actions = build_actions(
+            "staff",
+            chrono_tz::UTC,
+            date,
+            Sources {
+                workflows: None,
+                prices: Vec::new(),
+                draft: None,
+                last_completed_count: None,
+                below_par: Vec::new(),
+            },
+        );
+        assert!(actions.iter().all(|a| a.category != "source_nudge"));
     }
 
     fn price(increased: bool, at_least_ten_percent: bool) -> TodayPriceChange {
