@@ -319,8 +319,6 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             "/v1/connections/square/disconnect",
             post(square::disconnect),
         )
-        .route("/v1/suppliers/{id}", axum::routing::put(suppliers::update))
-        .route("/v1/suppliers/{id}/archive", post(suppliers::archive))
         .route("/v1/order-guides", post(order_guides::create))
         .route("/v1/order-guides/open", get(order_guides::open))
         .route(
