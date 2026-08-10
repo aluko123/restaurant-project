@@ -359,7 +359,7 @@ export function SourcesWorkspace({
           <p className="form-error" role="alert">
             {error}
           </p>
-          <button className="file-button" type="button" onClick={load}>
+          <button className="file-button" type="button" onClick={() => load()}>
             Retry
           </button>
         </div>

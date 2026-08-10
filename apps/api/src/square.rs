@@ -10,7 +10,10 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
 };
-use base64::{Engine, engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD}};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD},
+};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
@@ -326,7 +329,11 @@ async fn complete_callback(state: &AppState, query: CallbackQuery) -> Result<Str
     if query.error.is_some() {
         return Err("Square authorization was denied or failed.");
     }
-    let code = query.code.as_deref().filter(|v| !v.is_empty()).ok_or("Missing authorization code.")?;
+    let code = query
+        .code
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .ok_or("Missing authorization code.")?;
     let state_token = query
         .state
         .as_deref()
@@ -399,10 +406,7 @@ async fn complete_callback(state: &AppState, query: CallbackQuery) -> Result<Str
     enqueue_sync(&state.pool, connection_id, restaurant_id, "full")
         .await
         .ok();
-    Ok(format!(
-        "{}/sources?square=connected",
-        config.web_origin
-    ))
+    Ok(format!("{}/sources?square=connected", config.web_origin))
 }
 
 #[derive(Deserialize)]
@@ -628,18 +632,14 @@ async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
         tx.commit().await?;
         return Ok(None);
     };
-    sqlx::query(
-        "UPDATE source_sync_runs SET status='running',started_at=NOW() WHERE id=$1",
-    )
-    .bind(job.id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "UPDATE source_connections SET status='syncing',updated_at=NOW() WHERE id=$1",
-    )
-    .bind(job.connection_id)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("UPDATE source_sync_runs SET status='running',started_at=NOW() WHERE id=$1")
+        .bind(job.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE source_connections SET status='syncing',updated_at=NOW() WHERE id=$1")
+        .bind(job.connection_id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(Some(job))
 }
@@ -656,13 +656,11 @@ async fn process_job(pool: &PgPool, config: &SquareConfig, job: SyncJob) -> Resu
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "connection missing".to_owned())?;
 
-    let timezone = sqlx::query_scalar::<_, String>(
-        "SELECT timezone FROM restaurants WHERE id=$1",
-    )
-    .bind(job.restaurant_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let timezone = sqlx::query_scalar::<_, String>("SELECT timezone FROM restaurants WHERE id=$1")
+        .bind(job.restaurant_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let result = run_sync(pool, config, &connection, &job, &timezone).await;
     match result {
@@ -755,8 +753,7 @@ async fn run_sync(
             },
         )
         .map_err(|e| e.1.to_owned())?;
-        let expires_at =
-            Utc::now() + Duration::seconds(token.expires_in.unwrap_or(30 * 24 * 3600));
+        let expires_at = Utc::now() + Duration::seconds(token.expires_in.unwrap_or(30 * 24 * 3600));
         sqlx::query(
             "UPDATE source_connections
              SET access_token_encrypted=$2,refresh_token_encrypted=$3,
@@ -791,8 +788,7 @@ async fn run_sync(
     }
 
     let menu_stats = sync_catalog(pool, config, &access, job.restaurant_id).await?;
-    let sales_stats =
-        sync_orders(pool, config, &access, job, &location_id, timezone).await?;
+    let sales_stats = sync_orders(pool, config, &access, job, &location_id, timezone).await?;
     Ok(json!({
         "menu": menu_stats,
         "sales": sales_stats,
@@ -854,7 +850,10 @@ async fn sync_catalog(
     let mut skipped = 0u64;
     loop {
         let path = match &cursor {
-            Some(c) => format!("/v2/catalog/list?types=ITEM&cursor={}", urlencoding_encode(c)),
+            Some(c) => format!(
+                "/v2/catalog/list?types=ITEM&cursor={}",
+                urlencoding_encode(c)
+            ),
             None => "/v2/catalog/list?types=ITEM".to_owned(),
         };
         let body = square_get(config, access, &path).await?;
@@ -937,12 +936,17 @@ async fn sync_catalog(
                     continue;
                 }
                 let price = cents_to_decimal(amount);
-                let active = object
-                    .get("is_deleted")
-                    .and_then(|v| v.as_bool())
-                    != Some(true);
-                match upsert_menu_item(pool, restaurant_id, external_id, &name, &price, &currency, active)
-                    .await
+                let active = object.get("is_deleted").and_then(|v| v.as_bool()) != Some(true);
+                match upsert_menu_item(
+                    pool,
+                    restaurant_id,
+                    external_id,
+                    &name,
+                    &price,
+                    &currency,
+                    active,
+                )
+                .await
                 {
                     Ok(true) => upserted += 1,
                     Ok(false) => skipped += 1,
@@ -1054,8 +1058,15 @@ fn cents_to_decimal(amount: i64) -> BigDecimal {
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
-    value.chars().take(max).collect::<String>().trim().to_owned()
+    value
+        .chars()
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
+
+type SalesLineTotal = (BigDecimal, Option<i64>, Option<String>);
 
 async fn sync_orders(
     pool: &PgPool,
@@ -1084,8 +1095,7 @@ async fn sync_orders(
     let menu_map = load_square_menu_map(pool, job.restaurant_id).await?;
     let mut cursor: Option<String> = None;
     // business_date -> (menu_item_id -> (qty, net_sales cents, currency))
-    let mut days: HashMap<NaiveDate, HashMap<Uuid, (BigDecimal, Option<i64>, Option<String>)>> =
-        HashMap::new();
+    let mut days: HashMap<NaiveDate, HashMap<Uuid, SalesLineTotal>> = HashMap::new();
     let mut orders_seen = 0u64;
     let mut lines_matched = 0u64;
     let mut lines_skipped = 0u64;
@@ -1135,9 +1145,7 @@ async fn sync_orders(
                 .cloned()
                 .unwrap_or_default();
             for line in line_items {
-                let catalog_id = line
-                    .get("catalog_object_id")
-                    .and_then(|v| v.as_str());
+                let catalog_id = line.get("catalog_object_id").and_then(|v| v.as_str());
                 let Some(catalog_id) = catalog_id else {
                     lines_skipped += 1;
                     continue;
@@ -1184,13 +1192,12 @@ async fn sync_orders(
     }
 
     let mut days_written = 0u64;
-    let system_user = sqlx::query_scalar::<_, Uuid>(
-        "SELECT created_by FROM source_connections WHERE id=$1",
-    )
-    .bind(job.connection_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let system_user =
+        sqlx::query_scalar::<_, Uuid>("SELECT created_by FROM source_connections WHERE id=$1")
+            .bind(job.connection_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
     for (business_date, lines) in days {
         if lines.is_empty() {
@@ -1331,7 +1338,10 @@ mod tests {
     fn money_and_names() {
         assert_eq!(cents_to_decimal(1234).to_string(), "12.34");
         assert_eq!(cents_to_decimal(100).to_string(), "1.00");
-        assert_eq!(truncate_chars("Hello world item name that is very long indeed", 10).len(), 10);
+        assert_eq!(
+            truncate_chars("Hello world item name that is very long indeed", 10).len(),
+            10
+        );
         assert!(truncate_chars("  x  ", 50) == "x");
     }
 

@@ -341,9 +341,15 @@ pub(crate) async fn update(
         .fetch_one(&mut *tx)
         .await
         .map_err(database_error)?;
-        let (sid, sn, mid) =
-            resolve_edit_supplier(&mut tx, m.restaurant_id, m.user_id, item_id, x.supplier_id, x.supplier_name)
-                .await?;
+        let (sid, sn, mid) = resolve_edit_supplier(
+            &mut tx,
+            m.restaurant_id,
+            m.user_id,
+            item_id,
+            x.supplier_id,
+            x.supplier_name,
+        )
+        .await?;
         let shortage = sqlx::query_scalar::<_, BigDecimal>(
             "SELECT shortage FROM order_guide_lines WHERE id=$1 AND guide_id=$2",
         )
@@ -664,19 +670,17 @@ async fn resolve_edit_supplier(
         (None, None)
     };
     let mid = match sid {
-        Some(id) => {
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM supplier_product_mappings
+        Some(id) => sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM supplier_product_mappings
                  WHERE restaurant_id=$1 AND inventory_item_id=$2 AND supplier_id=$3
                  ORDER BY updated_at DESC,id DESC LIMIT 1",
-            )
-            .bind(restaurant_id)
-            .bind(item_id)
-            .bind(id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(database_error)?
-        }
+        )
+        .bind(restaurant_id)
+        .bind(item_id)
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(database_error)?,
         None => None,
     };
     Ok((sid, sn, mid))

@@ -647,8 +647,9 @@ fn push_source_nudges(
                 ),
                 source: "inventory_items + inventory_count_sessions".to_owned(),
             },
-            limitation: "This does not invent stock levels; only a completed count becomes evidence."
-                .to_owned(),
+            limitation:
+                "This does not invent stock levels; only a completed count becomes evidence."
+                    .to_owned(),
             target: Target {
                 workspace: "inventory",
                 path: "/inventory",
@@ -662,10 +663,7 @@ fn push_source_nudges(
         facts.single_invoice_supplier_at,
     ) {
         actions.push(Action {
-            action_id: format!(
-                "today:source:second_invoice:{}",
-                canonical_component(name)
-            ),
+            action_id: format!("today:source:second_invoice:{}", canonical_component(name)),
             rule_key: "source_second_invoice",
             category: "source_nudge",
             priority: Priority::Normal,
@@ -739,10 +737,7 @@ fn push_source_nudges(
     if invoice_stale {
         let (value, timestamp) = match facts.last_invoice_at {
             Some(at) => (
-                format!(
-                    "Last invoice: {}",
-                    at.with_timezone(&timezone).date_naive()
-                ),
+                format!("Last invoice: {}", at.with_timezone(&timezone).date_naive()),
                 at,
             ),
             None => ("No invoices uploaded yet".to_owned(), Utc::now()),
@@ -884,13 +879,20 @@ mod tests {
     #[test]
     fn source_nudges_fire_for_first_count_and_stale_sources() {
         let date = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
-        let mut facts = WorkflowFacts::default();
-        facts.active_inventory_count = 12;
-        facts.completed_count_total = 0;
-        facts.single_invoice_supplier_name = Some("Sysco".into());
-        facts.single_invoice_supplier_at = Some(at(20, 12));
-        facts.last_invoice_at = Some(at(10, 12));
-        facts.last_sales_date = Some(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+        let facts = WorkflowFacts {
+            invoice_review_count: 0,
+            invoice_review_at: None,
+            menu_review_count: 0,
+            menu_review_at: None,
+            failed_invoice_count: 0,
+            failed_invoice_at: None,
+            active_inventory_count: 12,
+            completed_count_total: 0,
+            last_invoice_at: Some(at(10, 12)),
+            last_sales_date: Some(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()),
+            single_invoice_supplier_name: Some("Sysco".into()),
+            single_invoice_supplier_at: Some(at(20, 12)),
+        };
         let actions = build_actions(
             "manager",
             chrono_tz::UTC,

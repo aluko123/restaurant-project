@@ -802,7 +802,11 @@ async fn parse_upload(mut multipart: Multipart, today: NaiveDate) -> Result<Uplo
             _ => {}
         }
     }
-    let invoice_date = match date.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    let invoice_date = match date
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         Some(value) => validate_date(value, today)?,
         None => today,
     };
