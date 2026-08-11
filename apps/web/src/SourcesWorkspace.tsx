@@ -4,6 +4,8 @@ import type { ApiRequest } from "./SalesWorkspace";
 export type MigrationSetup = {
   posSystem: string | null;
   accountingSystem: string | null;
+  setupApproach: "assisted" | "self_service" | null;
+  setupAssistanceRequestedAt: string | null;
   completedAt: string | null;
   inventoryItemCount: number;
   menuItemCount: number;
@@ -16,32 +18,6 @@ export type MigrationSetup = {
 };
 
 const posOptions = ["Toast", "Square", "Clover", "Lightspeed", "SpotOn", "TouchBistro", "Revel"];
-const accountingOptions = [
-  "QuickBooks Online",
-  "QuickBooks Desktop",
-  "Xero",
-  "FreshBooks",
-  "Spreadsheet or bookkeeper",
-];
-
-function toolHint(pos: string | null, accounting: string | null): string | null {
-  const parts: string[] = [];
-  const p = (pos ?? "").toLowerCase();
-  const a = (accounting ?? "").toLowerCase();
-  if (p.includes("toast")) {
-    parts.push("Toast: Reports → Item Sales → export CSV for recent days.");
-  } else if (p.includes("square")) {
-    parts.push("Square: use Connect Square above when available, or Reports → Sales → Items → CSV.");
-  } else if (p.includes("clover")) {
-    parts.push("Clover: Reporting → Items → export a recent sales CSV.");
-  } else if (pos) {
-    parts.push(`${pos}: export item sales CSV if available, or enter a day manually.`);
-  }
-  if (a.includes("quickbooks") || a.includes("xero")) {
-    parts.push("Keep accounting in place — Parline is for inventory and purchasing decisions.");
-  }
-  return parts.length ? parts.join(" ") : null;
-}
 
 function formatWhen(value: string | null, timezone?: string) {
   if (!value) return "Not yet";
@@ -156,11 +132,17 @@ export function SourcesWorkspace({
   }, [active, load]);
 
   useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 5000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
     if (!active) return;
     const params = new URLSearchParams(window.location.search);
     const square = params.get("square");
     if (square === "connected") {
-      setNotice("Square connected. Menu and sales are syncing in the background.");
+      setNotice("Square authorized. Menu and sales are syncing in the background.");
       setSquareSyncPending(true);
       window.history.replaceState({}, "", "/sources");
       void load();
@@ -291,13 +273,38 @@ export function SourcesWorkspace({
         body: JSON.stringify({
           posSystem: posSystem.trim() || null,
           accountingSystem: accountingSystem.trim() || null,
+          setupApproach: setup.setupApproach,
           markComplete: false,
         }),
       });
       setSetup(next);
-      setNotice("Saved the tools you already use.");
+      setNotice("Saved your menu and sales source.");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Those tools couldn't be saved.");
+      setError(cause instanceof Error ? cause.message : "That source couldn't be saved.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function chooseApproach(approach: "assisted" | "self_service") {
+    if (!setup) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const next = await request<MigrationSetup>("/v1/migration-setup", {
+        method: "PUT",
+        body: JSON.stringify({
+          posSystem: posSystem.trim() || null,
+          accountingSystem: accountingSystem.trim() || null,
+          setupApproach: approach,
+          markComplete: false,
+        }),
+      });
+      setSetup(next);
+      setNotice(approach === "assisted" ? "Setup help requested." : "Self-service setup selected.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Your setup path couldn't be saved.");
     } finally {
       setBusy(false);
     }
@@ -314,6 +321,7 @@ export function SourcesWorkspace({
         body: JSON.stringify({
           posSystem: posSystem.trim() || null,
           accountingSystem: accountingSystem.trim() || null,
+          setupApproach: setup.setupApproach,
           markComplete: true,
         }),
       });
@@ -330,7 +338,6 @@ export function SourcesWorkspace({
   const total = setup
     ? setup.inventoryItemCount + setup.menuItemCount + setup.invoiceCount + setup.salesDayCount
     : 0;
-  const hint = toolHint(setup?.posSystem ?? posSystem, setup?.accountingSystem ?? accountingSystem);
   const incomplete = Boolean(setup && !setup.completedAt);
 
   return (
@@ -365,7 +372,29 @@ export function SourcesWorkspace({
         </div>
       ) : setup ? (
         <>
-          <section className="sources-tools square-connect-panel" aria-labelledby="square-connect-heading">
+          {incomplete && !setup.setupApproach ? (
+            <SetupApproachChoice busy={busy} onChoose={chooseApproach} />
+          ) : <>
+          {incomplete && setup.setupApproach && (
+            <section className="setup-path-summary" aria-labelledby="setup-path-heading">
+              <p className="section-code">{setup.setupApproach === "assisted" ? "Setup help requested" : "You are leading setup"}</p>
+              <h2 id="setup-path-heading">{setup.setupApproach === "assisted" ? "Launch with Parline" : "Self-service setup"}</h2>
+              <p>{setup.setupApproach === "assisted" ? "Your request is saved for the Parline team. We’ll coordinate the migration using your account details, prepare imports and mappings, and bring back only decisions that need restaurant knowledge." : "You are migrating the restaurant’s records. Connect or import each source below, review the results, and prepare the first count at your own pace."}</p>
+              <ol className="setup-path-steps">
+                {setup.setupApproach === "assisted" ? <>
+                  <li><strong>Parline coordinates the handoff</strong><span>We connect with you about the files and systems you already use.</span></li>
+                  <li><strong>You authorize and share</strong><span>You approve external connections and provide records; credentials stay with you.</span></li>
+                  <li><strong>Parline prepares, you confirm</strong><span>We organize the migration and ask you only about uncertain mappings or physical counts.</span></li>
+                </> : <>
+                  <li><strong>Choose each source</strong><span>Connect Square or use the guided export path for another POS.</span></li>
+                  <li><strong>Import and review</strong><span>You upload records and resolve any items that need confirmation.</span></li>
+                  <li><strong>Start the first count</strong><span>You verify what is physically on hand before relying on inventory actions.</span></li>
+                </>}
+              </ol>
+              <button className="text-button" type="button" disabled={busy} onClick={() => void chooseApproach(setup.setupApproach === "assisted" ? "self_service" : "assisted")}>{setup.setupApproach === "assisted" ? "Cancel help and set it up myself" : "Request setup help"}</button>
+            </section>
+          )}
+          {(posSystem === "Square" || Boolean(squareConnection)) && <section className="sources-tools square-connect-panel" aria-labelledby="square-connect-heading">
             <div className="list-heading">
               <h2 id="square-connect-heading">Square</h2>
             </div>
@@ -386,11 +415,12 @@ export function SourcesWorkspace({
                     </p>
                   )}
                   <p>
-                    Connected Square fills menu items and recent sales automatically. Inventory counts
-                    and supplier invoices stay in Parline.
+                    {squareConnection.status === "error" || squareConnection.status === "needs_reauth"
+                      ? "Square needs attention before menu and sales can update again. Synced records stay in Parline."
+                      : "Square fills menu items and recent sales automatically. Inventory counts and supplier invoices stay in Parline."}
                   </p>
                   <div className="card-actions">
-                    <button
+                    {squareConnection.status !== "needs_reauth" && squareConnection.status !== "error" && <button
                       className="ledger-button"
                       type="button"
                       disabled={
@@ -405,11 +435,11 @@ export function SourcesWorkspace({
                       squareConnection.status === "syncing"
                         ? "Syncing…"
                         : "Sync now"}
-                    </button>
+                    </button>}
                     {(squareConnection.status === "needs_reauth" ||
                       squareConnection.status === "error") && (
                       <button
-                        className="file-button"
+                        className="ledger-button"
                         type="button"
                         disabled={busy}
                         onClick={() => void connectSquare()}
@@ -449,15 +479,15 @@ export function SourcesWorkspace({
                 sales with CSV, or ask for setup help.
               </p>
             )}
-          </section>
+          </section>}
 
           <form className="sources-tools" onSubmit={saveTools}>
             <div className="list-heading">
-              <h2>Tools you already use</h2>
+              <h2>Menu and sales source</h2>
             </div>
             <p>
-              Optional. Guides import tips and setup help. Square restaurants can Connect above
-              instead of exporting CSV.
+              Choose the POS or ordering system that holds your menu and sales. Square can connect
+              directly; other systems use a guided export for now.
             </p>
             <div className="inventory-form-fields">
               <label>
@@ -477,27 +507,9 @@ export function SourcesWorkspace({
                   )}
                 </select>
               </label>
-              <label>
-                Accounting <span>Optional</span>
-                <select
-                  value={accountingSystem}
-                  onChange={(e) => setAccountingSystem(e.target.value)}
-                >
-                  <option value="">Not set</option>
-                  {accountingOptions.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                  {accountingSystem && !accountingOptions.includes(accountingSystem) && (
-                    <option value={accountingSystem}>{accountingSystem}</option>
-                  )}
-                </select>
-              </label>
             </div>
-            {hint && <p className="setup-tools">{hint}</p>}
             <button className="file-button" type="submit" disabled={busy}>
-              {busy ? "Saving…" : "Save tools"}
+              {busy ? "Saving…" : "Save source"}
             </button>
           </form>
 
@@ -519,11 +531,6 @@ export function SourcesWorkspace({
                     ? "Ready for first count"
                     : "Not yet"
               }
-              nudge={
-                setup.inventoryItemCount > 0 && !setup.lastCompletedCountAt
-                  ? "Start a physical count to unlock your first order guide."
-                  : null
-              }
               onClick={() => onNavigate("/inventory")}
             />
             <SourceCard
@@ -537,7 +544,6 @@ export function SourcesWorkspace({
               }
               complete={setup.menuItemCount > 0}
               recency={`Last import ${recencyLabel(setup.lastMenuImportAt, "import")}`}
-              nudge={null}
               onClick={() => onNavigate("/menu")}
             />
             <SourceCard
@@ -551,14 +557,6 @@ export function SourcesWorkspace({
               }
               complete={setup.invoiceCount > 0}
               recency={`Last upload ${recencyLabel(setup.lastInvoiceAt, "invoice")}`}
-              nudge={
-                setup.invoiceCount > 0 &&
-                (daysSince(setup.lastInvoiceAt) ?? 99) > 14
-                  ? "Upload recent invoices so prices stay current."
-                  : setup.invoiceCount === 1
-                    ? "A second invoice from the same supplier unlocks price tracking."
-                    : null
-              }
               onClick={() => onNavigate("/invoices")}
             />
             <SourceCard
@@ -572,25 +570,9 @@ export function SourcesWorkspace({
               }
               complete={setup.salesDayCount > 0}
               recency={`Last day ${recencyLabel(setup.lastSalesDate, "sales day")}`}
-              nudge={
-                (daysSince(setup.lastSalesDate) ?? 99) > 7
-                  ? "Add recent sales to keep your weekly brief useful."
-                  : null
-              }
               onClick={() => onNavigate("/sales")}
             />
           </div>
-
-          {error && (
-            <p className="form-error" role="alert">
-              {error}
-            </p>
-          )}
-          {notice && (
-            <p className="success-notice" role="status">
-              {notice}
-            </p>
-          )}
 
           {incomplete ? (
             <div className="setup-finish">
@@ -613,10 +595,41 @@ export function SourcesWorkspace({
               Setup marked complete. Keep adding records here whenever something changes.
             </p>
           )}
+          </>}
+          {error && (
+            <p className="form-error sources-message" role="alert">
+              {error}
+            </p>
+          )}
+          {notice && (
+            <p className="success-notice sources-message" role="status">
+              {notice}
+            </p>
+          )}
         </>
       ) : null}
     </section>
   );
+}
+
+function SetupApproachChoice({ busy, onChoose }: { busy: boolean; onChoose: (approach: "assisted" | "self_service") => Promise<void> }) {
+  return <section className="setup-approach" aria-labelledby="setup-approach-heading">
+    <p className="section-code">Choose how to launch</p>
+    <h2 id="setup-approach-heading">Get your restaurant ready for Parline.</h2>
+    <div className="setup-approach-options">
+      <article className="setup-approach-card setup-approach-recommended">
+        <p className="invoice-status">Recommended</p>
+        <h3>Launch with Parline</h3>
+        <p>Request a setup handoff with the Parline team. We coordinate with you, prepare imports and mappings, and get the first count ready. You authorize accounts and confirm restaurant-specific decisions.</p>
+        <button className="ledger-button" type="button" disabled={busy} onClick={() => void onChoose("assisted")}>{busy ? "Sending request…" : "Request guided setup"}</button>
+      </article>
+      <article className="setup-approach-card">
+        <h3>Set it up myself</h3>
+        <p>Migrate your own records with a guided checklist. You connect or import each source, review mappings, and prepare the first count. Pause anytime or request help later without starting over.</p>
+        <button className="file-button" type="button" disabled={busy} onClick={() => void onChoose("self_service")}>{busy ? "Saving…" : "Use self-service setup"}</button>
+      </article>
+    </div>
+  </section>;
 }
 
 function squareStatusLabel(status: string) {
@@ -643,7 +656,6 @@ function SourceCard({
   countLabel,
   complete,
   recency,
-  nudge,
   onClick,
 }: {
   number: string;
@@ -652,7 +664,6 @@ function SourceCard({
   countLabel: string;
   complete: boolean;
   recency: string;
-  nudge: string | null;
   onClick: () => void;
 }) {
   return (
@@ -662,7 +673,6 @@ function SourceCard({
         <h3>{title}</h3>
         <p>{description}</p>
         <p className="source-recency">{recency}</p>
-        {nudge && <p className="source-nudge">{nudge}</p>}
       </div>
       <button className={complete ? "text-button" : "file-button"} type="button" onClick={onClick}>
         {countLabel}

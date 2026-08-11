@@ -852,6 +852,7 @@ async fn inventory_backend_import_and_order_guide_loop() {
         Some(json!({
             "posSystem": "  Toast  ",
             "accountingSystem": "QuickBooks Online",
+            "setupApproach": "assisted",
             "markComplete": true
         })),
     )
@@ -859,7 +860,25 @@ async fn inventory_backend_import_and_order_guide_loop() {
     assert_eq!(setup.status, StatusCode::OK);
     assert_eq!(setup.body["posSystem"], "Toast");
     assert_eq!(setup.body["accountingSystem"], "QuickBooks Online");
+    assert_eq!(setup.body["setupApproach"], "assisted");
+    assert!(!setup.body["setupAssistanceRequestedAt"].is_null());
     assert!(!setup.body["completedAt"].is_null());
+    let self_service = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        "/v1/migration-setup",
+        Some(json!({
+            "posSystem": "Toast",
+            "accountingSystem": "QuickBooks Online",
+            "setupApproach": "self_service",
+            "markComplete": false
+        })),
+    )
+    .await;
+    assert_eq!(self_service.status, StatusCode::OK);
+    assert_eq!(self_service.body["setupApproach"], "self_service");
+    assert!(self_service.body["setupAssistanceRequestedAt"].is_null());
     let other_setup = request(
         fixture.app.clone(),
         Some(&other),

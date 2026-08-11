@@ -65,6 +65,8 @@ struct Restaurant {
     id: uuid::Uuid,
     name: String,
     city: String,
+    region: Option<String>,
+    country: Option<String>,
     service_style: String,
     timezone: String,
     role: String,
@@ -80,7 +82,11 @@ struct MeResponse {
 struct CreateRestaurant {
     name: String,
     city: String,
+    region: Option<String>,
+    country: Option<String>,
     service_style: String,
+    #[serde(default = "default_timezone")]
+    timezone: String,
     pos_system: Option<String>,
     accounting_system: Option<String>,
 }
@@ -90,6 +96,8 @@ struct CreateRestaurant {
 struct MigrationSetup {
     pos_system: Option<String>,
     accounting_system: Option<String>,
+    setup_approach: Option<String>,
+    setup_assistance_requested_at: Option<chrono::DateTime<chrono::Utc>>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
     inventory_item_count: i64,
     menu_item_count: i64,
@@ -106,12 +114,17 @@ struct MigrationSetup {
 struct UpdateMigrationSetup {
     pos_system: Option<String>,
     accounting_system: Option<String>,
+    setup_approach: Option<String>,
     mark_complete: bool,
 }
 
 #[derive(Serialize)]
 struct ErrorBody {
     error: &'static str,
+}
+
+fn default_timezone() -> String {
+    "America/Chicago".to_owned()
 }
 
 #[derive(Debug)]
@@ -365,7 +378,7 @@ async fn me(
 ) -> Result<Json<MeResponse>, ApiError> {
     let subject = authenticated_subject(&state, &headers).await?;
     let mut restaurant = sqlx::query_as::<_, Restaurant>(
-        "SELECT r.id, r.name, r.city, r.service_style, r.timezone, m.role
+        "SELECT r.id, r.name, r.city, r.region, r.country, r.service_style, r.timezone, m.role
          FROM users u JOIN restaurant_memberships m ON m.user_id = u.id
          JOIN restaurants r ON r.id = m.restaurant_id WHERE u.auth_subject = $1",
     )
@@ -381,7 +394,7 @@ async fn me(
     if restaurant.is_none() {
         reconcile_invitation(&state, &subject).await?;
         restaurant = sqlx::query_as::<_, Restaurant>(
-            "SELECT r.id,r.name,r.city,r.service_style,r.timezone,m.role
+            "SELECT r.id,r.name,r.city,r.region,r.country,r.service_style,r.timezone,m.role
              FROM users u JOIN restaurant_memberships m ON m.user_id=u.id
              JOIN restaurants r ON r.id=m.restaurant_id WHERE u.auth_subject=$1",
         )
@@ -423,11 +436,17 @@ async fn update_migration_setup(
     }
     sqlx::query(
         "UPDATE restaurants SET pos_system=$1,accounting_system=$2,
-         migration_setup_completed_at=CASE WHEN $3 THEN COALESCE(migration_setup_completed_at,NOW()) ELSE migration_setup_completed_at END,
-         updated_at=NOW() WHERE id=$4",
+         setup_approach=COALESCE($3,setup_approach),
+         setup_assistance_requested_at=CASE
+           WHEN $3='assisted' THEN COALESCE(setup_assistance_requested_at,NOW())
+           WHEN $3='self_service' THEN NULL
+           ELSE setup_assistance_requested_at END,
+         migration_setup_completed_at=CASE WHEN $4 THEN COALESCE(migration_setup_completed_at,NOW()) ELSE migration_setup_completed_at END,
+         updated_at=NOW() WHERE id=$5",
     )
     .bind(input.pos_system)
     .bind(input.accounting_system)
+    .bind(input.setup_approach)
     .bind(input.mark_complete)
     .bind(restaurant_id)
     .execute(&state.pool)
@@ -460,7 +479,8 @@ async fn load_migration_setup(
     restaurant_id: uuid::Uuid,
 ) -> Result<MigrationSetup, ApiError> {
     sqlx::query_as(
-        "SELECT r.pos_system,r.accounting_system,r.migration_setup_completed_at completed_at,
+        "SELECT r.pos_system,r.accounting_system,r.setup_approach,r.setup_assistance_requested_at,
+         r.migration_setup_completed_at completed_at,
          (SELECT COUNT(*) FROM inventory_items WHERE restaurant_id=r.id) inventory_item_count,
          (SELECT COUNT(*) FROM menu_items WHERE restaurant_id=r.id) menu_item_count,
          (SELECT COUNT(*) FROM invoices WHERE restaurant_id=r.id) invoice_count,
@@ -640,13 +660,16 @@ async fn create_restaurant(
     .map_err(database_error)?;
     let restaurant_id = uuid::Uuid::now_v7();
     let timezone = sqlx::query_scalar::<_, String>(
-        "INSERT INTO restaurants (id, name, city, service_style, pos_system, accounting_system) VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO restaurants (id, name, city, region, country, service_style, timezone, pos_system, accounting_system) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING timezone",
     )
     .bind(restaurant_id)
     .bind(&input.name)
     .bind(&input.city)
+    .bind(&input.region)
+    .bind(&input.country)
     .bind(&input.service_style)
+    .bind(&input.timezone)
     .bind(&input.pos_system)
     .bind(&input.accounting_system)
     .fetch_one(&mut *tx)
@@ -669,6 +692,8 @@ async fn create_restaurant(
             id: restaurant_id,
             name: input.name,
             city: input.city,
+            region: input.region,
+            country: input.country,
             service_style: input.service_style,
             timezone,
             role: "owner".into(),
@@ -703,7 +728,16 @@ impl CreateRestaurant {
     fn validated(mut self) -> Result<Self, ApiError> {
         self.name = self.name.trim().to_owned();
         self.city = self.city.trim().to_owned();
+        self.region = self
+            .region
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        self.country = self
+            .country
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         self.service_style = self.service_style.trim().to_owned();
+        self.timezone = self.timezone.trim().to_owned();
         self.pos_system = optional_tool(self.pos_system)?;
         self.accounting_system = optional_tool(self.accounting_system)?;
         if self.name.is_empty() || self.name.chars().count() > 50 {
@@ -712,10 +746,30 @@ impl CreateRestaurant {
                 "Restaurant name must be between 1 and 50 characters.",
             ));
         }
-        if self.city.is_empty() || self.city.chars().count() > 50 {
+        if self.city.is_empty() || self.city.chars().count() > 100 {
             return Err(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "City must be between 1 and 50 characters.",
+                "City must be between 1 and 100 characters.",
+            ));
+        }
+        if self
+            .region
+            .as_ref()
+            .is_some_and(|region| region.chars().count() > 100)
+        {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "State or region must be at most 100 characters.",
+            ));
+        }
+        if self
+            .country
+            .as_ref()
+            .is_some_and(|country| country.chars().count() > 100)
+        {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Country must be at most 100 characters.",
             ));
         }
         if !matches!(
@@ -727,6 +781,13 @@ impl CreateRestaurant {
                 "Choose a listed service style.",
             ));
         }
+        let timezone = self.timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Choose a valid restaurant timezone.",
+            )
+        })?;
+        self.timezone = timezone.name().to_owned();
         Ok(self)
     }
 }
@@ -735,8 +796,23 @@ impl UpdateMigrationSetup {
     fn validated(mut self) -> Result<Self, ApiError> {
         self.pos_system = optional_tool(self.pos_system)?;
         self.accounting_system = optional_tool(self.accounting_system)?;
+        self.setup_approach = optional_setup_approach(self.setup_approach)?;
         Ok(self)
     }
+}
+
+fn optional_setup_approach(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let value = value.map(|value| value.trim().to_owned());
+    if value
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "assisted" | "self_service"))
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Choose assisted or self-service setup.",
+        ));
+    }
+    Ok(value)
 }
 
 fn optional_tool(value: Option<String>) -> Result<Option<String>, ApiError> {
@@ -820,7 +896,10 @@ mod tests {
         CreateRestaurant {
             name: name.into(),
             city: city.into(),
+            region: Some("Texas".into()),
+            country: Some("United States".into()),
             service_style: style.into(),
+            timezone: "America/Chicago".into(),
             pos_system: None,
             accounting_system: None,
         }
@@ -833,6 +912,8 @@ mod tests {
             .unwrap();
         assert_eq!(value.name, "Marigold");
         assert_eq!(value.city, "Dallas");
+        assert_eq!(value.region.as_deref(), Some("Texas"));
+        assert_eq!(value.country.as_deref(), Some("United States"));
     }
 
     #[test]
@@ -851,5 +932,10 @@ mod tests {
         assert!(input(" ", "Dallas", "bar").validated().is_err());
         assert!(input("Cafe", &"x".repeat(101), "bar").validated().is_err());
         assert!(input("Cafe", "Dallas", "other").validated().is_err());
+        let mut value = input("Cafe", "Dallas", "bar");
+        value.timezone = "Central Time".into();
+        assert!(value.validated().is_err());
+        assert!(optional_setup_approach(Some("assisted".into())).is_ok());
+        assert!(optional_setup_approach(Some("automatic".into())).is_err());
     }
 }

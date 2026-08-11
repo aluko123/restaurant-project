@@ -1,7 +1,8 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { useAuth } from "@workos-inc/authkit-react";
+import { LocationPicker } from "./CityInput";
 import { SalesWorkspace, type ApiRequest } from "./SalesWorkspace";
-import { SettingsWorkspace, type SettingsRestaurant } from "./SettingsWorkspace";
+import { SettingsWorkspace, availableTimezones, type SettingsRestaurant } from "./SettingsWorkspace";
 import { TodayWorkspace } from "./TodayWorkspace";
 import { WeeklyBriefWorkspace } from "./WeeklyBriefWorkspace";
 import { InventoryWorkspace, type InventoryItem } from "./InventoryWorkspace";
@@ -189,14 +190,9 @@ function AuthenticatedApp() {
         if (cancelled) return;
         const incomplete = !setup.completedAt;
         setSetupIncomplete(incomplete);
-        const path = window.location.pathname;
-        if (incomplete && (path === "/" || path === "/today" || path === "")) {
-          window.history.replaceState({}, "", "/sources");
-          setWorkspace("sources");
-        }
       })
       .catch(() => {
-        if (!cancelled) setSetupIncomplete(false);
+        if (!cancelled) setSetupIncomplete(null);
       });
     return () => {
       cancelled = true;
@@ -232,7 +228,12 @@ function AuthenticatedApp() {
   if (appState.status === "loading") return <StatusPage message="Opening Parline…" />;
   if (appState.status === "error") return <ErrorPage message={appState.message} onRetry={loadApp} onSignOut={handleSignOut} />;
   if (!appState.restaurant) {
-    return <Onboarding onSignOut={handleSignOut} onCreate={(input) => request<Restaurant>("/v1/restaurants", { method: "POST", body: JSON.stringify(input) }).then((restaurant) => setAppState({ status: "ready", restaurant }))} />;
+    return <Onboarding onSignOut={handleSignOut} onCreate={(input) => request<Restaurant>("/v1/restaurants", { method: "POST", body: JSON.stringify(input) }).then((restaurant) => {
+      setAppState({ status: "ready", restaurant });
+      setSetupIncomplete(true);
+      window.history.replaceState({}, "", "/sources");
+      setWorkspace("sources");
+    })} />;
   }
 
   const restaurant = appState.restaurant;
@@ -251,7 +252,7 @@ function AuthenticatedApp() {
         <button type="button" aria-current={workspace === "losses" ? "page" : undefined} onClick={() => openWorkspace("losses")}>Losses</button>
         <button type="button" aria-current={workspace === "settings" ? "page" : undefined} onClick={() => openWorkspace("settings")}>Settings</button>
       </nav>
-      <div hidden={workspace !== "today"}><TodayWorkspace request={request} active={workspace === "today"} canManageInvoices={restaurant.role !== "staff"} onNavigate={openTarget} /></div>
+      <div hidden={workspace !== "today"}><TodayWorkspace request={request} active={workspace === "today"} canManageInvoices={restaurant.role !== "staff"} setupIncomplete={setupIncomplete === true} onNavigate={openTarget} /></div>
       {restaurant.role !== "staff" && (
         <div hidden={workspace !== "sources"}>
           <SourcesWorkspace
@@ -783,7 +784,7 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
   const invoiceFiltersActive = invoiceSearch.trim() !== "" || invoiceStatus !== "action" || invoicePeriod !== "90";
 
   return <section className="invoice-workspace" aria-labelledby="invoices-heading">
-    <header className="invoice-heading"><h1 id="invoices-heading">Invoices</h1><p>{restaurant.name} · {restaurant.city} · {formatServiceStyle(restaurant.serviceStyle)}</p></header>
+    <header className="invoice-heading"><h1 id="invoices-heading">Invoices</h1><p>{restaurant.name} · {[restaurant.city, restaurant.region, restaurant.country].filter(Boolean).join(", ")} · {formatServiceStyle(restaurant.serviceStyle)}</p></header>
     <div className="invoice-grid">
       <form className="invoice-form" onSubmit={upload} noValidate>
         <h2>Upload an invoice</h2>
@@ -876,20 +877,21 @@ function formatBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.max(1
 function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`)); }
 function formatMoney(value:string,currency:string){return new Intl.NumberFormat(undefined,{style:"currency",currency}).format(Number(value));}
 
-function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string; city: string; serviceStyle: ServiceStyle; posSystem: string | null; accountingSystem: string | null }) => Promise<void>; onSignOut: () => void }) {
+function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string; city: string; region: string; country: string; serviceStyle: ServiceStyle; timezone: string }) => Promise<void>; onSignOut: () => void }) {
   const [name, setName] = useState("");
   const [city, setCity] = useState("");
+  const [region, setRegion] = useState("");
+  const [country, setCountry] = useState("");
   const [serviceStyle, setServiceStyle] = useState<ServiceStyle>("fast_casual");
-  const [posSystem, setPosSystem] = useState("");
-  const [accountingSystem, setAccountingSystem] = useState("");
+  const [timezone, setTimezone] = useState(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!name.trim() || !city.trim()) { setError("Add your restaurant name and city to continue."); return; }
+    if (!name.trim() || !city.trim() || !region.trim() || !country.trim()) { setError("Add your restaurant name and location to continue."); return; }
     setSubmitting(true); setError("");
-    try { await onCreate({ name, city, serviceStyle, posSystem:posSystem.trim()||null, accountingSystem:accountingSystem.trim()||null }); }
+    try { await onCreate({ name, city, region, country, serviceStyle, timezone }); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "We couldn't open Parline. Please try again."); setSubmitting(false); }
   }
 
@@ -898,12 +900,12 @@ function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string;
     <section className="onboarding-shell" aria-labelledby="onboarding-heading">
       <p className="section-code">First step</p>
       <h1 id="onboarding-heading">Tell us about <em>your restaurant.</em></h1>
-      <p className="brief-intro">Add three basic details now. Next, upload a supplier invoice or complete an inventory count to create your first Today actions.</p>
+      <p className="brief-intro">Add the basics now. Next, choose whether you want Parline to prepare your records or guide you through setup.</p>
       <form className="onboarding-form" onSubmit={submit} noValidate>
         <div className="ledger-field"><label htmlFor="restaurant-name">Restaurant name</label><p id="name-help">Use the name your crew knows.</p><input id="restaurant-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={120} autoComplete="organization" aria-describedby="name-help form-error" required /></div>
-        <div className="ledger-field"><label htmlFor="city">City</label><p id="city-help">The city for this first location.</p><input id="city" value={city} onChange={(event) => setCity(event.target.value)} maxLength={100} autoComplete="address-level2" aria-describedby="city-help form-error" required /></div>
+        <LocationPicker id="restaurant-location" className="ledger-field" city={city} region={region} country={country} onChange={location => { setCity(location.city); setRegion(location.region); setCountry(location.country); }} />
         <div className="ledger-field"><label htmlFor="service-style">Service style</label><p id="style-help">Choose the closest fit. You can keep setup simple.</p><select id="service-style" value={serviceStyle} onChange={(event) => setServiceStyle(event.target.value as ServiceStyle)} aria-describedby="style-help form-error">{serviceStyles.map((style) => <option key={style.value} value={style.value}>{style.label}</option>)}</select></div>
-        <fieldset className="onboarding-tools"><legend>Tools you already use <span>Optional</span></legend><p>This helps Parline show the right import path — or connect it for you later. Nothing is replaced.</p><div className="ledger-field"><label htmlFor="pos-system">POS or ordering system</label><select id="pos-system" value={posSystem} onChange={event=>setPosSystem(event.target.value)}><option value="">Not set</option><option value="Toast">Toast</option><option value="Square">Square</option><option value="Clover">Clover</option><option value="Lightspeed">Lightspeed</option><option value="SpotOn">SpotOn</option><option value="TouchBistro">TouchBistro</option><option value="Revel">Revel</option>{posSystem&&!["Toast","Square","Clover","Lightspeed","SpotOn","TouchBistro","Revel"].includes(posSystem)&&<option value={posSystem}>{posSystem}</option>}</select></div><div className="ledger-field"><label htmlFor="accounting-system">Accounting system</label><select id="accounting-system" value={accountingSystem} onChange={event=>setAccountingSystem(event.target.value)}><option value="">Not set</option><option value="QuickBooks Online">QuickBooks Online</option><option value="QuickBooks Desktop">QuickBooks Desktop</option><option value="Xero">Xero</option><option value="FreshBooks">FreshBooks</option><option value="Spreadsheet or bookkeeper">Spreadsheet or bookkeeper</option>{accountingSystem&&!["QuickBooks Online","QuickBooks Desktop","Xero","FreshBooks","Spreadsheet or bookkeeper"].includes(accountingSystem)&&<option value={accountingSystem}>{accountingSystem}</option>}</select></div></fieldset>
+        <div className="ledger-field"><label htmlFor="restaurant-timezone">Timezone</label><p id="timezone-help">Used for Today, count cadence, and weekly reporting.</p><select id="restaurant-timezone" value={timezone} onChange={event=>setTimezone(event.target.value)} aria-describedby="timezone-help form-error" required>{availableTimezones(timezone).map(value=><option key={value} value={value}>{value.replaceAll("_", " ")}</option>)}</select></div>
         {error && <p className="form-error" id="form-error" role="alert">{error}</p>}
         <button className="ledger-button" type="submit" disabled={submitting}>{submitting ? "Creating restaurant…" : "Create restaurant"}<span aria-hidden="true">→</span></button>
       </form>

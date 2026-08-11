@@ -80,16 +80,20 @@ impl SquareConfig {
     }
 
     fn scopes(&self) -> &'static str {
-        // ITEMS_WRITE/ORDERS_WRITE: sandbox seeding + future catalog fixes.
-        // Sync itself only needs the READ scopes.
-        "ITEMS_READ ITEMS_WRITE ORDERS_READ ORDERS_WRITE PAYMENTS_WRITE MERCHANT_PROFILE_READ"
+        if self.environment.eq_ignore_ascii_case("production") {
+            "ITEMS_READ ORDERS_READ MERCHANT_PROFILE_READ"
+        } else {
+            // Sandbox keeps write scopes for local seed tooling. Production sync is read-only.
+            "ITEMS_READ ITEMS_WRITE ORDERS_READ ORDERS_WRITE PAYMENTS_WRITE MERCHANT_PROFILE_READ"
+        }
     }
 }
 
 fn token_key_from_env() -> Result<[u8; 32], ()> {
-    let raw = std::env::var("CONNECTIONS_TOKEN_KEY")
-        .or_else(|_| std::env::var("SQUARE_APPLICATION_SECRET"))
-        .map_err(|_| ())?;
+    let raw = std::env::var("CONNECTIONS_TOKEN_KEY").map_err(|_| ())?;
+    if raw.trim().is_empty() {
+        return Err(());
+    }
     let hash = Sha256::digest(raw.as_bytes());
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash);
@@ -99,7 +103,7 @@ fn token_key_from_env() -> Result<[u8; 32], ()> {
 fn encrypt_secret(key: &[u8; 32], plain: &str) -> Result<String, ApiError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| encrypt_error())?;
     let mut nonce_bytes = [0u8; 12];
-    getrandom_nonce(&mut nonce_bytes);
+    getrandom::getrandom(&mut nonce_bytes).map_err(|_| encrypt_error())?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let encrypted = cipher
         .encrypt(nonce, plain.as_bytes())
@@ -128,12 +132,6 @@ fn encrypt_error() -> ApiError {
         StatusCode::INTERNAL_SERVER_ERROR,
         "We couldn't secure the connection. Please try again.",
     )
-}
-
-fn getrandom_nonce(buf: &mut [u8; 12]) {
-    for byte in buf.iter_mut() {
-        *byte = fastrand::u8(..);
-    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -547,6 +545,7 @@ pub(crate) async fn disconnect(
 ) -> Result<StatusCode, ApiError> {
     let m = member(&state, &headers).await?;
     manager(&m)?;
+    let mut tx = state.pool.begin().await.map_err(database_error)?;
     let n = sqlx::query(
         "UPDATE source_connections
          SET status='disconnected',
@@ -558,16 +557,33 @@ pub(crate) async fn disconnect(
     )
     .bind(m.restaurant_id)
     .bind(PROVIDER)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(database_error)?
     .rows_affected();
     if n == 0 {
+        tx.rollback().await.map_err(database_error)?;
         return Err(ApiError(
             StatusCode::NOT_FOUND,
             "No Square connection to disconnect.",
         ));
     }
+    sqlx::query(
+        "UPDATE source_sync_runs run
+         SET status='failed',error='Square was disconnected before this sync started.',
+             finished_at=NOW()
+         FROM source_connections connection
+         WHERE run.connection_id=connection.id
+           AND run.restaurant_id=connection.restaurant_id
+           AND connection.restaurant_id=$1 AND connection.provider=$2
+           AND run.status='queued'",
+    )
+    .bind(m.restaurant_id)
+    .bind(PROVIDER)
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    tx.commit().await.map_err(database_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -620,9 +636,13 @@ pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>) {
 async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let job = sqlx::query_as::<_, SyncJob>(
-        "SELECT id,connection_id,restaurant_id,kind FROM source_sync_runs
-         WHERE status='queued'
-         ORDER BY created_at
+        "SELECT run.id,run.connection_id,run.restaurant_id,run.kind
+         FROM source_sync_runs run
+         JOIN source_connections connection
+           ON connection.id=run.connection_id AND connection.restaurant_id=run.restaurant_id
+         WHERE run.status='queued' AND connection.provider='square'
+           AND connection.status<>'disconnected'
+         ORDER BY run.created_at
          FOR UPDATE SKIP LOCKED
          LIMIT 1",
     )
@@ -636,10 +656,14 @@ async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
         .bind(job.id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE source_connections SET status='syncing',updated_at=NOW() WHERE id=$1")
-        .bind(job.connection_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE source_connections SET status='syncing',updated_at=NOW()
+         WHERE id=$1 AND restaurant_id=$2 AND status<>'disconnected'",
+    )
+    .bind(job.connection_id)
+    .bind(job.restaurant_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(Some(job))
 }
@@ -648,9 +672,10 @@ async fn process_job(pool: &PgPool, config: &SquareConfig, job: SyncJob) -> Resu
     let connection = sqlx::query_as::<_, ConnectionRow>(
         "SELECT id,restaurant_id,status,external_location_id,access_token_encrypted,
                 refresh_token_encrypted,access_token_expires_at,last_success_at
-         FROM source_connections WHERE id=$1",
+         FROM source_connections WHERE id=$1 AND restaurant_id=$2 AND provider='square'",
     )
     .bind(job.connection_id)
+    .bind(job.restaurant_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?
@@ -679,9 +704,10 @@ async fn process_job(pool: &PgPool, config: &SquareConfig, job: SyncJob) -> Resu
                 "UPDATE source_connections
                  SET status='connected',last_sync_at=NOW(),last_success_at=NOW(),
                      last_error=NULL,updated_at=NOW()
-                 WHERE id=$1",
+                 WHERE id=$1 AND restaurant_id=$2 AND status<>'disconnected'",
             )
             .bind(job.connection_id)
+            .bind(job.restaurant_id)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
@@ -705,11 +731,12 @@ async fn process_job(pool: &PgPool, config: &SquareConfig, job: SyncJob) -> Resu
             sqlx::query(
                 "UPDATE source_connections
                  SET status=$2,last_sync_at=NOW(),last_error=$3,updated_at=NOW()
-                 WHERE id=$1",
+                 WHERE id=$1 AND restaurant_id=$4 AND status<>'disconnected'",
             )
             .bind(job.connection_id)
             .bind(status)
             .bind(&message)
+            .bind(job.restaurant_id)
             .execute(pool)
             .await
             .ok();
@@ -1351,6 +1378,25 @@ mod tests {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&key);
         let enc = encrypt_secret(&arr, "square-token").unwrap();
+        let next = encrypt_secret(&arr, "square-token").unwrap();
         assert_eq!(decrypt_secret(&arr, &enc).unwrap(), "square-token");
+        assert_ne!(enc, next);
+    }
+
+    #[test]
+    fn production_oauth_is_read_only() {
+        let config = SquareConfig {
+            application_id: "app".into(),
+            application_secret: "secret".into(),
+            environment: "production".into(),
+            redirect_uri: "https://example.com/callback".into(),
+            token_key: [1; 32],
+            web_origin: "https://example.com".into(),
+        };
+        assert_eq!(
+            config.scopes(),
+            "ITEMS_READ ORDERS_READ MERCHANT_PROFILE_READ"
+        );
+        assert!(!config.scopes().contains("WRITE"));
     }
 }
