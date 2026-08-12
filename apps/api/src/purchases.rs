@@ -82,6 +82,7 @@ pub(crate) struct PendingLine {
     unit_price: Option<String>,
     line_total: Option<String>,
     can_track: bool,
+    suggested_action: Option<&'static str>,
     suggested_inventory_item_id: Option<Uuid>,
     suggested_conversion: Option<String>,
 }
@@ -213,8 +214,10 @@ pub(crate) async fn review(
                 unit_price: line.unit_price.as_ref().map(ToString::to_string),
                 line_total: line.line_total.as_ref().map(ToString::to_string),
                 can_track,
-                suggested_inventory_item_id: suggestion.map(|value| value.0),
-                suggested_conversion: suggestion.map(|value| value.1.to_string()),
+                suggested_action: suggestion.map(|value| value.action),
+                suggested_inventory_item_id: suggestion.and_then(|value| value.inventory_item_id),
+                suggested_conversion: suggestion
+                    .and_then(|value| value.conversion.as_ref().map(ToString::to_string)),
             }
         })
         .collect();
@@ -254,6 +257,12 @@ pub(crate) async fn record(
     }
 
     let source_lines = load_source_lines(&mut *tx, id).await?;
+    if source_lines.is_empty() {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "This approved invoice has no line items to record.",
+        ));
+    }
     let mut decisions = HashMap::new();
     for resolution in input.resolutions {
         if decisions
@@ -266,15 +275,43 @@ pub(crate) async fn record(
             ));
         }
     }
-    if decisions.len() != source_lines.len()
-        || source_lines
-            .iter()
-            .any(|line| !decisions.contains_key(&line.id))
+    if decisions
+        .keys()
+        .any(|id| !source_lines.iter().any(|line| line.id == *id))
     {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Choose one action for every invoice line.",
         ));
+    }
+    let saved = load_locked_suggestions(&mut tx, &invoice, &source_lines).await?;
+    for source in &source_lines {
+        if decisions.contains_key(&source.id) {
+            continue;
+        }
+        let suggestion = saved.get(&source.id).ok_or(ApiError(
+            StatusCode::CONFLICT,
+            "A saved line choice changed. Review this invoice and try again.",
+        ))?;
+        decisions.insert(
+            source.id,
+            match suggestion.action {
+                "ignore" => DecisionInput::Ignore,
+                "match" => DecisionInput::Match {
+                    inventory_item_id: suggestion.inventory_item_id.expect("saved match item"),
+                    expected_count_unit: suggestion
+                        .count_unit
+                        .clone()
+                        .expect("saved match count unit"),
+                    conversion: suggestion
+                        .conversion
+                        .as_ref()
+                        .expect("saved match conversion")
+                        .to_string(),
+                },
+                _ => unreachable!("known suggestion action"),
+            },
+        );
     }
 
     let mut matched_ids = decisions
@@ -425,7 +462,7 @@ pub(crate) async fn record(
         insert_receipt_line(&mut tx, &invoice, &line).await?;
         resolved.push(line);
     }
-    save_mappings(&mut tx, &invoice, member.user_id, &resolved).await?;
+    save_resolutions(&mut tx, &invoice, member.user_id, &resolved).await?;
     tx.commit().await.map_err(database_error)?;
 
     let receipt = load_receipt(&state.pool, invoice.id, invoice.restaurant_id)
@@ -488,14 +525,16 @@ async fn load_suggestions<'e, E>(
     executor: E,
     invoice: &InvoiceHeader,
     lines: &[SourceLine],
-) -> Result<HashMap<Uuid, (Uuid, BigDecimal)>, ApiError>
+) -> Result<HashMap<Uuid, Suggestion>, ApiError>
 where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    E: sqlx::Executor<'e, Database = sqlx::Postgres> + Copy,
 {
     let mut counts = HashMap::new();
     for line in lines {
-        if let (Some(key), Some(unit)) = (&line.comparison_key, &line.comparison_unit) {
-            *counts.entry((key.clone(), unit.clone())).or_insert(0usize) += 1;
+        if let Some(key) = &line.comparison_key {
+            *counts
+                .entry((key.clone(), comparison_unit(line).to_owned()))
+                .or_insert(0usize) += 1;
         }
     }
     let rows = sqlx::query_as::<_, (String, String, Uuid, BigDecimal)>(
@@ -515,18 +554,136 @@ where
         .into_iter()
         .map(|(key, unit, item, conversion)| ((key, unit), (item, conversion)))
         .collect::<HashMap<_, _>>();
+    let ignores = sqlx::query_as::<_, (String, String)>(
+        "SELECT comparison_key,comparison_unit FROM supplier_line_ignores
+         WHERE restaurant_id=$1 AND supplier_key=$2",
+    )
+    .bind(invoice.restaurant_id)
+    .bind(&invoice.supplier_key)
+    .fetch_all(executor)
+    .await
+    .map_err(database_error)?
+    .into_iter()
+    .collect::<HashSet<_>>();
     Ok(lines
         .iter()
         .filter_map(|line| {
-            let identity = (line.comparison_key.clone()?, line.comparison_unit.clone()?);
+            let identity = (
+                line.comparison_key.clone()?,
+                comparison_unit(line).to_owned(),
+            );
             (counts.get(&identity) == Some(&1)).then(|| {
-                mappings
-                    .get(&identity)
-                    .cloned()
-                    .map(|value| (line.id, value))
+                match (mappings.get(&identity), ignores.contains(&identity)) {
+                    (Some((item, conversion)), false) => Some((
+                        line.id,
+                        Suggestion {
+                            action: "match",
+                            inventory_item_id: Some(*item),
+                            count_unit: None,
+                            conversion: Some(conversion.clone()),
+                        },
+                    )),
+                    (None, true) => Some((
+                        line.id,
+                        Suggestion {
+                            action: "ignore",
+                            inventory_item_id: None,
+                            count_unit: None,
+                            conversion: None,
+                        },
+                    )),
+                    _ => None,
+                }
             })?
         })
         .collect())
+}
+
+struct Suggestion {
+    action: &'static str,
+    inventory_item_id: Option<Uuid>,
+    count_unit: Option<String>,
+    conversion: Option<BigDecimal>,
+}
+
+async fn load_locked_suggestions(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    invoice: &InvoiceHeader,
+    lines: &[SourceLine],
+) -> Result<HashMap<Uuid, Suggestion>, ApiError> {
+    let mut counts = HashMap::new();
+    for line in lines {
+        if let Some(key) = &line.comparison_key {
+            *counts
+                .entry((key.clone(), comparison_unit(line).to_owned()))
+                .or_insert(0usize) += 1;
+        }
+    }
+    let mappings = sqlx::query_as::<_, (String, String, Uuid, String, BigDecimal)>(
+        "SELECT mapping.comparison_key,mapping.comparison_unit,mapping.inventory_item_id,
+                item.count_unit,mapping.count_units_per_purchase_unit
+         FROM supplier_product_mappings mapping
+         JOIN inventory_items item ON item.id=mapping.inventory_item_id
+           AND item.restaurant_id=mapping.restaurant_id AND item.active
+         WHERE mapping.restaurant_id=$1 AND mapping.supplier_key=$2
+         FOR UPDATE OF mapping,item",
+    )
+    .bind(invoice.restaurant_id)
+    .bind(&invoice.supplier_key)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_error)?
+    .into_iter()
+    .map(|(key, unit, item, count_unit, conversion)| ((key, unit), (item, count_unit, conversion)))
+    .collect::<HashMap<_, _>>();
+    let ignores = sqlx::query_as::<_, (String, String)>(
+        "SELECT comparison_key,comparison_unit FROM supplier_line_ignores
+         WHERE restaurant_id=$1 AND supplier_key=$2 FOR UPDATE",
+    )
+    .bind(invoice.restaurant_id)
+    .bind(&invoice.supplier_key)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_error)?
+    .into_iter()
+    .collect::<HashSet<_>>();
+    Ok(lines
+        .iter()
+        .filter_map(|line| {
+            let identity = (
+                line.comparison_key.clone()?,
+                comparison_unit(line).to_owned(),
+            );
+            if counts.get(&identity) != Some(&1) {
+                return None;
+            }
+            match (mappings.get(&identity), ignores.contains(&identity)) {
+                (Some((item, count_unit, conversion)), false) => Some((
+                    line.id,
+                    Suggestion {
+                        action: "match",
+                        inventory_item_id: Some(*item),
+                        count_unit: Some(count_unit.clone()),
+                        conversion: Some(conversion.clone()),
+                    },
+                )),
+                (None, true) => Some((
+                    line.id,
+                    Suggestion {
+                        action: "ignore",
+                        inventory_item_id: None,
+                        count_unit: None,
+                        conversion: None,
+                    },
+                )),
+                _ => None,
+            }
+        })
+        .collect())
+}
+
+fn comparison_unit(line: &SourceLine) -> &str {
+    line.comparison_unit.as_deref().unwrap_or("")
 }
 
 async fn create_inventory_item(
@@ -584,7 +741,7 @@ async fn insert_receipt_line(
     Ok(())
 }
 
-async fn save_mappings(
+async fn save_resolutions(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     invoice: &InvoiceHeader,
     user_id: Uuid,
@@ -592,18 +749,18 @@ async fn save_mappings(
 ) -> Result<(), ApiError> {
     let mut counts = HashMap::new();
     for line in lines {
-        if let (Some(key), Some(unit)) = (&line.source.comparison_key, &line.source.comparison_unit)
-        {
-            *counts.entry((key.clone(), unit.clone())).or_insert(0usize) += 1;
+        if let Some(key) = &line.source.comparison_key {
+            *counts
+                .entry((key.clone(), comparison_unit(&line.source).to_owned()))
+                .or_insert(0usize) += 1;
         }
     }
     let mut eligible = lines
         .iter()
-        .filter(|line| line.resolution != "ignored")
         .filter_map(|line| {
             let key = line.source.comparison_key.as_ref()?;
-            let unit = line.source.comparison_unit.as_ref()?;
-            (counts.get(&(key.clone(), unit.clone())) == Some(&1)).then_some((key, unit, line))
+            let unit = comparison_unit(&line.source);
+            (counts.get(&(key.clone(), unit.to_owned())) == Some(&1)).then_some((key, unit, line))
         })
         .collect::<Vec<_>>();
     eligible.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
@@ -615,6 +772,50 @@ async fn save_mappings(
     )
     .await?;
     for (key, unit, line) in eligible {
+        if line.resolution == "ignored" {
+            sqlx::query(
+                "DELETE FROM supplier_product_mappings
+                 WHERE restaurant_id=$1 AND supplier_key=$2 AND comparison_key=$3
+                   AND comparison_unit=$4",
+            )
+            .bind(invoice.restaurant_id)
+            .bind(&invoice.supplier_key)
+            .bind(key)
+            .bind(unit)
+            .execute(&mut **tx)
+            .await
+            .map_err(database_error)?;
+            sqlx::query(
+                "INSERT INTO supplier_line_ignores
+                 (id,restaurant_id,supplier_key,comparison_key,comparison_unit,created_by)
+                 VALUES($1,$2,$3,$4,$5,$6)
+                 ON CONFLICT (restaurant_id,supplier_key,comparison_key,comparison_unit)
+                 DO UPDATE SET updated_at=NOW()",
+            )
+            .bind(Uuid::now_v7())
+            .bind(invoice.restaurant_id)
+            .bind(&invoice.supplier_key)
+            .bind(key)
+            .bind(unit)
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(database_error)?;
+            continue;
+        }
+        // A match or create intentionally replaces a previously learned ignore.
+        sqlx::query(
+            "DELETE FROM supplier_line_ignores
+             WHERE restaurant_id=$1 AND supplier_key=$2 AND comparison_key=$3
+               AND comparison_unit=$4",
+        )
+        .bind(invoice.restaurant_id)
+        .bind(&invoice.supplier_key)
+        .bind(key)
+        .bind(unit)
+        .execute(&mut **tx)
+        .await
+        .map_err(database_error)?;
         sqlx::query(
             "INSERT INTO supplier_product_mappings
              (id,restaurant_id,supplier_name,supplier_key,comparison_key,comparison_unit,

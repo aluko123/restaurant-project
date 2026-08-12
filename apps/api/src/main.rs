@@ -11,6 +11,7 @@ mod order_guides;
 mod purchases;
 mod sales;
 mod settings;
+mod setup;
 mod square;
 mod storage;
 mod suppliers;
@@ -234,6 +235,15 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             "/v1/migration-setup",
             get(migration_setup).put(update_migration_setup),
         )
+        .route("/v1/setup", get(setup::get))
+        .route(
+            "/v1/setup/streams/{stream}",
+            axum::routing::put(setup::put_stream).delete(setup::delete_stream),
+        )
+        .route(
+            "/v1/setup/connectors/square",
+            axum::routing::put(setup::put_square),
+        )
         .route("/v1/settings", get(settings::get).put(settings::update))
         .route("/v1/settings/invitations", post(settings::invite))
         .route(
@@ -268,6 +278,10 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             "/v1/invoices/{id}/price-changes",
             get(invoices::price_changes),
         )
+        .route(
+            "/v1/invoices/{id}/price-findings/{finding_id}/reviewed",
+            axum::routing::put(invoices::review_price_finding),
+        )
         .route("/v1/invoices/{id}/purchase-review", get(purchases::review))
         .route(
             "/v1/invoices/{id}/purchase-receipt",
@@ -284,6 +298,10 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         )
         .route("/v1/sales/menu-options", get(sales::menu_options))
         .route("/v1/menu-items", get(menu::list).post(menu::create))
+        .route(
+            "/v1/menu-items/{id}/ingredient-setup-choice",
+            axum::routing::put(menu::put_ingredient_setup_choice),
+        )
         .route("/v1/menu-items/{id}/costing", get(costing::get))
         .route(
             "/v1/menu-items/{id}/ingredients",
@@ -311,11 +329,15 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         )
         .route(
             "/v1/inventory-imports",
-            post(inventory_imports::create).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+            get(inventory_imports::latest)
+                .post(inventory_imports::create)
+                .layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
         )
         .route(
             "/v1/inventory-imports/{id}",
-            get(inventory_imports::get).put(inventory_imports::apply),
+            get(inventory_imports::get)
+                .put(inventory_imports::apply)
+                .delete(inventory_imports::discard),
         )
         .route(
             "/v1/suppliers",
@@ -410,7 +432,7 @@ async fn migration_setup(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MigrationSetup>, ApiError> {
-    let restaurant_id = migration_setup_restaurant(&state, &headers).await?;
+    let (restaurant_id, _) = migration_setup_actor(&state, &headers).await?;
     Ok(Json(load_migration_setup(&state, restaurant_id).await?))
 }
 
@@ -419,7 +441,7 @@ async fn update_migration_setup(
     headers: HeaderMap,
     Json(input): Json<UpdateMigrationSetup>,
 ) -> Result<Json<MigrationSetup>, ApiError> {
-    let restaurant_id = migration_setup_restaurant(&state, &headers).await?;
+    let (restaurant_id, user_id) = migration_setup_actor(&state, &headers).await?;
     let input = input.validated()?;
     let current = load_migration_setup(&state, restaurant_id).await?;
     if input.mark_complete
@@ -434,6 +456,15 @@ async fn update_migration_setup(
             "Import or add at least one restaurant record before finishing setup.",
         ));
     }
+    let mut tx = state.pool.begin().await.map_err(database_error)?;
+    setup::sync_legacy_sources(
+        &mut tx,
+        restaurant_id,
+        user_id,
+        input.pos_system.as_deref(),
+        input.setup_approach.as_deref(),
+    )
+    .await?;
     sqlx::query(
         "UPDATE restaurants SET pos_system=$1,accounting_system=$2,
          setup_approach=COALESCE($3,setup_approach),
@@ -449,19 +480,20 @@ async fn update_migration_setup(
     .bind(input.setup_approach)
     .bind(input.mark_complete)
     .bind(restaurant_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(database_error)?;
+    tx.commit().await.map_err(database_error)?;
     Ok(Json(load_migration_setup(&state, restaurant_id).await?))
 }
 
-async fn migration_setup_restaurant(
+async fn migration_setup_actor(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<uuid::Uuid, ApiError> {
+) -> Result<(uuid::Uuid, uuid::Uuid), ApiError> {
     let subject = authenticated_subject(state, headers).await?;
-    sqlx::query_scalar(
-        "SELECT m.restaurant_id FROM users u JOIN restaurant_memberships m ON m.user_id=u.id
+    sqlx::query_as(
+        "SELECT m.restaurant_id,u.id user_id FROM users u JOIN restaurant_memberships m ON m.user_id=u.id
          WHERE u.auth_subject=$1 AND m.role IN ('owner','manager')",
     )
     .bind(subject)

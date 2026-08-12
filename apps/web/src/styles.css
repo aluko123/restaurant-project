@@ -557,6 +557,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .invoice-workspace { width: min(1180px, 100%); margin: 0 auto; padding: clamp(36px, 6vw, 76px) clamp(20px, 5vw, 64px); }
 .menu-workspace { width: min(1080px, 100%); margin: 0 auto; padding: clamp(36px, 6vw, 76px) clamp(20px, 5vw, 64px); }
 .menu-message { margin-top: 20px; }
+.menu-create-next { margin-top: 20px; padding: 20px; border: 2px solid var(--ink); background: var(--paper-light); }
+.menu-create-next h2 { margin: 0 0 14px; font-size: 1.25rem; text-transform: uppercase; }
+.menu-create-next > div { display: flex; flex-wrap: wrap; gap: 10px; }
+.ingredient-setup-queue { margin-bottom: 32px; padding: 20px; border-left: 7px solid #9a6514; background: var(--paper-light); }
+.ingredient-setup-queue > p { margin: 6px 0 0; }
 .menu-grid { margin-top: 32px; display: grid; gap: 44px; }
 .menu-grid-read-only { display: block; }
 .menu-price-fields { display: grid; grid-template-columns: minmax(0, 2fr) minmax(90px, 1fr); gap: 12px; }

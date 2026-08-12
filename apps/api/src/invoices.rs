@@ -154,39 +154,13 @@ pub(crate) async fn list(
 ) -> Result<Json<Vec<Invoice>>, ApiError> {
     let membership = membership(&state, &headers).await?;
     let invoices = sqlx::query_as::<_, Invoice>(
-        "WITH comparable_lines AS (
-            SELECT invoice.id AS invoice_id,invoice.restaurant_id,invoice.supplier_name,
-                   invoice.invoice_date,invoice.created_at,line.unit_price,line.comparison_key,
-                   line.comparison_unit,extraction.currency,
-                   COUNT(*) OVER (
-                       PARTITION BY line.invoice_id,line.comparison_key,line.comparison_unit
-                   ) AS matching_lines
-            FROM invoices invoice
-            JOIN invoice_extractions extraction ON extraction.invoice_id=invoice.id
-            JOIN invoice_line_items line ON line.invoice_id=invoice.id
-            WHERE invoice.restaurant_id=$1 AND invoice.status='ready' AND line.unit_price>0
-              AND line.comparison_key IS NOT NULL AND line.comparison_unit IS NOT NULL
-         ), history AS (
-            SELECT invoice_id,unit_price,
-                   LAG(unit_price) OVER (
-                       PARTITION BY restaurant_id,LOWER(BTRIM(supplier_name)),currency,
-                                    comparison_key,comparison_unit
-                       ORDER BY invoice_date,created_at,invoice_id
-                   ) AS previous_unit_price
-            FROM comparable_lines
-            WHERE matching_lines=1
-         ), change_counts AS (
-            SELECT invoice_id,COUNT(*) AS price_change_count
-            FROM history
-            WHERE previous_unit_price IS NOT NULL
-              AND ABS(unit_price-previous_unit_price)*100>=previous_unit_price*5
-            GROUP BY invoice_id
-         )
-         SELECT invoice.id,invoice.supplier_name,invoice.invoice_date,
+        "SELECT invoice.id,invoice.supplier_name,invoice.invoice_date,
                 invoice.original_filename,invoice.content_type,invoice.size_bytes,invoice.status,
                 invoice.status = 'processing'
                     AND invoice.updated_at < NOW() - INTERVAL '5 minutes' AS delayed,
-                COALESCE(change_counts.price_change_count,0) AS price_change_count,
+                (SELECT COUNT(*) FROM invoice_price_findings finding
+                 WHERE finding.restaurant_id=invoice.restaurant_id
+                   AND finding.invoice_id=invoice.id AND finding.status='open') AS price_change_count,
                 EXISTS(
                     SELECT 1 FROM purchase_receipts receipt
                     WHERE receipt.invoice_id=invoice.id
@@ -194,7 +168,6 @@ pub(crate) async fn list(
                 ) AS purchase_receipt_recorded,
                 invoice.created_at
          FROM invoices invoice
-         LEFT JOIN change_counts ON change_counts.invoice_id=invoice.id
          WHERE invoice.restaurant_id=$1
          ORDER BY invoice.created_at DESC,invoice.id DESC LIMIT 100",
     )
@@ -305,6 +278,7 @@ pub(crate) struct PriceChange {
     current_unit_price: String,
     percentage_change: String,
     previous_invoice_date: NaiveDate,
+    status: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -325,6 +299,7 @@ struct PriceChangeRow {
     comparison_unit: String,
     increased: bool,
     at_least_ten_percent: bool,
+    status: String,
 }
 
 pub(crate) struct TodayPriceChange {
@@ -389,10 +364,32 @@ const PRICE_CHANGES_SQL: &str = "WITH comparable_lines AS (
      SELECT id,invoice_id,supplier_name,invoice_date,created_at,description,unit,currency,
             previous_unit_price::text AS previous_unit_price,
             unit_price::text AS current_unit_price,percentage_change::text AS percentage_change,
-            previous_invoice_date,comparison_key,comparison_unit,increased,at_least_ten_percent
+            previous_invoice_date,comparison_key,comparison_unit,increased,at_least_ten_percent,
+            ''::text AS status
      FROM changes
      WHERE $1::uuid IS NULL OR invoice_id=$1
      ORDER BY ABS(percentage_change) DESC,position,invoice_id";
+
+const FINDINGS_SQL: &str = "SELECT id,invoice_id,supplier_name,invoice_date,
+        invoice_created_at AS created_at,description,unit,currency,
+        previous_unit_price::text AS previous_unit_price,
+        current_unit_price::text AS current_unit_price,
+        percentage_change::text AS percentage_change,previous_invoice_date,comparison_key,
+        comparison_unit,increased,at_least_ten_percent,status
+    FROM invoice_price_findings
+    WHERE restaurant_id=$1 AND ($2::uuid IS NULL OR invoice_id=$2)
+      AND status<>'baseline'
+    ORDER BY ABS(percentage_change) DESC,created_at,id";
+
+const OPEN_FINDINGS_SQL: &str = "SELECT id,invoice_id,supplier_name,invoice_date,
+        invoice_created_at AS created_at,description,unit,currency,
+        previous_unit_price::text AS previous_unit_price,
+        current_unit_price::text AS current_unit_price,
+        percentage_change::text AS percentage_change,previous_invoice_date,comparison_key,
+        comparison_unit,increased,at_least_ten_percent,status
+    FROM invoice_price_findings
+    WHERE restaurant_id=$1 AND status='open'
+    ORDER BY ABS(percentage_change) DESC,created_at,id";
 
 struct ReviewedLine {
     line_id: Uuid,
@@ -536,13 +533,60 @@ pub(crate) async fn put_review(
             .await
             .map_err(crate::database_error)?;
     }
-    let price_changes = sqlx::query_as::<_, PriceChangeRow>(PRICE_CHANGES_SQL)
+    let mut computed_changes = sqlx::query_as::<_, PriceChangeRow>(PRICE_CHANGES_SQL)
         .bind(Some(id))
         .bind(member.restaurant_id)
         .fetch_all(&mut *tx)
         .await
-        .map_err(crate::database_error)?
+        .map_err(crate::database_error)?;
+    let setup_complete = sqlx::query_scalar::<_, bool>(
+        "SELECT migration_setup_completed_at IS NOT NULL FROM restaurants WHERE id=$1",
+    )
+    .bind(member.restaurant_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(crate::database_error)?;
+    let finding_status = if setup_complete { "open" } else { "baseline" };
+    for change in &mut computed_changes {
+        change.status = finding_status.to_owned();
+    }
+    for change in &computed_changes {
+        sqlx::query(
+            "INSERT INTO invoice_price_findings(
+                 id,restaurant_id,invoice_id,source_line_id,supplier_name,invoice_date,
+                 invoice_created_at,description,unit,currency,previous_unit_price,
+                 current_unit_price,percentage_change,previous_invoice_date,comparison_key,
+                 comparison_unit,increased,at_least_ten_percent,status)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::NUMERIC,$12::NUMERIC,
+                    $13::NUMERIC,$14,$15,$16,$17,$18,$19)
+             ON CONFLICT (restaurant_id,source_line_id) DO NOTHING",
+        )
+        .bind(Uuid::now_v7())
+        .bind(member.restaurant_id)
+        .bind(change.invoice_id)
+        .bind(change.id)
+        .bind(&change.supplier_name)
+        .bind(change.invoice_date)
+        .bind(change.created_at)
+        .bind(&change.description)
+        .bind(&change.unit)
+        .bind(&change.currency)
+        .bind(&change.previous_unit_price)
+        .bind(&change.current_unit_price)
+        .bind(&change.percentage_change)
+        .bind(change.previous_invoice_date)
+        .bind(&change.comparison_key)
+        .bind(&change.comparison_unit)
+        .bind(change.increased)
+        .bind(change.at_least_ten_percent)
+        .bind(finding_status)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::database_error)?;
+    }
+    let price_changes = computed_changes
         .into_iter()
+        .filter(|change| change.status == "open")
         .map(PriceChange::from)
         .collect();
     tx.commit().await.map_err(crate::database_error)?;
@@ -555,9 +599,9 @@ pub(crate) async fn price_changes(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<PriceChange>>, ApiError> {
     let member = membership(&state, &headers).await?;
-    let changes = sqlx::query_as::<_, PriceChangeRow>(PRICE_CHANGES_SQL)
-        .bind(Some(id))
+    let changes = sqlx::query_as::<_, PriceChangeRow>(FINDINGS_SQL)
         .bind(member.restaurant_id)
+        .bind(Some(id))
         .fetch_all(&state.pool)
         .await
         .map_err(crate::database_error)?
@@ -571,14 +615,44 @@ pub(crate) async fn restaurant_price_changes(
     pool: &PgPool,
     restaurant_id: Uuid,
 ) -> Result<Vec<TodayPriceChange>, sqlx::Error> {
-    Ok(sqlx::query_as::<_, PriceChangeRow>(PRICE_CHANGES_SQL)
-        .bind(Option::<Uuid>::None)
+    Ok(sqlx::query_as::<_, PriceChangeRow>(OPEN_FINDINGS_SQL)
         .bind(restaurant_id)
         .fetch_all(pool)
         .await?
         .into_iter()
         .map(TodayPriceChange::from)
         .collect())
+}
+
+pub(crate) async fn review_price_finding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((invoice_id, finding_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let member = membership(&state, &headers).await?;
+    let changed = sqlx::query(
+        "UPDATE invoice_price_findings
+         SET reviewed_by=CASE WHEN status='open' THEN $4 ELSE reviewed_by END,
+             reviewed_at=CASE WHEN status='open' THEN NOW() ELSE reviewed_at END,
+             status='reviewed'
+         WHERE id=$1 AND invoice_id=$2 AND restaurant_id=$3
+           AND status IN ('open','reviewed')",
+    )
+    .bind(finding_id)
+    .bind(invoice_id)
+    .bind(member.restaurant_id)
+    .bind(member.user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(crate::database_error)?
+    .rows_affected();
+    if changed == 0 {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "Open price finding not found.",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 impl From<PriceChangeRow> for PriceChange {
@@ -592,6 +666,7 @@ impl From<PriceChangeRow> for PriceChange {
             current_unit_price: row.current_unit_price,
             percentage_change: row.percentage_change,
             previous_invoice_date: row.previous_invoice_date,
+            status: row.status,
         }
     }
 }
@@ -641,6 +716,12 @@ pub(crate) async fn retry(
 fn validate_review(mut i: ReviewInput, today: NaiveDate) -> Result<ReviewInput, ApiError> {
     i.supplier_name = validate_supplier(&i.supplier_name)?;
     i.currency = i.currency.trim().to_ascii_uppercase();
+    if i.line_items.is_empty() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Add at least one reviewed line item before approving this invoice.",
+        ));
+    }
     if i.currency.len() != 3
         || !i.currency.bytes().all(|c| c.is_ascii_uppercase())
         || i.line_items.len() > 200

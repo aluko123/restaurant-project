@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json,
@@ -49,6 +49,7 @@ struct InventoryChoice {
 
 #[derive(sqlx::FromRow)]
 struct ConfiguredRow {
+    menu_item_id: Uuid,
     id: Uuid,
     inventory_item_id: Uuid,
     inventory_item_name: String,
@@ -155,7 +156,7 @@ enum PriceBasis {
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
-enum Summary {
+pub(crate) enum Summary {
     Complete {
         known_subtotal: String,
         currency: String,
@@ -176,13 +177,27 @@ enum Summary {
     },
 }
 
+impl Summary {
+    pub(crate) fn cost_state(&self) -> &'static str {
+        match self {
+            Self::Complete { .. } => "complete",
+            Self::Partial { .. } => "partial",
+            Self::Unavailable {
+                configured_ingredient_count: 0,
+                ..
+            } => "recipe_not_configured",
+            Self::Unavailable { .. } => "purchase_cost_missing",
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CostingResponse {
     menu_item: CostingMenuItem,
     inventory_items: Vec<InventoryChoice>,
     ingredients: Vec<Ingredient>,
-    summary: Summary,
+    pub(crate) summary: Summary,
 }
 
 #[derive(Deserialize)]
@@ -326,7 +341,7 @@ pub(crate) async fn put(
     ))
 }
 
-async fn load_costing(
+pub(crate) async fn load_costing(
     pool: &sqlx::PgPool,
     restaurant_id: Uuid,
     menu_item_id: Uuid,
@@ -351,7 +366,7 @@ async fn load_costing(
     .await
     .map_err(database_error)?;
     let rows = sqlx::query_as::<_, ConfiguredRow>(
-        "SELECT ingredient.id,ingredient.inventory_item_id,item.name AS inventory_item_name,
+        "SELECT ingredient.menu_item_id,ingredient.id,ingredient.inventory_item_id,item.name AS inventory_item_name,
                 item.category AS inventory_item_category,item.active AS inventory_item_active,
                 ingredient.quantity,ingredient.unit,
                 source.source_line_id,source.invoice_id AS source_invoice_id,
@@ -413,6 +428,72 @@ async fn load_costing(
         ingredients,
         summary,
     })
+}
+
+pub(crate) async fn load_cost_states(
+    pool: &sqlx::PgPool,
+    restaurant_id: Uuid,
+    menu_item_ids: &[Uuid],
+) -> Result<HashMap<Uuid, String>, ApiError> {
+    if menu_item_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let menus = sqlx::query_as::<_, (Uuid, BigDecimal, String)>(
+        "SELECT id,selling_price,currency FROM menu_items WHERE restaurant_id=$1 AND id=ANY($2)",
+    )
+    .bind(restaurant_id)
+    .bind(menu_item_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(database_error)?;
+    let rows = sqlx::query_as::<_, ConfiguredRow>(
+        "SELECT ingredient.menu_item_id,ingredient.id,ingredient.inventory_item_id,item.name AS inventory_item_name,
+                item.category AS inventory_item_category,item.active AS inventory_item_active,
+                ingredient.quantity,ingredient.unit,source.source_line_id,source.invoice_id AS source_invoice_id,
+                source.supplier_name,source.invoice_date,source.recorded_at,source.currency AS source_currency,
+                source.description AS source_description,source.purchase_quantity,source.purchase_unit,
+                source.unit_price,source.line_total,source.count_unit,source.count_units_per_purchase_unit
+         FROM menu_item_ingredients ingredient
+         JOIN inventory_items item ON item.id=ingredient.inventory_item_id AND item.restaurant_id=ingredient.restaurant_id
+         LEFT JOIN LATERAL (
+           SELECT line.source_line_id,line.invoice_id,receipt.supplier_name,receipt.invoice_date,receipt.recorded_at,
+                  receipt.currency,line.description,line.purchase_quantity,line.purchase_unit,line.unit_price,
+                  line.line_total,line.count_unit,line.count_units_per_purchase_unit
+           FROM purchase_receipt_lines line JOIN purchase_receipts receipt
+             ON receipt.invoice_id=line.invoice_id AND receipt.restaurant_id=line.restaurant_id
+           WHERE line.restaurant_id=ingredient.restaurant_id AND line.inventory_item_id=ingredient.inventory_item_id
+           ORDER BY receipt.invoice_date DESC,receipt.recorded_at DESC,receipt.invoice_id DESC,line.source_line_id DESC LIMIT 1
+         ) source ON TRUE
+         WHERE ingredient.restaurant_id=$1 AND ingredient.menu_item_id=ANY($2)",
+    )
+    .bind(restaurant_id)
+    .bind(menu_item_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(database_error)?;
+    let mut costs: HashMap<Uuid, Vec<Option<BigDecimal>>> = HashMap::new();
+    for row in &rows {
+        let currency = menus
+            .iter()
+            .find(|menu| menu.0 == row.menu_item_id)
+            .map(|menu| menu.2.as_str())
+            .unwrap_or("");
+        costs
+            .entry(row.menu_item_id)
+            .or_default()
+            .push(ingredient_calculation(row, currency).1);
+    }
+    Ok(menus
+        .into_iter()
+        .map(|(id, price, currency)| {
+            let summary = summarize(
+                costs.get(&id).map(Vec::as_slice).unwrap_or(&[]),
+                &price,
+                &currency,
+            );
+            (id, summary.cost_state().to_owned())
+        })
+        .collect())
 }
 
 fn ingredient_calculation(
@@ -740,6 +821,7 @@ mod tests {
         let (count_unit, conversion) = receipt_conversion;
         let (purchase_quantity, unit_price, line_total) = prices;
         ConfiguredRow {
+            menu_item_id: Uuid::now_v7(),
             id: Uuid::now_v7(),
             inventory_item_id: Uuid::now_v7(),
             inventory_item_name: "Chicken".into(),
@@ -883,6 +965,14 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cost_state_distinguishes_recipe_setup_from_missing_purchase_cost() {
+        let no_recipe = summarize(&[], &decimal("10"), "USD");
+        let no_cost = summarize(&[None], &decimal("10"), "USD");
+        assert_eq!(no_recipe.cost_state(), "recipe_not_configured");
+        assert_eq!(no_cost.cost_state(), "purchase_cost_missing");
     }
 
     #[test]

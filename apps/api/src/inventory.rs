@@ -162,6 +162,8 @@ pub(crate) struct CountSummary {
 pub(crate) struct StartInput {
     #[serde(default)]
     storage_area_ids: Option<Vec<Uuid>>,
+    #[serde(default)]
+    item_ids: Option<Vec<Uuid>>,
 }
 
 #[derive(Deserialize)]
@@ -562,9 +564,9 @@ pub(crate) async fn start(
     body: Option<Json<StartInput>>,
 ) -> Result<(StatusCode, Json<Count>), ApiError> {
     let m = membership(&state, &headers).await?;
-    let area_ids = body
-        .map(|Json(input)| input.storage_area_ids.unwrap_or_default())
-        .unwrap_or_default();
+    let input = body.map(|Json(input)| input).unwrap_or_default();
+    let area_ids = input.storage_area_ids.unwrap_or_default();
+    let item_ids = input.item_ids.unwrap_or_default();
     let mut unique_areas = Vec::new();
     let mut seen = HashSet::new();
     for id in area_ids {
@@ -572,7 +574,22 @@ pub(crate) async fn start(
             unique_areas.push(id);
         }
     }
-    let scope = if unique_areas.is_empty() {
+    let mut unique_items = Vec::new();
+    seen.clear();
+    for id in item_ids {
+        if seen.insert(id) {
+            unique_items.push(id);
+        }
+    }
+    if !unique_areas.is_empty() && !unique_items.is_empty() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Choose items or areas, not both.",
+        ));
+    }
+    let scope = if !unique_items.is_empty() {
+        "focused"
+    } else if unique_areas.is_empty() {
         "all"
     } else {
         "areas"
@@ -630,6 +647,36 @@ pub(crate) async fn start(
         .fetch_all(&mut *tx)
         .await
         .map_err(database_error)?
+    } else if scope == "focused" {
+        let rows = sqlx::query_as::<_, ItemRow>(
+            "WITH last AS (
+               SELECT DISTINCT ON (e.inventory_item_id) e.inventory_item_id, e.quantity
+               FROM inventory_count_entries e
+               JOIN inventory_count_sessions s ON s.id=e.session_id
+               WHERE s.restaurant_id=$1 AND s.status='completed' AND e.quantity IS NOT NULL
+               ORDER BY e.inventory_item_id, s.completed_at DESC, s.id DESC
+             )
+             SELECT i.id,i.name,i.category,i.count_unit,a.name storage_area_name,
+                    COALESCE(a.sort_order, 1000000) storage_area_sort,i.shelf_order,
+                    l.quantity previous_quantity
+             FROM inventory_items i
+             LEFT JOIN storage_areas a ON a.id=i.storage_area_id
+             LEFT JOIN last l ON l.inventory_item_id=i.id
+             WHERE i.restaurant_id=$1 AND i.active AND i.id = ANY($2)
+             ORDER BY COALESCE(a.sort_order, 1000000),i.shelf_order,LOWER(i.name),i.id",
+        )
+        .bind(m.restaurant_id)
+        .bind(&unique_items)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        if rows.len() != unique_items.len() {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Choose active inventory items.",
+            ));
+        }
+        rows
     } else {
         sqlx::query_as::<_, ItemRow>(
             "WITH last AS (

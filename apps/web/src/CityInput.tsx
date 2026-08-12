@@ -105,7 +105,7 @@ export function LocationPicker({
   const knownRegion = regionChoice !== "" && regionChoice !== "other";
 
   return <fieldset className={`location-picker${className ? ` ${className}` : ""}`}>
-    <legend>Restaurant location</legend>
+    <legend>Location</legend>
 
     <div className="location-part">
       <label htmlFor={`${id}-country`}>Country</label>
@@ -116,11 +116,11 @@ export function LocationPicker({
         setCityChoice("");
         onChange({ country: next === "other" ? "" : next, region: "", city: "" });
       }}>
-        <option value="" disabled>Choose country</option>
+        <option value="" disabled>Country</option>
         {countries.map(option => <option key={option} value={option}>{option}</option>)}
         <option value="other">Other</option>
       </select>
-      {countryChoice === "other" && <input aria-label="Country" value={country} onChange={event => onChange({ country: event.target.value, region, city })} maxLength={100} autoComplete="country-name" placeholder="Enter country" required />}
+      {countryChoice === "other" && <input aria-label="Country" value={country} onChange={event => onChange({ country: event.target.value, region, city })} maxLength={100} autoComplete="country-name" placeholder="Country" required />}
     </div>
 
     <div className="location-part">
@@ -132,12 +132,12 @@ export function LocationPicker({
           setCityChoice("");
           onChange({ country, region: next === "other" ? "" : next, city: "" });
         }}>
-          <option value="" disabled>Choose {regionLabel.toLowerCase()}</option>
+          <option value="" disabled>{regionLabel}</option>
           {regionsFor(countryChoice).map(option => <option key={option} value={option}>{option}</option>)}
           <option value="other">Other {regionLabel.toLowerCase()}</option>
         </select>
-        {regionChoice === "other" && <input aria-label={regionLabel} value={region} onChange={event => onChange({ country, region: event.target.value, city })} maxLength={100} autoComplete="address-level1" placeholder={`Enter ${regionLabel.toLowerCase()}`} required />}
-      </> : countryChoice === "other" ? <input id={`${id}-region`} value={region} onChange={event => onChange({ country, region: event.target.value, city })} maxLength={100} autoComplete="address-level1" placeholder={`Enter ${regionLabel.toLowerCase()}`} required /> : <select id={`${id}-region`} value="" disabled><option value="">Choose country</option></select>}
+        {regionChoice === "other" && <input aria-label={regionLabel} value={region} onChange={event => onChange({ country, region: event.target.value, city })} maxLength={100} autoComplete="address-level1" placeholder={regionLabel} required />}
+      </> : countryChoice === "other" ? <input id={`${id}-region`} value={region} onChange={event => onChange({ country, region: event.target.value, city })} maxLength={100} autoComplete="address-level1" placeholder={regionLabel} required /> : <select id={`${id}-region`} value="" disabled><option value="">Country first</option></select>}
     </div>
 
     <div className="location-part">
@@ -148,12 +148,12 @@ export function LocationPicker({
           setCityChoice(next);
           onChange({ country, region, city: next === "other" ? "" : next });
         }}>
-          <option value="" disabled>{knownRegion ? "Choose city" : `Choose ${regionLabel.toLowerCase()} first`}</option>
+          <option value="" disabled>{knownRegion ? "City" : `${regionLabel} first`}</option>
           {citiesFor(countryChoice, regionChoice).map(option => <option key={option} value={option}>{option}</option>)}
           {knownRegion && <option value="other">Other</option>}
         </select>
-        {cityChoice === "other" && <input aria-label="City" value={city} onChange={event => onChange({ country, region, city: event.target.value })} maxLength={100} autoComplete="address-level2" placeholder="Enter city" required />}
-      </> : countryChoice === "other" ? <input id={`${id}-city`} value={city} onChange={event => onChange({ country, region, city: event.target.value })} maxLength={100} autoComplete="address-level2" placeholder="Enter city" required /> : <select id={`${id}-city`} value="" disabled><option value="">Choose country</option></select>}
+        {cityChoice === "other" && <input aria-label="City" value={city} onChange={event => onChange({ country, region, city: event.target.value })} maxLength={100} autoComplete="address-level2" placeholder="City" required />}
+      </> : countryChoice === "other" ? <input id={`${id}-city`} value={city} onChange={event => onChange({ country, region, city: event.target.value })} maxLength={100} autoComplete="address-level2" placeholder="City" required /> : <select id={`${id}-city`} value="" disabled><option value="">Country first</option></select>}
     </div>
   </fieldset>;
 }
