@@ -13,13 +13,17 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, authenticated_subject, database_error, invoices::strict_decimal,
+    ApiError, AppState, authenticated_subject, database_error,
+    extraction::{ExtractedSalesCsv, ProviderError},
+    invoices::strict_decimal,
     uploads::multipart_error,
 };
 
 const MAX_SALES_LINES: usize = 200;
 const MAX_CSV_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
 const MAX_CSV_ROWS: usize = 2_000;
+#[cfg(test)]
 const MAX_CSV_ERRORS: usize = 25;
 
 #[derive(sqlx::FromRow)]
@@ -137,6 +141,7 @@ struct ParsedCsvRow {
     currency: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 struct CsvIssue {
     row_number: Option<u64>,
@@ -283,7 +288,12 @@ pub(crate) async fn preview_import(
         SalesImportError::unprocessable("Choose a Parline CSV file to preview.".into())
     })?;
     validate_csv_upload(&original_filename, &bytes)?;
-    let parsed = parse_sales_csv(&bytes).map_err(SalesImportError::csv_validation)?;
+    let extracted = state
+        .gemini
+        .extract_sales_csv(bytes)
+        .await
+        .map_err(extraction_error)?;
+    let parsed = validate_extracted_sales(extracted.extracted)?;
 
     let mut tx = state.pool.begin().await.map_err(database_error)?;
     let menu = sqlx::query_as::<_, MenuRecord>(
@@ -350,6 +360,84 @@ pub(crate) async fn preview_import(
         rows,
         existing_day,
     }))
+}
+
+fn extraction_error(error: ProviderError) -> SalesImportError {
+    let detail = match error {
+        ProviderError::Retryable { error, .. } | ProviderError::Terminal(error) => error,
+    };
+    tracing::warn!(%detail, "sales CSV extraction failed");
+    SalesImportError {
+        status: StatusCode::BAD_GATEWAY,
+        message: "We couldn't read this sales file. Try again, or export it again from your POS."
+            .into(),
+    }
+}
+
+fn validate_extracted_sales(extracted: ExtractedSalesCsv) -> Result<ParsedCsv, SalesImportError> {
+    let date = extracted.business_date.as_deref().and_then(|value| {
+        let value = value.trim();
+        NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
+            .filter(|date| date.format("%Y-%m-%d").to_string() == value)
+    }).ok_or_else(|| SalesImportError::unprocessable(
+        "We couldn't identify one business date. Upload a sales export for a single day, then review it before applying.".into(),
+    ))?;
+    if extracted.rows.is_empty() {
+        return Err(SalesImportError::unprocessable(
+            "We couldn't find item-level sales in this file.".into(),
+        ));
+    }
+    let mut rows = Vec::new();
+    for (index, row) in extracted.rows.into_iter().take(MAX_SALES_LINES).enumerate() {
+        let name = row.item_name.trim().to_owned();
+        let quantity = row
+            .quantity
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_owned();
+        let net_sales = row.net_sales.and_then(|value| {
+            let value = value.trim().to_owned();
+            (!value.is_empty()).then_some(value)
+        });
+        let currency = row.currency.and_then(|value| {
+            let value = value.trim().to_ascii_uppercase();
+            (!value.is_empty()).then_some(value)
+        });
+        if name.is_empty()
+            || name.chars().count() > 50
+            || sales_decimal(&quantity, 6).is_err()
+            || sales_decimal(&quantity, 6).is_ok_and(|value| value <= 0)
+            || net_sales.as_ref().is_some_and(|value| {
+                sales_decimal(value, 4).is_err()
+                    || sales_decimal(value, 4).is_ok_and(|amount| amount < 0)
+            })
+            || currency.as_ref().is_some_and(|value| {
+                value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_uppercase())
+            })
+            || net_sales.is_some() != currency.is_some()
+        {
+            return Err(SalesImportError::unprocessable(format!(
+                "We found a sales value that needs correction before previewing (extracted row {}). Try exporting the file again.",
+                index + 1
+            )));
+        }
+        rows.push(ParsedCsvRow {
+            row_number: (index + 2) as u64,
+            raw_item_label: name,
+            item_code: row.item_code.and_then(|value| {
+                let value = value.trim().to_owned();
+                (!value.is_empty()).then_some(value)
+            }),
+            quantity,
+            reported_net_sales: net_sales,
+            currency,
+        });
+    }
+    Ok(ParsedCsv {
+        business_date: date,
+        rows,
+    })
 }
 
 pub(crate) async fn put(
@@ -795,6 +883,7 @@ fn validate_csv_upload(filename: &str, bytes: &[u8]) -> Result<(), SalesImportEr
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_sales_csv(bytes: &[u8]) -> Result<ParsedCsv, Vec<CsvIssue>> {
     const REQUIRED_HEADERS: [&str; 3] = ["business_date", "item_name", "quantity"];
     const ALLOWED_HEADERS: [&str; 6] = [
@@ -998,6 +1087,7 @@ fn parse_sales_csv(bytes: &[u8]) -> Result<ParsedCsv, Vec<CsvIssue>> {
     })
 }
 
+#[cfg(test)]
 fn push_csv_issue(issues: &mut Vec<CsvIssue>, row_number: Option<u64>, message: String) {
     if issues.len() < MAX_CSV_ERRORS {
         issues.push(CsvIssue {
@@ -1007,6 +1097,7 @@ fn push_csv_issue(issues: &mut Vec<CsvIssue>, row_number: Option<u64>, message: 
     }
 }
 
+#[cfg(test)]
 fn csv_value<'a>(
     record: &'a csv::StringRecord,
     indexes: &HashMap<&str, usize>,
@@ -1021,18 +1112,6 @@ impl SalesImportError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             message,
         }
-    }
-
-    fn csv_validation(issues: Vec<CsvIssue>) -> Self {
-        let details = issues
-            .into_iter()
-            .map(|issue| match issue.row_number {
-                Some(row) => format!("Row {row}: {}", issue.message),
-                None => issue.message,
-            })
-            .collect::<Vec<_>>()
-            .join(" • ");
-        Self::unprocessable(format!("The CSV needs correction. {details}"))
     }
 }
 
@@ -1060,6 +1139,7 @@ impl IntoResponse for SalesImportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extraction::ExtractedSalesRow;
 
     fn input(expected_revision: serde_json::Value, lines: serde_json::Value) -> SaveSalesDay {
         serde_json::from_value(serde_json::json!({
@@ -1182,6 +1262,49 @@ mod tests {
         assert!(parse_business_date("2026-07-22").is_ok());
         assert!(parse_business_date("2026-7-22").is_err());
         assert!(parse_business_date("not-a-date").is_err());
+    }
+
+    #[test]
+    fn validates_normalized_llm_sales_output() {
+        let parsed = validate_extracted_sales(ExtractedSalesCsv {
+            business_date: Some("2026-07-21".into()),
+            rows: vec![ExtractedSalesRow {
+                item_name: " Chicken Taco ".into(),
+                item_code: Some(" TACO-1 ".into()),
+                quantity: Some("12".into()),
+                net_sales: Some("144.00".into()),
+                currency: Some(" usd ".into()),
+            }],
+        })
+        .unwrap();
+        assert_eq!(parsed.business_date.to_string(), "2026-07-21");
+        assert_eq!(parsed.rows[0].raw_item_label, "Chicken Taco");
+        assert_eq!(parsed.rows[0].currency.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn rejects_llm_sales_without_one_date_or_quantity() {
+        let row = || ExtractedSalesRow {
+            item_name: "Taco".into(),
+            item_code: None,
+            quantity: None,
+            net_sales: None,
+            currency: None,
+        };
+        assert!(
+            validate_extracted_sales(ExtractedSalesCsv {
+                business_date: None,
+                rows: vec![row()]
+            })
+            .is_err()
+        );
+        assert!(
+            validate_extracted_sales(ExtractedSalesCsv {
+                business_date: Some("2026-07-21".into()),
+                rows: vec![row()]
+            })
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use crate::{
-    ApiError, AppState, authenticated_subject, database_error, inventory::ItemInput,
+    ApiError, AppState, authenticated_subject, database_error,
+    extraction::{ExtractedInventoryCsv, ProviderError},
+    inventory::ItemInput,
     uploads::multipart_error,
 };
 use axum::{
@@ -9,10 +11,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use uuid::Uuid;
 const MAX_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
 const MAX_ROWS: usize = 2000;
+#[cfg(test)]
 const MAX_ERRORS: usize = 25;
 #[derive(sqlx::FromRow)]
 struct Member {
@@ -100,7 +104,26 @@ pub(crate) async fn create(
             "CSV files must be between 1 byte and 1 MiB.",
         ));
     }
-    let parsed = parse(&b)?;
+    #[cfg(test)]
+    let parsed = if s.gemini.is_inert_for_tests() {
+        parse(&b)?
+    } else {
+        let extracted = s
+            .gemini
+            .extract_inventory_csv(b.clone())
+            .await
+            .map_err(extraction_error)?;
+        validate_extracted(extracted.extracted)?
+    };
+    #[cfg(not(test))]
+    let parsed = {
+        let extracted = s
+            .gemini
+            .extract_inventory_csv(b.clone())
+            .await
+            .map_err(extraction_error)?;
+        validate_extracted(extracted.extracted)?
+    };
     let hash = format!("{:x}", Sha256::digest(&b));
     let existing: HashSet<String> = sqlx::query_scalar::<_, String>(
         "SELECT LOWER(BTRIM(name)) FROM inventory_items WHERE restaurant_id=$1",
@@ -145,6 +168,78 @@ pub(crate) async fn create(
         StatusCode::CREATED,
         Json(load(&s, id, m.restaurant_id).await?),
     ))
+}
+
+fn extraction_error(error: ProviderError) -> ApiError {
+    let detail = match error {
+        ProviderError::Retryable { error, .. } | ProviderError::Terminal(error) => error,
+    };
+    tracing::warn!(%detail, "inventory CSV extraction failed");
+    ApiError(
+        StatusCode::BAD_GATEWAY,
+        "We couldn't read this inventory file. Try again, or export it again from your inventory system.",
+    )
+}
+
+fn validate_extracted(
+    extracted: ExtractedInventoryCsv,
+) -> Result<Vec<(Row, Vec<String>)>, ApiError> {
+    if extracted.items.is_empty() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "We couldn't find inventory items in this file.",
+        ));
+    }
+    Ok(extracted
+        .items
+        .into_iter()
+        .take(200)
+        .enumerate()
+        .map(|(index, item)| {
+            let name = item.name.trim().to_owned();
+            let category = item.category.and_then(|value| {
+                let value = value.trim().to_owned();
+                (!value.is_empty()).then_some(value)
+            });
+            let count_unit = item
+                .count_unit
+                .map(|value| value.trim().to_owned())
+                .unwrap_or_default();
+            let par_level = item.par_level.and_then(|value| {
+                let value = value.trim().to_owned();
+                (!value.is_empty()).then_some(value)
+            });
+            let input = ItemInput {
+                name: name.clone(),
+                category: category.clone(),
+                count_unit: count_unit.clone(),
+                par_level: par_level.clone(),
+                storage_area_id: None,
+                shelf_order: 0,
+                preferred_supplier_id: None,
+                active: true,
+            };
+            let errors = input
+                .validated()
+                .err()
+                .map(|error| vec![error.1.into()])
+                .unwrap_or_default();
+            (
+                Row {
+                    id: Uuid::nil(),
+                    row_number: (index + 2) as i32,
+                    name,
+                    category,
+                    count_unit,
+                    par_level,
+                    validation_errors: serde_json::json!([]),
+                    selected: None,
+                    created_inventory_item_id: None,
+                },
+                errors,
+            )
+        })
+        .collect())
 }
 pub(crate) async fn get(
     State(s): State<AppState>,
@@ -235,7 +330,9 @@ async fn load(s: &AppState, id: Uuid, r: Uuid) -> Result<Import, ApiError> {
     let rows=sqlx::query_as("SELECT id,row_number,name,category,count_unit,par_level,validation_errors,selected,created_inventory_item_id FROM inventory_import_rows WHERE import_id=$1 ORDER BY row_number").bind(id).fetch_all(&s.pool).await.map_err(database_error)?;
     Ok(Import { head, rows })
 }
+#[cfg(test)]
 fn parse(b: &[u8]) -> Result<Vec<(Row, Vec<String>)>, ApiError> {
+    use std::collections::HashMap;
     let mut rd = csv::ReaderBuilder::new()
         .flexible(false)
         .from_reader(b.strip_prefix(b"\xef\xbb\xbf").unwrap_or(b));
@@ -327,6 +424,24 @@ fn parse(b: &[u8]) -> Result<Vec<(Row, Vec<String>)>, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extraction::{ExtractedInventoryCsv, ExtractedInventoryItem};
+
+    #[test]
+    fn keeps_unclear_llm_inventory_values_for_review() {
+        let rows = validate_extracted(ExtractedInventoryCsv {
+            items: vec![ExtractedInventoryItem {
+                name: " Chicken breast ".into(),
+                category: Some(" Protein ".into()),
+                count_unit: None,
+                par_level: Some("25".into()),
+            }],
+        })
+        .unwrap();
+        assert_eq!(rows[0].0.name, "Chicken breast");
+        assert_eq!(rows[0].0.category.as_deref(), Some("Protein"));
+        assert!(!rows[0].1.is_empty());
+    }
+
     #[test]
     fn csv_v1_validation() {
         assert!(parse(b"name,count_unit,category,par_level\nFlour,bag,Dry,2.5\n").is_ok());
