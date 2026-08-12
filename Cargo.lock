@@ -2329,6 +2329,7 @@ dependencies = [
  "csv",
  "dotenvy",
  "fastrand",
+ "getrandom 0.2.17",
  "hex",
  "httpdate",
  "jsonwebtoken",

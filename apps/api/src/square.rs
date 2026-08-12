@@ -80,16 +80,20 @@ impl SquareConfig {
     }
 
     fn scopes(&self) -> &'static str {
-        // ITEMS_WRITE/ORDERS_WRITE: sandbox seeding + future catalog fixes.
-        // Sync itself only needs the READ scopes.
-        "ITEMS_READ ITEMS_WRITE ORDERS_READ ORDERS_WRITE PAYMENTS_WRITE MERCHANT_PROFILE_READ"
+        if self.environment.eq_ignore_ascii_case("production") {
+            "ITEMS_READ ORDERS_READ MERCHANT_PROFILE_READ"
+        } else {
+            // Sandbox keeps write scopes for local seed tooling. Production sync is read-only.
+            "ITEMS_READ ITEMS_WRITE ORDERS_READ ORDERS_WRITE PAYMENTS_WRITE MERCHANT_PROFILE_READ"
+        }
     }
 }
 
 fn token_key_from_env() -> Result<[u8; 32], ()> {
-    let raw = std::env::var("CONNECTIONS_TOKEN_KEY")
-        .or_else(|_| std::env::var("SQUARE_APPLICATION_SECRET"))
-        .map_err(|_| ())?;
+    let raw = std::env::var("CONNECTIONS_TOKEN_KEY").map_err(|_| ())?;
+    if raw.trim().is_empty() {
+        return Err(());
+    }
     let hash = Sha256::digest(raw.as_bytes());
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash);
@@ -99,7 +103,7 @@ fn token_key_from_env() -> Result<[u8; 32], ()> {
 fn encrypt_secret(key: &[u8; 32], plain: &str) -> Result<String, ApiError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| encrypt_error())?;
     let mut nonce_bytes = [0u8; 12];
-    getrandom_nonce(&mut nonce_bytes);
+    getrandom::getrandom(&mut nonce_bytes).map_err(|_| encrypt_error())?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let encrypted = cipher
         .encrypt(nonce, plain.as_bytes())
@@ -130,10 +134,11 @@ fn encrypt_error() -> ApiError {
     )
 }
 
-fn getrandom_nonce(buf: &mut [u8; 12]) {
-    for byte in buf.iter_mut() {
-        *byte = fastrand::u8(..);
-    }
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("static Square HTTP client configuration")
 }
 
 #[derive(sqlx::FromRow)]
@@ -340,9 +345,8 @@ async fn complete_callback(state: &AppState, query: CallbackQuery) -> Result<Str
         .filter(|v| !v.is_empty())
         .ok_or("Missing OAuth state.")?;
     let row = sqlx::query_as::<_, (Uuid, Uuid)>(
-        "DELETE FROM oauth_states
-         WHERE state=$1 AND provider=$2 AND expires_at > NOW()
-         RETURNING restaurant_id,user_id",
+        "SELECT restaurant_id,user_id FROM oauth_states
+         WHERE state=$1 AND provider=$2 AND expires_at > NOW()",
     )
     .bind(state_token)
     .bind(PROVIDER)
@@ -365,7 +369,58 @@ async fn complete_callback(state: &AppState, query: CallbackQuery) -> Result<Str
         .ok()
         .flatten();
     let connection_id = Uuid::now_v7();
-    sqlx::query(
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| "We couldn't save the Square connection.")?;
+    sqlx::query("SELECT id FROM restaurants WHERE id=$1 FOR UPDATE")
+        .bind(restaurant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "We couldn't save the Square connection.")?;
+    let consumed = sqlx::query(
+        "DELETE FROM oauth_states
+         WHERE state=$1 AND provider=$2 AND restaurant_id=$3 AND user_id=$4
+           AND expires_at > NOW()",
+    )
+    .bind(state_token)
+    .bind(PROVIDER)
+    .bind(restaurant_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| "We couldn't verify the connection request.")?
+    .rows_affected();
+    if consumed != 1 {
+        return Err("This connection link expired. Try Connect Square again.");
+    }
+    let selected = sqlx::query_scalar::<_, bool>(
+        "SELECT COUNT(*)=2 FROM restaurant_setup_streams
+         WHERE restaurant_id=$1 AND stream IN ('menu','sales')
+           AND method='connector' AND connector_provider='square'",
+    )
+    .bind(restaurant_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| "We couldn't verify the connection request.")?;
+    if !selected {
+        return Err("Square is no longer selected.");
+    }
+    let existing_merchant = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT external_merchant_id FROM source_connections
+         WHERE restaurant_id=$1 AND provider=$2",
+    )
+    .bind(restaurant_id)
+    .bind(PROVIDER)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| "We couldn't verify the Square account.")?
+    .flatten();
+    if existing_merchant.is_some() && existing_merchant.as_deref() != merchant_id.as_deref() {
+        return Err("This restaurant is linked to a different Square account.");
+    }
+    let connection_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO source_connections
          (id,restaurant_id,provider,status,external_merchant_id,external_location_id,
           access_token_encrypted,refresh_token_encrypted,access_token_expires_at,scopes,created_by)
@@ -392,20 +447,22 @@ async fn complete_callback(state: &AppState, query: CallbackQuery) -> Result<Str
     .bind(expires_at)
     .bind(config.scopes())
     .bind(user_id)
-    .execute(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| "We couldn't save the Square connection.")?;
-    let connection_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM source_connections WHERE restaurant_id=$1 AND provider=$2",
+    sqlx::query(
+        "INSERT INTO source_sync_runs(id,connection_id,restaurant_id,kind,status)
+         VALUES($1,$2,$3,'full','queued')",
     )
+    .bind(Uuid::now_v7())
+    .bind(connection_id)
     .bind(restaurant_id)
-    .bind(PROVIDER)
-    .fetch_one(&state.pool)
+    .execute(&mut *tx)
     .await
-    .map_err(|_| "We couldn't save the Square connection.")?;
-    enqueue_sync(&state.pool, connection_id, restaurant_id, "full")
+    .map_err(|_| "We couldn't start the Square sync.")?;
+    tx.commit()
         .await
-        .ok();
+        .map_err(|_| "We couldn't save the Square connection.")?;
     Ok(format!("{}/sources?square=connected", config.web_origin))
 }
 
@@ -418,7 +475,7 @@ struct TokenResponse {
 }
 
 async fn obtain_token(config: &SquareConfig, code: &str) -> Result<TokenResponse, ()> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .post(format!("{}/oauth2/token", config.oauth_base()))
         .header(header::CONTENT_TYPE, "application/json")
@@ -444,7 +501,7 @@ async fn refresh_access_token(
     config: &SquareConfig,
     refresh_token: &str,
 ) -> Result<TokenResponse, ()> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .post(format!("{}/oauth2/token", config.oauth_base()))
         .header(header::CONTENT_TYPE, "application/json")
@@ -468,7 +525,7 @@ async fn fetch_primary_location(
     config: &SquareConfig,
     access_token: &str,
 ) -> Result<Option<String>, ()> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .get(format!("{}/v2/locations", config.api_base()))
         .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
@@ -497,26 +554,6 @@ async fn fetch_primary_location(
         .map(str::to_owned))
 }
 
-async fn enqueue_sync(
-    pool: &PgPool,
-    connection_id: Uuid,
-    restaurant_id: Uuid,
-    kind: &str,
-) -> Result<(), ApiError> {
-    sqlx::query(
-        "INSERT INTO source_sync_runs(id,connection_id,restaurant_id,kind,status)
-         VALUES($1,$2,$3,$4,'queued')",
-    )
-    .bind(Uuid::now_v7())
-    .bind(connection_id)
-    .bind(restaurant_id)
-    .bind(kind)
-    .execute(pool)
-    .await
-    .map_err(database_error)?;
-    Ok(())
-}
-
 pub(crate) async fn sync_now(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -524,20 +561,48 @@ pub(crate) async fn sync_now(
     let m = member(&state, &headers).await?;
     manager(&m)?;
     require_config(&state)?;
+    let mut tx = state.pool.begin().await.map_err(database_error)?;
+    sqlx::query("SELECT id FROM restaurants WHERE id=$1 FOR UPDATE")
+        .bind(m.restaurant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    let selected = sqlx::query_scalar::<_, bool>(
+        "SELECT COUNT(*)=2 FROM restaurant_setup_streams
+         WHERE restaurant_id=$1 AND stream IN ('menu','sales')
+           AND method='connector' AND connector_provider='square'",
+    )
+    .bind(m.restaurant_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    if !selected {
+        return Err(ApiError(StatusCode::CONFLICT, "Select Square first."));
+    }
     let connection_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM source_connections
          WHERE restaurant_id=$1 AND provider=$2 AND status IN ('connected','error','needs_reauth','syncing')",
     )
     .bind(m.restaurant_id)
     .bind(PROVIDER)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(database_error)?
     .ok_or(ApiError(
         StatusCode::NOT_FOUND,
         "Connect Square before syncing.",
     ))?;
-    enqueue_sync(&state.pool, connection_id, m.restaurant_id, "incremental").await?;
+    sqlx::query(
+        "INSERT INTO source_sync_runs(id,connection_id,restaurant_id,kind,status)
+         VALUES($1,$2,$3,'incremental','queued')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(connection_id)
+    .bind(m.restaurant_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    tx.commit().await.map_err(database_error)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -547,6 +612,36 @@ pub(crate) async fn disconnect(
 ) -> Result<StatusCode, ApiError> {
     let m = member(&state, &headers).await?;
     manager(&m)?;
+    let mut tx = state.pool.begin().await.map_err(database_error)?;
+    sqlx::query("SELECT id FROM restaurants WHERE id=$1 FOR UPDATE")
+        .bind(m.restaurant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    sqlx::query("DELETE FROM oauth_states WHERE restaurant_id=$1 AND provider=$2")
+        .bind(m.restaurant_id)
+        .bind(PROVIDER)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    let running = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM source_sync_runs run
+         JOIN source_connections connection
+           ON connection.id=run.connection_id AND connection.restaurant_id=run.restaurant_id
+         WHERE connection.restaurant_id=$1 AND connection.provider=$2
+           AND run.status='running')",
+    )
+    .bind(m.restaurant_id)
+    .bind(PROVIDER)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    if running {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Wait for the Square sync to finish.",
+        ));
+    }
     let n = sqlx::query(
         "UPDATE source_connections
          SET status='disconnected',
@@ -558,16 +653,33 @@ pub(crate) async fn disconnect(
     )
     .bind(m.restaurant_id)
     .bind(PROVIDER)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(database_error)?
     .rows_affected();
     if n == 0 {
+        tx.rollback().await.map_err(database_error)?;
         return Err(ApiError(
             StatusCode::NOT_FOUND,
             "No Square connection to disconnect.",
         ));
     }
+    sqlx::query(
+        "UPDATE source_sync_runs run
+         SET status='failed',error='Square was disconnected before this sync started.',
+             finished_at=NOW()
+         FROM source_connections connection
+         WHERE run.connection_id=connection.id
+           AND run.restaurant_id=connection.restaurant_id
+           AND connection.restaurant_id=$1 AND connection.provider=$2
+           AND run.status='queued'",
+    )
+    .bind(m.restaurant_id)
+    .bind(PROVIDER)
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    tx.commit().await.map_err(database_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -592,6 +704,7 @@ struct SyncJob {
     connection_id: Uuid,
     restaurant_id: Uuid,
     kind: String,
+    claim_token: Uuid,
 }
 
 pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>) {
@@ -619,27 +732,108 @@ pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>) {
 
 async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let job = sqlx::query_as::<_, SyncJob>(
-        "SELECT id,connection_id,restaurant_id,kind FROM source_sync_runs
-         WHERE status='queued'
-         ORDER BY created_at
-         FOR UPDATE SKIP LOCKED
-         LIMIT 1",
+    sqlx::query(
+        "UPDATE source_sync_runs SET status='failed',error='Square sync timed out.',
+           finished_at=NOW(),claim_token=NULL,lease_expires_at=NULL
+         WHERE status='running' AND claim_token IS NOT NULL AND lease_expires_at<NOW()",
     )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE source_connections connection SET
+           status=COALESCE((SELECT CASE run.status WHEN 'succeeded' THEN 'connected' ELSE 'error' END
+                            FROM source_sync_runs run WHERE run.connection_id=connection.id
+                              AND run.status IN ('succeeded','failed')
+                            ORDER BY run.finished_at DESC NULLS LAST LIMIT 1),'error'),
+           last_error=(SELECT run.error FROM source_sync_runs run
+                       WHERE run.connection_id=connection.id
+                         AND run.status IN ('succeeded','failed')
+                       ORDER BY run.finished_at DESC NULLS LAST LIMIT 1),
+           updated_at=NOW()
+         WHERE connection.provider='square' AND connection.status='syncing'
+           AND NOT EXISTS (SELECT 1 FROM source_sync_runs run
+                           WHERE run.connection_id=connection.id AND run.status='running')",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let candidate = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT run.id,run.restaurant_id FROM source_sync_runs run
+         JOIN source_connections connection
+           ON connection.id=run.connection_id AND connection.restaurant_id=run.restaurant_id
+         WHERE run.status='queued' AND connection.provider='square'
+           AND NOT EXISTS (SELECT 1 FROM source_sync_runs active
+                           WHERE active.connection_id=run.connection_id
+                             AND active.status='running')
+         ORDER BY run.created_at LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((candidate_id, restaurant_id)) = candidate else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    sqlx::query("SELECT id FROM restaurants WHERE id=$1 FOR UPDATE")
+        .bind(restaurant_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE source_sync_runs run SET status='failed',
+           error='Square is not active for setup.',finished_at=NOW()
+         FROM source_connections connection
+         WHERE run.connection_id=connection.id
+           AND run.restaurant_id=connection.restaurant_id
+           AND run.restaurant_id=$1
+           AND run.status='queued' AND connection.provider='square'
+           AND (connection.status='disconnected' OR
+             (SELECT COUNT(*) FROM restaurant_setup_streams setup
+              WHERE setup.restaurant_id=run.restaurant_id
+                AND setup.stream IN ('menu','sales')
+                AND setup.method='connector'
+                AND setup.connector_provider='square')<>2)",
+    )
+    .bind(restaurant_id)
+    .execute(&mut *tx)
+    .await?;
+    let job = sqlx::query_as::<_, SyncJob>(
+        "SELECT run.id,run.connection_id,run.restaurant_id,run.kind,
+                $2::uuid claim_token
+         FROM source_sync_runs run
+         JOIN source_connections connection
+           ON connection.id=run.connection_id AND connection.restaurant_id=run.restaurant_id
+         WHERE run.id=$1 AND run.status='queued' AND connection.provider='square'
+           AND connection.status<>'disconnected'
+           AND (SELECT COUNT(*) FROM restaurant_setup_streams setup
+                WHERE setup.restaurant_id=run.restaurant_id
+                  AND setup.stream IN ('menu','sales')
+                  AND setup.method='connector'
+                  AND setup.connector_provider='square')=2
+         FOR UPDATE SKIP LOCKED
+         ",
+    )
+    .bind(candidate_id)
+    .bind(Uuid::now_v7())
     .fetch_optional(&mut *tx)
     .await?;
     let Some(job) = job else {
         tx.commit().await?;
         return Ok(None);
     };
-    sqlx::query("UPDATE source_sync_runs SET status='running',started_at=NOW() WHERE id=$1")
-        .bind(job.id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE source_connections SET status='syncing',updated_at=NOW() WHERE id=$1")
-        .bind(job.connection_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE source_sync_runs SET status='running',started_at=NOW(),
+           claim_token=$2,lease_expires_at=NOW()+INTERVAL '20 minutes' WHERE id=$1",
+    )
+    .bind(job.id)
+    .bind(job.claim_token)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE source_connections SET status='syncing',updated_at=NOW()
+         WHERE id=$1 AND restaurant_id=$2 AND status<>'disconnected'",
+    )
+    .bind(job.connection_id)
+    .bind(job.restaurant_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(Some(job))
 }
@@ -648,9 +842,10 @@ async fn process_job(pool: &PgPool, config: &SquareConfig, job: SyncJob) -> Resu
     let connection = sqlx::query_as::<_, ConnectionRow>(
         "SELECT id,restaurant_id,status,external_location_id,access_token_encrypted,
                 refresh_token_encrypted,access_token_expires_at,last_success_at
-         FROM source_connections WHERE id=$1",
+         FROM source_connections WHERE id=$1 AND restaurant_id=$2 AND provider='square'",
     )
     .bind(job.connection_id)
+    .bind(job.restaurant_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?
@@ -662,41 +857,75 @@ async fn process_job(pool: &PgPool, config: &SquareConfig, job: SyncJob) -> Resu
         .await
         .map_err(|e| e.to_string())?;
 
-    let result = run_sync(pool, config, &connection, &job, &timezone).await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(15 * 60),
+        run_sync(pool, config, &connection, &job, &timezone),
+    )
+    .await
+    .unwrap_or_else(|_| Err("Square sync timed out.".to_owned()));
     match result {
         Ok(stats) => {
-            sqlx::query(
+            let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+            sqlx::query("SELECT id FROM restaurants WHERE id=$1 FOR UPDATE")
+                .bind(job.restaurant_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            let finalized = sqlx::query(
                 "UPDATE source_sync_runs
-                 SET status='succeeded',stats=$2,finished_at=NOW(),error=NULL
-                 WHERE id=$1",
+                 SET status='succeeded',stats=$2,finished_at=NOW(),error=NULL,
+                     claim_token=NULL,lease_expires_at=NULL
+                 WHERE id=$1 AND claim_token=$3",
             )
             .bind(job.id)
             .bind(stats)
-            .execute(pool)
+            .bind(job.claim_token)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .rows_affected();
+            if finalized != 1 {
+                tx.commit().await.map_err(|e| e.to_string())?;
+                return Ok(());
+            }
             sqlx::query(
                 "UPDATE source_connections
                  SET status='connected',last_sync_at=NOW(),last_success_at=NOW(),
                      last_error=NULL,updated_at=NOW()
-                 WHERE id=$1",
+                 WHERE id=$1 AND restaurant_id=$2 AND status<>'disconnected'",
             )
             .bind(job.connection_id)
-            .execute(pool)
+            .bind(job.restaurant_id)
+            .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
         }
         Err(error) => {
             let message = error.chars().take(500).collect::<String>();
-            sqlx::query(
+            let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+            sqlx::query("SELECT id FROM restaurants WHERE id=$1 FOR UPDATE")
+                .bind(job.restaurant_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            let finalized = sqlx::query(
                 "UPDATE source_sync_runs
-                 SET status='failed',error=$2,finished_at=NOW() WHERE id=$1",
+                 SET status='failed',error=$2,finished_at=NOW(),
+                     claim_token=NULL,lease_expires_at=NULL
+                 WHERE id=$1 AND claim_token=$3",
             )
             .bind(job.id)
             .bind(&message)
-            .execute(pool)
+            .bind(job.claim_token)
+            .execute(&mut *tx)
             .await
-            .ok();
+            .map_err(|e| e.to_string())?
+            .rows_affected();
+            if finalized != 1 {
+                tx.commit().await.map_err(|e| e.to_string())?;
+                return Ok(());
+            }
             let status = if message.contains("reauth") {
                 "needs_reauth"
             } else {
@@ -705,14 +934,16 @@ async fn process_job(pool: &PgPool, config: &SquareConfig, job: SyncJob) -> Resu
             sqlx::query(
                 "UPDATE source_connections
                  SET status=$2,last_sync_at=NOW(),last_error=$3,updated_at=NOW()
-                 WHERE id=$1",
+                 WHERE id=$1 AND restaurant_id=$4 AND status<>'disconnected'",
             )
             .bind(job.connection_id)
             .bind(status)
             .bind(&message)
-            .execute(pool)
+            .bind(job.restaurant_id)
+            .execute(&mut *tx)
             .await
-            .ok();
+            .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -797,7 +1028,7 @@ async fn run_sync(
 }
 
 async fn square_get(config: &SquareConfig, access: &str, path: &str) -> Result<Value, String> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .get(format!("{}{path}", config.api_base()))
         .header(header::AUTHORIZATION, format!("Bearer {access}"))
@@ -820,7 +1051,7 @@ async fn square_post(
     path: &str,
     body: Value,
 ) -> Result<Value, String> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .post(format!("{}{path}", config.api_base()))
         .header(header::AUTHORIZATION, format!("Bearer {access}"))
@@ -1351,6 +1582,25 @@ mod tests {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&key);
         let enc = encrypt_secret(&arr, "square-token").unwrap();
+        let next = encrypt_secret(&arr, "square-token").unwrap();
         assert_eq!(decrypt_secret(&arr, &enc).unwrap(), "square-token");
+        assert_ne!(enc, next);
+    }
+
+    #[test]
+    fn production_oauth_is_read_only() {
+        let config = SquareConfig {
+            application_id: "app".into(),
+            application_secret: "secret".into(),
+            environment: "production".into(),
+            redirect_uri: "https://example.com/callback".into(),
+            token_key: [1; 32],
+            web_origin: "https://example.com".into(),
+        };
+        assert_eq!(
+            config.scopes(),
+            "ITEMS_READ ORDERS_READ MERCHANT_PROFILE_READ"
+        );
+        assert!(!config.scopes().contains("WRITE"));
     }
 }

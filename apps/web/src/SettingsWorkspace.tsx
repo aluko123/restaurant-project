@@ -1,4 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { LocationPicker } from "./CityInput";
 
 type Role = "owner" | "manager" | "staff";
 type ServiceStyle = "counter_service" | "full_service" | "fast_casual" | "cafe_bakery" | "bar";
@@ -7,6 +8,8 @@ export type SettingsRestaurant = {
   id: string;
   name: string;
   city: string;
+  region: string | null;
+  country: string | null;
   serviceStyle: ServiceStyle;
   timezone: string;
   role: Role;
@@ -34,7 +37,7 @@ type SettingsResponse = {
   invitationsEnabled: boolean;
 };
 
-type Draft = Pick<SettingsRestaurant, "name" | "city" | "serviceStyle" | "timezone">;
+type Draft = Pick<SettingsRestaurant, "name" | "city" | "serviceStyle" | "timezone"> & { region: string; country: string };
 
 type Props = {
   restaurant: SettingsRestaurant;
@@ -116,12 +119,18 @@ export function SettingsWorkspace({ restaurant, request, active, onRestaurantCha
 
   useEffect(() => { if (active) void load(); }, [active, load]);
 
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 5000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
   async function saveRestaurant(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
     setNotice("");
-    if (!draft.name.trim() || !draft.city.trim()) {
-      setError("Add the restaurant name and city.");
+    if (!draft.name.trim() || !draft.city.trim() || !draft.region.trim() || !draft.country.trim()) {
+      setError("Add the restaurant name and location.");
       return;
     }
     if (!isSupportedTimezone(draft.timezone.trim())) {
@@ -255,7 +264,7 @@ export function SettingsWorkspace({ restaurant, request, active, onRestaurantCha
     {owner ? <form className="settings-form" onSubmit={saveRestaurant} noValidate>
       <div className="settings-fields">
         <label>Restaurant name<input required autoComplete="organization" maxLength={50} value={draft.name} onChange={event => setDraft({ ...draft, name: event.target.value })}/></label>
-        <label>City<input required autoComplete="address-level2" maxLength={100} value={draft.city} onChange={event => setDraft({ ...draft, city: event.target.value })}/></label>
+        <LocationPicker id="settings-location" city={draft.city} region={draft.region} country={draft.country} onChange={location => setDraft({ ...draft, ...location })} />
         <label>Service style<select value={draft.serviceStyle} onChange={event => setDraft({ ...draft, serviceStyle: event.target.value as ServiceStyle })}>{serviceStyles.map(style => <option key={style.value} value={style.value}>{style.label}</option>)}</select></label>
         <label>Timezone<select required value={draft.timezone} aria-describedby="timezone-help" onChange={event => setDraft({ ...draft, timezone: event.target.value })}>{timezoneOptions.map(timezone => <option key={timezone} value={timezone}>{timezone.replaceAll("_", " ")}</option>)}</select><small id="timezone-help">Choose the restaurant's local timezone. Future Today and weekly brief boundaries change; saved timestamps and records do not.</small></label>
       </div>
@@ -264,7 +273,7 @@ export function SettingsWorkspace({ restaurant, request, active, onRestaurantCha
       <p className="readonly-note">Only an owner can update these details or manage team access.</p>
       <dl>
         <div><dt>Restaurant name</dt><dd>{response.restaurant.name}</dd></div>
-        <div><dt>City</dt><dd>{response.restaurant.city}</dd></div>
+        <div><dt>Location</dt><dd>{[response.restaurant.city, response.restaurant.region, response.restaurant.country].filter(Boolean).join(", ")}</dd></div>
         <div><dt>Service style</dt><dd>{serviceStyleLabel(response.restaurant.serviceStyle)}</dd></div>
         <div><dt>Timezone</dt><dd>{response.restaurant.timezone}</dd></div>
       </dl>
@@ -323,7 +332,7 @@ export function SettingsWorkspace({ restaurant, request, active, onRestaurantCha
 }
 
 function restaurantDraft(restaurant: SettingsRestaurant): Draft {
-  return { name: restaurant.name, city: restaurant.city, serviceStyle: restaurant.serviceStyle, timezone: restaurant.timezone };
+  return { name: restaurant.name, city: restaurant.city, region: restaurant.region ?? "", country: restaurant.country ?? "", serviceStyle: restaurant.serviceStyle, timezone: restaurant.timezone };
 }
 
 function isSupportedTimezone(value: string) {
@@ -335,7 +344,7 @@ function isSupportedTimezone(value: string) {
   }
 }
 
-function availableTimezones(current: string) {
+export function availableTimezones(current: string) {
   const supported = typeof Intl.supportedValuesOf === "function"
     ? Intl.supportedValuesOf("timeZone")
     : commonTimezones;

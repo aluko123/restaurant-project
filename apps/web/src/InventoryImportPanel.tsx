@@ -1,10 +1,10 @@
-import { ChangeEvent, useState } from "react";
+import { ChangeEvent, useEffect, useState } from "react";
 import type { ApiRequest } from "./SalesWorkspace";
 
 type ImportRow = { id:string; rowNumber:number; name:string; category:string|null; countUnit:string; parLevel:string|null; validationErrors:string[]; selected:boolean|null; createdInventoryItemId:string|null };
 type InventoryImport = { id:string; originalFilename:string; contentHash:string; status:string; revision:number; rows:ImportRow[] };
 
-export function InventoryImportPanel({request,onApplied}:{request:ApiRequest;onApplied:()=>Promise<void>}) {
+export function InventoryImportPanel({request,onApplied}:{request:ApiRequest;onApplied:(value:InventoryImport)=>Promise<void>}) {
   const [value,setValue]=useState<InventoryImport|null>(null);
   const [showAll,setShowAll]=useState(false);
   const [busy,setBusy]=useState(false), [error,setError]=useState(""), [notice,setNotice]=useState("");

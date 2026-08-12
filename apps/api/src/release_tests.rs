@@ -347,6 +347,176 @@ async fn seed_tenants(pool: &PgPool) -> FixtureIds {
 }
 
 #[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL and a disposable PostgreSQL database"]
+async fn persisted_price_findings_are_tenant_scoped_reviewable_and_drive_counts_and_today() {
+    let fixture = ApiFixture::create("price_findings").await;
+    let invoice = Uuid::now_v7();
+    let line = Uuid::now_v7();
+    let baseline_line = Uuid::now_v7();
+    let baseline = Uuid::now_v7();
+    let open = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO invoices(id,restaurant_id,uploaded_by,supplier_name,invoice_date,
+             original_filename,content_type,size_bytes,object_key,status)
+         VALUES($1,$2,$3,'Acme Foods','2026-08-10','finding.pdf','application/pdf',1,$4,'ready')",
+    )
+    .bind(invoice)
+    .bind(fixture.ids.restaurant_a)
+    .bind(fixture.ids.owner_a)
+    .bind(format!("release-tests/{invoice}.pdf"))
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO invoice_line_items(id,invoice_id,position,description,unit,unit_price,
+             comparison_key,comparison_unit) VALUES($1,$2,0,'Chicken','case',11,'sku:chk','case')",
+    )
+    .bind(line)
+    .bind(invoice)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO invoice_line_items(id,invoice_id,position,description,unit,unit_price,
+             comparison_key,comparison_unit) VALUES($1,$2,1,'Beef','case',10.5,'sku:beef','case')",
+    )
+    .bind(baseline_line)
+    .bind(invoice)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    for (id, source_line, status, price) in [
+        (baseline, baseline_line, "baseline", "10.50"),
+        (open, line, "open", "11.00"),
+    ] {
+        sqlx::query(
+            "INSERT INTO invoice_price_findings(id,restaurant_id,invoice_id,source_line_id,
+                 supplier_name,invoice_date,invoice_created_at,description,unit,currency,
+                 previous_unit_price,current_unit_price,percentage_change,previous_invoice_date,
+                 comparison_key,comparison_unit,increased,at_least_ten_percent,status)
+             VALUES($1,$2,$3,$4,'Acme Foods','2026-08-10',NOW(),'Chicken','case','USD',
+                    10,$5,10,'2026-08-01','sku:chk','case',TRUE,TRUE,$6)",
+        )
+        .bind(id)
+        .bind(fixture.ids.restaurant_a)
+        .bind(invoice)
+        .bind(source_line)
+        .bind(decimal(price))
+        .bind(status)
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    }
+
+    let owner_a = fixture.token("owner-a");
+    let owner_b = fixture.token("owner-b");
+    let changes = request(
+        fixture.app.clone(),
+        Some(&owner_a),
+        Method::GET,
+        &format!("/v1/invoices/{invoice}/price-changes"),
+        None,
+    )
+    .await;
+    assert_eq!(changes.status, StatusCode::OK);
+    assert_eq!(changes.body.as_array().unwrap().len(), 1);
+    assert_eq!(changes.body[0]["id"], open.to_string());
+    assert_eq!(changes.body[0]["status"], "open");
+    let other_tenant = request(
+        fixture.app.clone(),
+        Some(&owner_b),
+        Method::GET,
+        &format!("/v1/invoices/{invoice}/price-changes"),
+        None,
+    )
+    .await;
+    assert_eq!(other_tenant.body.as_array().unwrap().len(), 0);
+
+    let invoices = request(
+        fixture.app.clone(),
+        Some(&owner_a),
+        Method::GET,
+        "/v1/invoices",
+        None,
+    )
+    .await;
+    let card = invoices
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == invoice.to_string())
+        .unwrap();
+    assert_eq!(card["priceChangeCount"], 1);
+    let today = request(
+        fixture.app.clone(),
+        Some(&owner_a),
+        Method::GET,
+        "/v1/today",
+        None,
+    )
+    .await;
+    assert!(
+        today.body["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["ruleKey"] == "supplier_price_increase")
+    );
+
+    let reviewed = request(
+        fixture.app.clone(),
+        Some(&owner_a),
+        Method::PUT,
+        &format!("/v1/invoices/{invoice}/price-findings/{open}/reviewed"),
+        None,
+    )
+    .await;
+    assert_eq!(reviewed.status, StatusCode::NO_CONTENT);
+    let reviewed_again = request(
+        fixture.app.clone(),
+        Some(&owner_a),
+        Method::PUT,
+        &format!("/v1/invoices/{invoice}/price-findings/{open}/reviewed"),
+        None,
+    )
+    .await;
+    assert_eq!(reviewed_again.status, StatusCode::NO_CONTENT);
+    let invoices = request(
+        fixture.app.clone(),
+        Some(&owner_a),
+        Method::GET,
+        "/v1/invoices",
+        None,
+    )
+    .await;
+    let card = invoices
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == invoice.to_string())
+        .unwrap();
+    assert_eq!(card["priceChangeCount"], 0);
+    let today = request(
+        fixture.app.clone(),
+        Some(&owner_a),
+        Method::GET,
+        "/v1/today",
+        None,
+    )
+    .await;
+    assert!(
+        !today.body["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["ruleKey"] == "supplier_price_increase")
+    );
+    fixture.drop().await;
+}
+
+#[tokio::test]
 #[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
 async fn migrations_support_fresh_upgrade_and_checksum_safety() {
     let fresh = TestDatabase::create("migrations_fresh").await;
@@ -816,6 +986,141 @@ async fn api_enforces_tenant_and_role_boundaries() {
 
 #[tokio::test]
 #[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn menu_ingredient_queue_is_validated_tenant_scoped_and_derived_from_ingredients() {
+    let fixture = ApiFixture::create("menu_ingredient_queue").await;
+    let owner = fixture.token("owner-a");
+    let staff = fixture.token("staff-a");
+    let created = request(
+        fixture.app.clone(), Some(&owner), Method::POST, "/v1/menu-items",
+        Some(json!({"name":"Important taco","category":"Tacos","sellingPrice":"12","currency":"USD"})),
+    ).await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let id = created.body["id"].as_str().unwrap();
+    let path = format!("/v1/menu-items/{id}/ingredient-setup-choice");
+    let other_menu = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO menu_items(id,restaurant_id,name,selling_price,currency)
+         VALUES($1,$2,'Other tenant item',10,'USD')",
+    )
+    .bind(other_menu)
+    .bind(fixture.ids.restaurant_b)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    let other_tenant_path = format!("/v1/menu-items/{other_menu}/ingredient-setup-choice");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            &other_tenant_path,
+            Some(json!({"choice":"important"}))
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            &path,
+            Some(json!({"choice":"sales_ranked"}))
+        )
+        .await
+        .status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::PUT,
+            &path,
+            Some(json!({"choice":"important"}))
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    let other_path = format!("/v1/menu-items/{}/ingredient-setup-choice", Uuid::now_v7());
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            &other_path,
+            Some(json!({"choice":"important"}))
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            &path,
+            Some(json!({"choice":"important"}))
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    let menu = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/menu-items",
+        None,
+    )
+    .await;
+    assert_eq!(menu.body[0]["setupChoice"], "important");
+    assert_eq!(menu.body[0]["costState"], "recipe_not_configured");
+
+    let ingredients_path = format!("/v1/menu-items/{id}/ingredients");
+    let saved = request(fixture.app.clone(), Some(&owner), Method::PUT, &ingredients_path,
+        Some(json!({"ingredients":[{"inventoryItemId":fixture.ids.inventory_a,"quantity":"1","unit":"lb"}]}))).await;
+    assert_eq!(saved.status, StatusCode::OK);
+    let menu = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/menu-items",
+        None,
+    )
+    .await;
+    assert_eq!(menu.body[0]["setupChoice"], "important");
+    assert_eq!(menu.body[0]["costState"], "purchase_cost_missing");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            &ingredients_path,
+            Some(json!({"ingredients":[]}))
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let menu = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/menu-items",
+        None,
+    )
+    .await;
+    assert_eq!(menu.body[0]["setupChoice"], "important");
+    assert_eq!(menu.body[0]["costState"], "recipe_not_configured");
+    fixture.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
 async fn inventory_backend_import_and_order_guide_loop() {
     let fixture = ApiFixture::create("inventory_backend_loop").await;
     let owner = fixture.token("owner-a");
@@ -853,6 +1158,7 @@ async fn inventory_backend_import_and_order_guide_loop() {
         Some(json!({
             "posSystem": "  Toast  ",
             "accountingSystem": "QuickBooks Online",
+            "setupApproach": "assisted",
             "markComplete": true
         })),
     )
@@ -860,7 +1166,49 @@ async fn inventory_backend_import_and_order_guide_loop() {
     assert_eq!(setup.status, StatusCode::OK);
     assert_eq!(setup.body["posSystem"], "Toast");
     assert_eq!(setup.body["accountingSystem"], "QuickBooks Online");
+    assert_eq!(setup.body["setupApproach"], "assisted");
+    assert!(!setup.body["setupAssistanceRequestedAt"].is_null());
     assert!(!setup.body["completedAt"].is_null());
+    let preserved_assistance = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        "/v1/migration-setup",
+        Some(json!({
+            "posSystem": "Toast",
+            "accountingSystem": "QuickBooks Online",
+            "setupApproach": null,
+            "markComplete": false
+        })),
+    )
+    .await;
+    assert_eq!(preserved_assistance.status, StatusCode::OK);
+    let assisted_streams: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM restaurant_setup_streams
+         WHERE restaurant_id=$1 AND stream IN ('menu','sales')
+           AND method='assisted' AND owner='parline'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(assisted_streams, 2);
+    let self_service = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        "/v1/migration-setup",
+        Some(json!({
+            "posSystem": "Toast",
+            "accountingSystem": "QuickBooks Online",
+            "setupApproach": "self_service",
+            "markComplete": false
+        })),
+    )
+    .await;
+    assert_eq!(self_service.status, StatusCode::OK);
+    assert_eq!(self_service.body["setupApproach"], "self_service");
+    assert!(self_service.body["setupAssistanceRequestedAt"].is_null());
     let other_setup = request(
         fixture.app.clone(),
         Some(&other),
@@ -872,7 +1220,145 @@ async fn inventory_backend_import_and_order_guide_loop() {
     assert_eq!(other_setup.status, StatusCode::OK);
     assert!(other_setup.body["posSystem"].is_null());
     assert!(other_setup.body["completedAt"].is_null());
-    let csv = "name,count_unit,category,par_level\nRelease Beans,lb,Dry,8.25\nRelease Oil,liter,Pantry,3.5\n,each,Bad,2\n";
+
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::GET,
+            "/v1/setup",
+            None,
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    let plan = request(
+        fixture.app.clone(),
+        Some(&manager),
+        Method::GET,
+        "/v1/setup",
+        None,
+    )
+    .await;
+    assert_eq!(plan.status, StatusCode::OK);
+    assert_eq!(plan.body["streams"].as_array().unwrap().len(), 5);
+    assert_eq!(plan.body["activationState"], "ready_for_first_count");
+    assert_eq!(plan.body["firstCountHandoff"]["focusedItemCount"], 0);
+    assert_eq!(
+        plan.body["firstCountHandoff"]["unresolvedCriticalImportUnitCount"],
+        0
+    );
+    assert_eq!(plan.body["firstCountHandoff"]["state"], "ready");
+    let other_plan = request(
+        fixture.app.clone(),
+        Some(&other),
+        Method::GET,
+        "/v1/setup",
+        None,
+    )
+    .await;
+    assert_eq!(other_plan.status, StatusCode::OK);
+    assert_eq!(other_plan.body["activationState"], "ready_for_first_count");
+    assert_eq!(other_plan.body["firstCountHandoff"]["focusedItemCount"], 0);
+    assert_eq!(
+        other_plan.body["firstCountHandoff"]["unresolvedCriticalImportUnitCount"],
+        0
+    );
+    assert_eq!(other_plan.body["firstCountHandoff"]["state"], "ready");
+    let setup_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM restaurant_setup_streams WHERE restaurant_id=$1")
+            .bind(fixture.ids.restaurant_a)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(setup_rows, 2);
+
+    let inventory_plan = request(
+        fixture.app.clone(),
+        Some(&manager),
+        Method::PUT,
+        "/v1/setup/streams/inventory",
+        Some(json!({"method":"manual","owner":"restaurant","connectorProvider":null})),
+    )
+    .await;
+    assert_eq!(inventory_plan.status, StatusCode::OK);
+    assert_eq!(inventory_plan.body["streams"][2]["lifecycle"], "ready");
+    let invalid = request(
+        fixture.app.clone(),
+        Some(&manager),
+        Method::PUT,
+        "/v1/setup/streams/purchases",
+        Some(json!({"method":"manual","owner":"restaurant","connectorProvider":null})),
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let square_plan = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        "/v1/setup/connectors/square",
+        Some(json!({"selected":true})),
+    )
+    .await;
+    assert_eq!(square_plan.status, StatusCode::OK);
+    assert_eq!(square_plan.body["connectors"][0]["selected"], true);
+    let square_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM restaurant_setup_streams
+         WHERE restaurant_id=$1 AND connector_provider='square'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(square_rows, 2);
+    let square_plan = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        "/v1/setup/connectors/square",
+        Some(json!({"selected":false})),
+    )
+    .await;
+    assert_eq!(square_plan.status, StatusCode::OK);
+    assert_eq!(square_plan.body["connectors"][0]["selected"], false);
+
+    for _ in 0..10 {
+        let select = request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            "/v1/setup/connectors/square",
+            Some(json!({"selected":true})),
+        );
+        let change_menu = request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            "/v1/setup/streams/menu",
+            Some(json!({"method":"manual","owner":"restaurant","connectorProvider":null})),
+        );
+        let (selected, changed) = tokio::join!(select, change_menu);
+        assert_eq!(selected.status, StatusCode::OK);
+        assert!(matches!(
+            changed.status,
+            StatusCode::OK | StatusCode::CONFLICT
+        ));
+        let square_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM restaurant_setup_streams
+             WHERE restaurant_id=$1 AND stream IN ('menu','sales')
+               AND method='connector' AND connector_provider='square'",
+        )
+        .bind(fixture.ids.restaurant_a)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        assert_eq!(square_rows, 2);
+    }
+
+    // Nonblank custom units are legitimate; only a missing/invalid unit blocks a reviewable row.
+    let csv = "name,count_unit,category,par_level\nRelease Beans,lb,Dry,8.25\nRelease Oil,chef-tub,Pantry,3.5\nRelease Mystery,,Bad,2\n";
     assert_eq!(
         multipart_csv(fixture.app.clone(), &staff, csv).await.status,
         StatusCode::FORBIDDEN
@@ -887,6 +1373,31 @@ async fn inventory_backend_import_and_order_guide_loop() {
             .filter(|r| r["validationErrors"].as_array().unwrap().is_empty())
             .count(),
         2
+    );
+    let handoff = request(
+        fixture.app.clone(),
+        Some(&manager),
+        Method::GET,
+        "/v1/setup",
+        None,
+    )
+    .await;
+    assert_eq!(handoff.status, StatusCode::OK);
+    assert_eq!(
+        handoff.body["firstCountHandoff"]["unresolvedCriticalImportUnitCount"],
+        1
+    );
+    assert_eq!(
+        handoff.body["firstCountHandoff"]["state"],
+        "needs_unit_review"
+    );
+    assert_eq!(
+        handoff.body["firstCountHandoff"]["nextAction"],
+        "review_import_units"
+    );
+    assert_eq!(
+        handoff.body["streams"][2]["evidence"]["backlog"]["reviewCount"],
+        1
     );
     let apply_rows = rows
         .iter()
@@ -967,6 +1478,30 @@ async fn inventory_backend_import_and_order_guide_loop() {
         .await
         .unwrap(),
         2
+    );
+    let handoff = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/setup",
+        None,
+    )
+    .await;
+    assert_eq!(handoff.body["firstCountHandoff"]["focusedItemCount"], 2);
+    assert_eq!(
+        handoff.body["firstCountHandoff"]["unresolvedCriticalImportUnitCount"],
+        0
+    );
+    assert_eq!(handoff.body["firstCountHandoff"]["state"], "ready");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT count_unit FROM inventory_items WHERE restaurant_id=$1 AND name='Release Oil'"
+        )
+        .bind(fixture.ids.restaurant_a)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap(),
+        "chef-tub"
     );
 
     // Keep the imported items out of this count so the guide has one focused, fully counted line.
@@ -1492,6 +2027,139 @@ async fn exact_decimals_and_concurrent_replays_remain_stable() {
         saved_receipt,
         (1, "2.500000".into(), "1.2300".into(), "3.0750".into())
     );
+    let learned_ignore = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT supplier_key,comparison_key,comparison_unit FROM supplier_line_ignores
+         WHERE restaurant_id=$1",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        learned_ignore,
+        (
+            "exact supplier".into(),
+            "description:tomatoes".into(),
+            "case".into()
+        )
+    );
+
+    let next_invoice = Uuid::now_v7();
+    let exact_line = Uuid::now_v7();
+    let changed_unit_line = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO invoices(
+             id,restaurant_id,uploaded_by,supplier_name,invoice_date,original_filename,
+             content_type,size_bytes,object_key,status)
+         VALUES($1,$2,$3,'Exact Supplier','2026-07-21','next.pdf',
+                'application/pdf',8,$4,'ready')",
+    )
+    .bind(next_invoice)
+    .bind(fixture.ids.restaurant_a)
+    .bind(fixture.ids.owner_a)
+    .bind(format!("release-tests/{next_invoice}.pdf"))
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO invoice_extractions(
+             invoice_id,provider,model_id,raw_provider_json,supplier_name,invoice_number,
+             invoice_date,currency,total)
+         VALUES($1,'test','test-model','{}'::jsonb,'Exact Supplier','INV-2',
+                '2026-07-21','USD',6.00)",
+    )
+    .bind(next_invoice)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO invoice_line_items(
+             id,invoice_id,position,description,quantity,unit,unit_price,line_total,
+             comparison_key,comparison_unit)
+         VALUES
+             ($1,$3,0,'Tomatoes',1,'case',3,3,'description:tomatoes','case'),
+             ($2,$3,1,'Tomatoes',1,'each',3,3,'description:tomatoes','each')",
+    )
+    .bind(exact_line)
+    .bind(changed_unit_line)
+    .bind(next_invoice)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    let review = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        &format!("/v1/invoices/{next_invoice}/purchase-review"),
+        None,
+    )
+    .await;
+    assert_eq!(review.status, StatusCode::OK);
+    assert_eq!(review.body["lines"][0]["suggestedAction"], "ignore");
+    assert!(review.body["lines"][0]["suggestedInventoryItemId"].is_null());
+    assert!(review.body["lines"][1]["suggestedAction"].is_null());
+    let stale_saved = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        &format!("/v1/invoices/{next_invoice}/purchase-receipt"),
+        Some(json!({"resolutions": []})),
+    )
+    .await;
+    assert_eq!(stale_saved.status, StatusCode::CONFLICT);
+    let auto_saved = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        &format!("/v1/invoices/{next_invoice}/purchase-receipt"),
+        Some(json!({
+            "resolutions": [{"lineId": changed_unit_line, "action": "ignore"}]
+        })),
+    )
+    .await;
+    assert_eq!(auto_saved.status, StatusCode::OK);
+    assert_eq!(
+        auto_saved.body["receipt"]["lines"][0]["resolution"],
+        "ignored"
+    );
+    assert_eq!(
+        auto_saved.body["receipt"]["lines"][1]["resolution"],
+        "ignored"
+    );
+
+    let empty_invoice = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO invoices(
+             id,restaurant_id,uploaded_by,supplier_name,invoice_date,original_filename,
+             content_type,size_bytes,object_key,status)
+         VALUES($1,$2,$3,'Empty Supplier','2026-07-21','empty.pdf',
+                'application/pdf',8,$4,'ready')",
+    )
+    .bind(empty_invoice)
+    .bind(fixture.ids.restaurant_a)
+    .bind(fixture.ids.owner_a)
+    .bind(format!("release-tests/{empty_invoice}.pdf"))
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO invoice_extractions(
+             invoice_id,provider,model_id,raw_provider_json,supplier_name,invoice_date,currency)
+         VALUES($1,'test','test-model','{}'::jsonb,'Empty Supplier','2026-07-21','USD')",
+    )
+    .bind(empty_invoice)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    let empty_record = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        &format!("/v1/invoices/{empty_invoice}/purchase-receipt"),
+        Some(json!({"resolutions": []})),
+    )
+    .await;
+    assert_eq!(empty_record.status, StatusCode::CONFLICT);
 
     let start_owner = request(
         fixture.app.clone(),
@@ -1671,6 +2339,26 @@ async fn inventory_walk_order_scope_skip_and_history() {
         .await
         .unwrap();
 
+    // A focused first count includes only selected imported items.
+    let focused = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        Some(json!({"itemIds": [vodka_id]})),
+    )
+    .await;
+    assert_eq!(focused.status, StatusCode::CREATED);
+    assert_eq!(focused.body["scope"], "focused");
+    assert_eq!(focused.body["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(focused.body["entries"][0]["name"], "Bar Vodka");
+
+    sqlx::query("DELETE FROM inventory_count_sessions WHERE restaurant_id=$1 AND status='draft'")
+        .bind(fixture.ids.restaurant_a)
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+
     // Area-scoped count: Bar only.
     let scoped = request(
         fixture.app.clone(),
@@ -1750,6 +2438,15 @@ async fn inventory_walk_order_scope_skip_and_history() {
     assert_eq!(completed.status, StatusCode::OK);
     assert_eq!(completed.body["status"], "completed");
     assert_eq!(completed.body["entries"][0]["skipped"], true);
+    let setup_after_skipped = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/setup",
+        None,
+    )
+    .await;
+    assert_ne!(setup_after_skipped.body["activationState"], "active");
 
     // History lists the completed session; detail matches.
     let history = request(
@@ -1822,6 +2519,36 @@ async fn inventory_walk_order_scope_skip_and_history() {
         .await
         .status,
         StatusCode::OK
+    );
+    let active_setup = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/setup",
+        None,
+    )
+    .await;
+    assert_eq!(active_setup.body["activationState"], "active");
+    assert_eq!(active_setup.body["firstCountHandoff"]["state"], "completed");
+    assert!(active_setup.body["firstCountHandoff"]["nextAction"].is_null());
+    assert_eq!(
+        active_setup.body["streams"][2]["evidence"]["backlog"]["reviewCount"],
+        0
+    );
+    let today = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/today",
+        None,
+    )
+    .await;
+    assert!(
+        today.body["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| !action["ruleKey"].as_str().unwrap().starts_with("source_"))
     );
 
     let third = request(

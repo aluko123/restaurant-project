@@ -22,6 +22,8 @@ pub(crate) struct MenuItem {
     currency: String,
     active: bool,
     ingredient_count: i64,
+    setup_choice: Option<String>,
+    cost_state: String,
 }
 
 #[derive(Deserialize)]
@@ -33,25 +35,42 @@ pub(crate) struct CreateMenuItem {
     currency: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IngredientSetupChoice {
+    choice: String,
+}
+
 pub(crate) async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<MenuItem>>, ApiError> {
     let restaurant_id = manager_restaurant_id(&state, &headers).await?;
-    let items = sqlx::query_as::<_, MenuItem>(
+    let mut items = sqlx::query_as::<_, MenuItem>(
         "SELECT item.id,item.name,item.category,item.selling_price::text AS selling_price,
-                item.currency,item.active,COUNT(ingredient.id)::bigint AS ingredient_count
+                item.currency,item.active,COUNT(ingredient.id)::bigint AS ingredient_count,
+                preference.choice AS setup_choice,'recipe_not_configured'::text AS cost_state
          FROM menu_items item
          LEFT JOIN menu_item_ingredients ingredient ON ingredient.menu_item_id=item.id
            AND ingredient.restaurant_id=item.restaurant_id
+         LEFT JOIN menu_ingredient_setup_preferences preference
+           ON preference.menu_item_id=item.id AND preference.restaurant_id=item.restaurant_id
          WHERE item.restaurant_id=$1 AND item.active
-         GROUP BY item.id,item.name,item.category,item.selling_price,item.currency,item.active
+         GROUP BY item.id,item.name,item.category,item.selling_price,item.currency,item.active,preference.choice
          ORDER BY item.category NULLS LAST,item.name,item.id",
     )
     .bind(restaurant_id)
     .fetch_all(&state.pool)
     .await
     .map_err(crate::database_error)?;
+    let ids = items.iter().map(|item| item.id).collect::<Vec<_>>();
+    let states = crate::costing::load_cost_states(&state.pool, restaurant_id, &ids).await?;
+    for item in &mut items {
+        item.cost_state = states
+            .get(&item.id)
+            .cloned()
+            .unwrap_or_else(|| "recipe_not_configured".into());
+    }
     Ok(Json(items))
 }
 
@@ -66,7 +85,8 @@ pub(crate) async fn create(
         "INSERT INTO menu_items (id,restaurant_id,name,category,selling_price,currency)
          VALUES ($1,$2,$3,$4,$5,$6)
          RETURNING id,name,category,selling_price::text AS selling_price,currency,active,
-                   0::bigint AS ingredient_count",
+                   0::bigint AS ingredient_count,NULL::text AS setup_choice,
+                   'recipe_not_configured'::text AS cost_state",
     )
     .bind(Uuid::now_v7())
     .bind(restaurant_id)
@@ -91,6 +111,41 @@ pub(crate) async fn create(
         }
     })?;
     Ok((StatusCode::CREATED, Json(item)))
+}
+
+pub(crate) async fn put_ingredient_setup_choice(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Json(input): Json<IngredientSetupChoice>,
+) -> Result<StatusCode, ApiError> {
+    let member = membership(&state, &headers).await?;
+    let restaurant_id = manager_restaurant_id(&state, &headers).await?;
+    if !matches!(input.choice.as_str(), "important" | "later") {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Choose important or later.",
+        ));
+    }
+    let affected = sqlx::query(
+        "INSERT INTO menu_ingredient_setup_preferences
+         (restaurant_id,menu_item_id,choice,created_by,updated_by)
+         SELECT $1,id,$3,$4,$4 FROM menu_items WHERE id=$2 AND restaurant_id=$1 AND active
+         ON CONFLICT (restaurant_id,menu_item_id) DO UPDATE SET
+           choice=EXCLUDED.choice,updated_by=EXCLUDED.updated_by,updated_at=NOW()",
+    )
+    .bind(restaurant_id)
+    .bind(id)
+    .bind(input.choice)
+    .bind(member.user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(database_error)?
+    .rows_affected();
+    if affected == 0 {
+        return Err(ApiError(StatusCode::NOT_FOUND, "Menu item not found."));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn manager_restaurant_id(state: &AppState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
