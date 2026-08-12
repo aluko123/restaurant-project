@@ -34,11 +34,13 @@ export function TodayWorkspace({
   request,
   active,
   canManageInvoices,
+  setupIncomplete,
   onNavigate,
 }: {
   request: ApiRequest;
   active: boolean;
   canManageInvoices: boolean;
+  setupIncomplete: boolean;
   onNavigate: (path: string) => void;
 }) {
   const [state, setState] = useState<TodayState>({ status: "loading" });
@@ -79,6 +81,17 @@ export function TodayWorkspace({
           <p>A short, source-backed list of what needs attention.</p>
         )}
       </header>
+
+      {canManageInvoices && setupIncomplete && (
+        <aside className="today-setup-resume" aria-labelledby="today-setup-resume-heading">
+          <div>
+            <p className="section-code">Setup in progress</p>
+            <h2 id="today-setup-resume-heading">Keep preparing your restaurant.</h2>
+            <p>Continue the guided launch or self-service steps without losing anything already added.</p>
+          </div>
+          <button className="file-button" type="button" onClick={() => onNavigate("/sources")}>Continue setup</button>
+        </aside>
+      )}
 
       {state.status === "loading" ? (
         <p className="today-status" role="status">

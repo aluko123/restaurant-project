@@ -154,6 +154,45 @@ pub(crate) async fn get(
     let m = member(&s, &h).await?;
     Ok(Json(load(&s, id, m.restaurant_id).await?))
 }
+pub(crate) async fn latest(
+    State(s): State<AppState>,
+    h: HeaderMap,
+) -> Result<Json<Option<Import>>, ApiError> {
+    let m = member(&s, &h).await?;
+    let id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM inventory_imports WHERE restaurant_id=$1 AND status='needs_review' ORDER BY updated_at DESC,id DESC LIMIT 1",
+    )
+    .bind(m.restaurant_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(database_error)?;
+    Ok(Json(match id {
+        Some(id) => Some(load(&s, id, m.restaurant_id).await?),
+        None => None,
+    }))
+}
+pub(crate) async fn discard(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let m = member(&s, &h).await?;
+    let result = sqlx::query(
+        "DELETE FROM inventory_imports WHERE id=$1 AND restaurant_id=$2 AND status='needs_review'",
+    )
+    .bind(id)
+    .bind(m.restaurant_id)
+    .execute(&s.pool)
+    .await
+    .map_err(database_error)?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "Open inventory import not found.",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
 pub(crate) async fn apply(
     State(s): State<AppState>,
     h: HeaderMap,

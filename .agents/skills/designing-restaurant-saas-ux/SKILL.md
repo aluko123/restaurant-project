@@ -66,6 +66,8 @@ Assume users are on phones in noisy, rushed restaurant environments.
 - Support glare/low-light use with strong contrast.
 - Avoid dense tables on mobile; use cards or progressive disclosure.
 
+For restaurant location, use conventional cascading native selects in this order: country, state/province/region, then city. Keep each field a normal height, disable later choices until their parent is selected, and provide an explicit `Other` entry path without stretching neighboring form fields. Store country and region separately from city so analytics never depends on parsing display labels. Do not use a browser datalist.
+
 ### “Top 20” Before “Track Everything”
 
 Do not force full ERP inventory behavior.

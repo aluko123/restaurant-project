@@ -16,6 +16,8 @@ struct SettingsContext {
     id: Uuid,
     name: String,
     city: String,
+    region: Option<String>,
+    country: Option<String>,
     service_style: String,
     timezone: String,
     role: String,
@@ -41,6 +43,8 @@ struct RestaurantSettings {
     id: Uuid,
     name: String,
     city: String,
+    region: Option<String>,
+    country: Option<String>,
     service_style: String,
     timezone: String,
     role: String,
@@ -101,6 +105,8 @@ struct ActiveInvitation {
 pub(crate) struct UpdateRestaurant {
     name: String,
     city: String,
+    region: Option<String>,
+    country: Option<String>,
     service_style: String,
     timezone: String,
 }
@@ -132,11 +138,13 @@ pub(crate) async fn update(
 
     sqlx::query(
         "UPDATE restaurants
-         SET name=$1,city=$2,service_style=$3,timezone=$4,updated_at=NOW()
-         WHERE id=$5",
+         SET name=$1,city=$2,region=COALESCE($3,region),country=COALESCE($4,country),service_style=$5,timezone=$6,updated_at=NOW()
+         WHERE id=$7",
     )
     .bind(&input.name)
     .bind(&input.city)
+    .bind(&input.region)
+    .bind(&input.country)
     .bind(&input.service_style)
     .bind(&input.timezone)
     .bind(actor.restaurant_id)
@@ -470,7 +478,7 @@ async fn invitation_target(
 
 async fn load_settings(state: &AppState, subject: &str) -> Result<SettingsResponse, ApiError> {
     let context = sqlx::query_as::<_, SettingsContext>(
-        "SELECT r.id,r.name,r.city,r.service_style,r.timezone,m.role,u.id AS user_id
+        "SELECT r.id,r.name,r.city,r.region,r.country,r.service_style,r.timezone,m.role,u.id AS user_id
          FROM users u
          JOIN restaurant_memberships m ON m.user_id=u.id
          JOIN restaurants r ON r.id=m.restaurant_id
@@ -516,6 +524,8 @@ async fn load_settings(state: &AppState, subject: &str) -> Result<SettingsRespon
             id: context.id,
             name: context.name,
             city: context.city,
+            region: context.region,
+            country: context.country,
             service_style: context.service_style,
             timezone: context.timezone,
             role: context.role,
@@ -703,6 +713,14 @@ impl UpdateRestaurant {
     fn validated(mut self) -> Result<Self, ApiError> {
         self.name = self.name.trim().to_owned();
         self.city = self.city.trim().to_owned();
+        self.region = self
+            .region
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        self.country = self
+            .country
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         self.service_style = self.service_style.trim().to_owned();
         self.timezone = self.timezone.trim().to_owned();
         if self.name.is_empty() || self.name.chars().count() > 50 {
@@ -715,6 +733,26 @@ impl UpdateRestaurant {
             return Err(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "City must be between 1 and 100 characters.",
+            ));
+        }
+        if self
+            .region
+            .as_ref()
+            .is_some_and(|region| region.chars().count() > 100)
+        {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "State or region must be at most 100 characters.",
+            ));
+        }
+        if self
+            .country
+            .as_ref()
+            .is_some_and(|country| country.chars().count() > 100)
+        {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Country must be at most 100 characters.",
             ));
         }
         if !matches!(
@@ -775,6 +813,8 @@ mod tests {
         UpdateRestaurant {
             name: "  Marigold  ".into(),
             city: " Dallas ".into(),
+            region: Some(" Texas ".into()),
+            country: Some(" United States ".into()),
             service_style: "fast_casual".into(),
             timezone: timezone.into(),
         }
@@ -800,6 +840,8 @@ mod tests {
         let value = settings(" America/Chicago ").validated().unwrap();
         assert_eq!(value.name, "Marigold");
         assert_eq!(value.city, "Dallas");
+        assert_eq!(value.region.as_deref(), Some("Texas"));
+        assert_eq!(value.country.as_deref(), Some("United States"));
         assert_eq!(value.timezone, "America/Chicago");
         assert!(settings("America/Dallas").validated().is_err());
         assert!(settings("Not/A_Zone").validated().is_err());

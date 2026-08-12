@@ -95,6 +95,8 @@ type EntryState = { quantity: string; skipped: boolean };
 
 const inventoryUnits = ["each", "lb", "oz", "kg", "g", "case", "bag", "bottle", "can", "gal", "L"];
 const suggestedAreas = ["Walk-in", "Dry storage", "Prep", "Bar", "Freezer"];
+const countScopeLabel = (scope: string) =>
+  scope === "areas" ? "Selected areas" : scope === "focused" ? "Selected items" : "Whole house";
 const blankItem: ItemFields = {
   name: "",
   category: "",
@@ -852,7 +854,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
                   <p>
                     {row.scope === "areas" && row.areaNames
                       ? row.areaNames
-                      : "Whole house"}{" "}
+                      : countScopeLabel(row.scope)}{" "}
                     · {row.countedCount} counted
                     {row.skippedCount > 0 ? ` · ${row.skippedCount} skipped` : ""} · {row.entryCount}{" "}
                     items
@@ -889,7 +891,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
               : "Completed count"}
           </h1>
           <p>
-            {historyDetail.scope === "areas" ? "Selected areas" : "Whole house"} ·{" "}
+            {countScopeLabel(historyDetail.scope)} ·{" "}
             {historyDetail.entries.filter((e) => e.quantity !== null).length} counted ·{" "}
             {historyDetail.entries.filter((e) => e.skipped).length} skipped
           </p>
@@ -1044,7 +1046,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
             .map((e) => e.storageAreaName)
             .filter((name, index, all): name is string => Boolean(name) && all.indexOf(name) === index)
             .join(" · ") || "Selected areas"
-        : "Whole house";
+        : countScopeLabel(count.scope);
 
     if (mode === "review") {
       return (
@@ -1250,7 +1252,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
         </div>
         {count && (
           <p className="draft-badge" role="status">
-            Draft in progress · {count.scope === "areas" ? "Selected areas" : "Whole house"} ·{" "}
+            Draft in progress · {countScopeLabel(count.scope)} ·{" "}
             {count.entries.filter((e) => e.quantity !== null || e.skipped).length} of{" "}
             {count.entries.length} done
           </p>
@@ -1378,7 +1380,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
       {manager && (
         <InventoryImportPanel
           request={request}
-          onApplied={async () => {
+          onApplied={async (appliedImport) => {
             if (count) {
               await loadOverview();
               showNotice(
@@ -1387,9 +1389,12 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
               return;
             }
             try {
+              const itemIds = appliedImport.rows.flatMap((row) =>
+                row.createdInventoryItemId ? [row.createdInventoryItemId] : [],
+              );
               const next = await request<InventoryCount>("/v1/inventory-counts", {
                 method: "POST",
-                body: "{}",
+                body: JSON.stringify({ itemIds }),
               });
               adoptCount(next);
               showNotice("Inventory items imported. Your first count is ready to record.");
