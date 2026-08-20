@@ -51,6 +51,7 @@ struct AppState {
     pool: PgPool,
     verifier: JwtVerifier,
     storage: ObjectStorage,
+    gemini: extraction::GeminiClient,
     workos: WorkosClient,
     square: Option<square::SquareConfig>,
 }
@@ -179,7 +180,7 @@ async fn main() -> Result<()> {
     tokio::spawn(menu_imports::run_worker(
         pool.clone(),
         storage.clone(),
-        gemini,
+        gemini.clone(),
     ));
     let square_config = square::SquareConfig::from_env(&web_origin);
     if square_config.is_some() {
@@ -194,6 +195,7 @@ async fn main() -> Result<()> {
             pool,
             verifier,
             storage,
+            gemini,
             workos,
             square: square_config,
         },

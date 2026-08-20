@@ -167,6 +167,7 @@ impl ApiFixture {
                 pool: database.pool.clone(),
                 verifier,
                 storage: ObjectStorage::inert_for_tests(),
+                gemini: crate::extraction::GeminiClient::inert_for_tests(),
                 workos: WorkosClient::mock(workos.clone()),
                 square: None,
             },

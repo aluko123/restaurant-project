@@ -56,20 +56,13 @@ WORKOS_ISSUER=https://api.workos.com/user_management/client_your_client_id
 WORKOS_JWKS_URL=https://api.workos.com/sso/jwks/client_your_client_id
 ```
 
-### Sales CSV v1
+### Flexible CSV imports
 
-Owners and managers can preview and apply one complete business date from the Sales workspace. Download the in-app template or provide a UTF-8, comma-delimited CSV (optional UTF-8 BOM and standard quoted fields are supported):
+Owners and managers can upload existing sales and inventory CSV exports without renaming or reordering columns. Gemini extracts the fields Parline needs into a structured preview; no data is applied until the user reviews it.
 
-```csv
-business_date,item_name,quantity,item_code,net_sales,currency
-2026-07-21,Chicken Taco,84,TACO-CHICKEN,1008.00,USD
-2026-07-21,Chips and Salsa,31,,,
-```
-
-- Required headers: `business_date`, `item_name`, `quantity`.
-- Optional headers: `item_code`, `net_sales`, `currency`. Header order may vary; unknown and duplicate headers are rejected.
-- Every row must use the same ISO `YYYY-MM-DD` business date. Files are limited to 1 MiB and 2,000 data rows.
-- Quantity must be greater than zero with at most 6 decimal places. Net sales, when reported, must be nonnegative with at most 4 decimal places and must include a three-letter currency.
+- Sales imports represent one complete business date and extract item name, quantity, optional item code, and optional net sales/currency. Files are limited to 1 MiB and 200 extracted item rows.
+- Inventory imports extract item name, counting unit, optional category, and optional par level. Files are limited to 1 MiB and 200 extracted items; the first 20 valid items are selected by default to support a focused initial count.
+- Missing or unclear values are never invented. Inventory values can be corrected in review; files without one identifiable sales date or valid item-level sales must be re-exported.
 - Menu matching uses only the trimmed, case-insensitive item name. Item codes are reference-only; there is no fuzzy or alias matching, and name collisions remain unmatched.
 - Every unmatched row must be manually mapped or explicitly excluded. Reported currency must match the selected menu item's currency and is never guessed when missing.
 - Applying creates or atomically replaces the canonical sales day using the revision shown in preview. If that day changes first, the apply is rejected and the preview must be refreshed.

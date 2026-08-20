@@ -242,7 +242,7 @@ export function SalesWorkspace({
 
   async function previewCsv(file = importFile) {
     if (!file) {
-      setError("Choose a CSV file to preview.");
+      setError("Choose a sales CSV to read.");
       return;
     }
     if (file.size > 1024 * 1024) {
@@ -275,7 +275,7 @@ export function SalesWorkspace({
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (reason) {
       if (generation !== requestGeneration.current) return;
-      setError(errorMessage(reason, "The CSV couldn't be previewed. Check the file and try again."));
+      setError(errorMessage(reason, "We couldn't read this sales file. Try exporting it again from your POS."));
     } finally {
       if (generation === requestGeneration.current) setImporting(false);
     }
@@ -450,7 +450,6 @@ export function SalesWorkspace({
 
       {canImport && !importPreview && !loading && !dateChanged && (
         <SalesImportUpload
-          businessDate={loadedDate}
           file={importFile}
           importing={importing}
           onFile={selectImportFile}
@@ -524,13 +523,11 @@ export function SalesWorkspace({
 }
 
 function SalesImportUpload({
-  businessDate,
   file,
   importing,
   onFile,
   onPreview,
 }: {
-  businessDate: string;
   file: File | null;
   importing: boolean;
   onFile: (file: File | null) => void;
@@ -539,11 +536,11 @@ function SalesImportUpload({
   return (
     <section className="sales-import-upload" aria-labelledby="sales-import-heading">
       <div>
-        <p className="section-code">CSV import</p>
-        <h2 id="sales-import-heading">Upload sales CSV</h2>
+        <p className="section-code">Flexible CSV import</p>
+        <h2 id="sales-import-heading">Upload any sales CSV</h2>
         <p>
-          Exact menu names match automatically. You will map or exclude every unmatched row and
-          review the complete saved-day replacement before anything changes.
+          Use the item-sales export from your POS — columns and headings do not need to match a
+          template. We’ll read it, then you’ll map or exclude unmatched items before anything changes.
         </p>
       </div>
       <div className="sales-import-controls">
@@ -563,14 +560,11 @@ function SalesImportUpload({
           {file ? "Choose another CSV" : "Choose CSV"}
         </label>
         <button className="ledger-button" type="button" disabled={!file || importing} onClick={onPreview}>
-          {importing ? "Checking CSV…" : "Preview CSV"}
-        </button>
-        <button className="text-button" type="button" onClick={() => downloadSalesCsvTemplate(businessDate)}>
-          Download CSV template
+          {importing ? "Reading sales…" : "Read and review"}
         </button>
       </div>
       <p className="selected-file" aria-live="polite">
-        {file ? `${file.name} · ${formatFileSize(file.size)}` : "CSV only · 1 MiB maximum · one business date"}
+        {file ? `${file.name} · ${formatFileSize(file.size)}` : "Any CSV layout · 1 MiB maximum · one business date"}
       </p>
     </section>
   );
@@ -1196,20 +1190,6 @@ function nullableDecimalEqual(
   return left === null || right === null
     ? left === right
     : exactDecimalEqual(left, right, scale);
-}
-
-function downloadSalesCsvTemplate(businessDate: string) {
-  const csv = [
-    "business_date,item_name,quantity,item_code,net_sales,currency",
-    `${businessDate},Chicken Taco,84,TACO-CHICKEN,1008.00,USD`,
-    `${businessDate},Chips and Salsa,31,,,`,
-  ].join("\n");
-  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `parline-sales-${businessDate}.csv`;
-  link.click();
-  URL.revokeObjectURL(url);
 }
 
 function formatFileSize(bytes: number): string {
