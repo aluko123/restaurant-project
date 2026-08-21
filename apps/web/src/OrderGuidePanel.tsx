@@ -25,6 +25,8 @@ export type OrderGuideLine = {
 export type OrderGuide = {
   id: string;
   sourceCountId: string;
+  sourceCountCompletedAt: string | null;
+  newerCountExists: boolean;
   status: "draft" | "ordered" | "received" | "cancelled";
   revision: number;
   createdAt: string;
@@ -67,6 +69,12 @@ function displayGuide(guide: OrderGuide): OrderGuide {
         line.receivedQuantity === null ? null : formatQuantity(line.receivedQuantity),
     })),
   };
+}
+
+function formatDateOnly(value: string) {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(
+    new Date(`${value}T00:00:00Z`),
+  );
 }
 
 function discrepancyCopy(line: OrderGuideLine): string | null {
@@ -272,6 +280,13 @@ export function OrderGuidePanel({
       {!manager && !ordered && (
         <p className="review-warning">
           A manager must review, edit, order, or cancel this draft.
+        </p>
+      )}
+      {!ordered && draft.newerCountExists && (
+        <p className="review-warning" role="status">
+          Based on your last full count
+          {draft.sourceCountCompletedAt ? ` from ${formatDateOnly(draft.sourceCountCompletedAt.slice(0, 10))}` : ""}. A
+          newer partial count exists and did not change these suggestions.
         </p>
       )}
       {receivedMismatches.length > 0 && (

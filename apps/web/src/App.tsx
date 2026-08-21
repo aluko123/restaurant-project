@@ -13,7 +13,7 @@ type AppProps = {
 };
 
 type Restaurant = SettingsRestaurant;
-type Invoice = { id: string; supplierName: string; invoiceDate: string; originalFilename: string; contentType: string; sizeBytes: number; status: string; delayed: boolean; priceChangeCount: number; purchaseReceiptRecorded: boolean; createdAt: string };
+type Invoice = { id: string; supplierName: string; invoiceDate: string; originalFilename: string; contentType: string; sizeBytes: number; status: string; delayed: boolean; priceChangeCount: number; purchaseReceiptRecorded: boolean; duplicate: boolean; createdAt: string };
 type ReviewLine = { id?: string; sku: string | null; description: string; quantity: string | null; unit: string | null; unitPrice: string | null; lineTotal: string | null; hasWarnings: boolean };
 type Review = { invoiceId: string; supplierName: string; invoiceNumber: string | null; invoiceDate: string | null; currency: string; subtotal: string | null; tax: string | null; fees: string | null; discount: string | null; total: string | null; hasWarnings: boolean; lineItems: ReviewLine[] };
 type PriceChange = { id: string; description: string; unit: string | null; currency: string; previousUnitPrice: string; currentUnitPrice: string; percentageChange: string; previousInvoiceDate: string; status: "open" | "reviewed" };
@@ -715,6 +715,7 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
   const [purchaseId, setPurchaseId] = useState("");
   const [approvedPriceChanges, setApprovedPriceChanges] = useState<PriceChange[] | null>(null);
   const [retryingId, setRetryingId] = useState("");
+  const [deletingId, setDeletingId] = useState("");
   const [invoiceSearch, setInvoiceSearch] = useState("");
   const [invoiceStatus, setInvoiceStatus] = useState<"action" | "processing" | "approved" | "all">("action");
   const [invoicePeriod, setInvoicePeriod] = useState<"30" | "90" | "year" | "all">("90");
@@ -747,11 +748,27 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
     setUploading(true);
     try {
       const invoice = await request<Invoice>("/v1/invoices", { method: "POST", body });
-      setInvoices((current) => [invoice, ...current]); setFile(null);
-      setNotice("Invoice uploaded. We’re reading the supplier and line items.");
+      if (invoice.duplicate) {
+        setNotice("This invoice was already uploaded, so nothing was added.");
+      } else {
+        setInvoices((current) => [invoice, ...current]);
+        setNotice("Invoice uploaded. We’re reading the supplier and line items.");
+      }
+      setFile(null);
       form.reset();
     } catch (error) { setUploadError(error instanceof Error ? error.message : "Invoice upload failed. Please try again."); }
     finally { setUploading(false); }
+  }
+
+  async function removeInvoice(invoice: Invoice) {
+    if (!window.confirm(`Delete the ${invoice.supplierName} invoice? This cannot be undone.`)) return;
+    setDeletingId(invoice.id); setListError("");
+    try {
+      await request(`/v1/invoices/${invoice.id}`, { method: "DELETE" });
+      setInvoices((current) => current.filter((row) => row.id !== invoice.id));
+      setNotice("Invoice deleted.");
+    } catch (error) { setListError(error instanceof Error ? error.message : "The invoice couldn't be deleted. Please try again."); }
+    finally { setDeletingId(""); }
   }
 
   async function openOriginal(invoice: Invoice) {
@@ -812,8 +829,8 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
         {listError && <p className="form-error" role="alert">{listError}</p>}
         {!loading&&invoices.length>0&&<div className="collection-toolbar invoice-toolbar" aria-label="Filter invoices"><label className="collection-search">Search all invoices<input type="search" placeholder="Supplier or filename" value={invoiceSearch} onChange={event=>{const value=event.target.value;if(!invoiceSearch.trim()&&value.trim()){setInvoiceStatus("all");setInvoicePeriod("all")}setInvoiceSearch(value)}}/></label><label>Status<select value={invoiceStatus} onChange={event=>setInvoiceStatus(event.target.value as typeof invoiceStatus)}><option value="action">Needs action</option><option value="processing">Processing</option><option value="approved">Approved</option><option value="all">All statuses</option></select></label><label>Period<select value={invoicePeriod} onChange={event=>setInvoicePeriod(event.target.value as typeof invoicePeriod)}><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="year">This year</option><option value="all">All history</option></select></label><div className="collection-toolbar-summary"><strong>{filteredInvoices.length} {filteredInvoices.length===1?"invoice":"invoices"}</strong>{invoiceFiltersActive&&<button className="text-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("action");setInvoicePeriod("90")}}>Clear filters</button>}</div></div>}
         {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload one to capture its purchases, compare supplier prices, and create supported Today actions.</p> : filteredInvoices.length===0 ? <div className="filtered-empty"><h3>{invoiceStatus === "action" && !invoiceSearch.trim() ? "No invoices need action" : "No invoices match"}</h3><p>{invoiceStatus === "action" && !invoiceSearch.trim() ? "You're caught up for this period. Approved invoices remain available in history." : "Try a different status, period, or search."}</p><button className="file-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("all");setInvoicePeriod("all")}}>Show all invoices</button></div> : <div className="invoice-results">
-          {operationalInvoices.length>0&&<section className="invoice-result-group"><h3>Current work<span>{operationalInvoices.length}</span></h3><div className="invoice-cards">{operationalInvoices.map(invoice=><InvoiceCard key={invoice.id} invoice={invoice} openingId={openingId} retryingId={retryingId} onReview={setReviewId} onRetry={retry} onPriceChanges={id=>{setApprovedPriceChanges(null);setPriceChangeId(id)}} onPurchases={setPurchaseId} onOriginal={openOriginal}/>)}</div></section>}
-          {invoiceMonths.map(([month,monthInvoices],index)=><details className="invoice-month" key={month} open={index===0}><summary><span>{formatInvoiceMonth(month)}</span><strong>{monthInvoices.length}</strong></summary><div className="invoice-cards">{monthInvoices.map(invoice=><InvoiceCard key={invoice.id} invoice={invoice} openingId={openingId} retryingId={retryingId} onReview={setReviewId} onRetry={retry} onPriceChanges={id=>{setApprovedPriceChanges(null);setPriceChangeId(id)}} onPurchases={setPurchaseId} onOriginal={openOriginal}/>)}</div></details>)}
+          {operationalInvoices.length>0&&<section className="invoice-result-group"><h3>Current work<span>{operationalInvoices.length}</span></h3><div className="invoice-cards">{operationalInvoices.map(invoice=><InvoiceCard key={invoice.id} invoice={invoice} openingId={openingId} retryingId={retryingId} deletingId={deletingId} onReview={setReviewId} onRetry={retry} onPriceChanges={id=>{setApprovedPriceChanges(null);setPriceChangeId(id)}} onPurchases={setPurchaseId} onOriginal={openOriginal} onDelete={removeInvoice}/>)}</div></section>}
+          {invoiceMonths.map(([month,monthInvoices],index)=><details className="invoice-month" key={month} open={index===0}><summary><span>{formatInvoiceMonth(month)}</span><strong>{monthInvoices.length}</strong></summary><div className="invoice-cards">{monthInvoices.map(invoice=><InvoiceCard key={invoice.id} invoice={invoice} openingId={openingId} retryingId={retryingId} deletingId={deletingId} onReview={setReviewId} onRetry={retry} onPriceChanges={id=>{setApprovedPriceChanges(null);setPriceChangeId(id)}} onPurchases={setPurchaseId} onOriginal={openOriginal} onDelete={removeInvoice}/>)}</div></details>)}
         </div>}
       </div>
     </div>
@@ -829,7 +846,7 @@ function invoiceDisplayName(invoice: Invoice) {
   if (invoice.supplierName === "Reading invoice…") return "Supplier needs review";
   return invoice.supplierName;
 }
-function InvoiceCard({invoice,openingId,retryingId,onReview,onRetry,onPriceChanges,onPurchases,onOriginal}:{invoice:Invoice;openingId:string;retryingId:string;onReview:(id:string)=>void;onRetry:(invoice:Invoice)=>void;onPriceChanges:(id:string)=>void;onPurchases:(id:string)=>void;onOriginal:(invoice:Invoice)=>void}) { return <article className="invoice-card"><div><p className="invoice-status">{invoice.status === "ready" && invoice.purchaseReceiptRecorded ? "Approved" : invoice.status === "ready" ? "Purchases need review" : importStatusLabel(invoice.status, invoice.delayed, "invoice")}</p><h3>{invoiceDisplayName(invoice)}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><div className="card-actions">{invoice.status === "needs_review" && <button className="ledger-button" type="button" onClick={() => onReview(invoice.id)}>Review invoice</button>}{invoice.status === "failed" && <button className="ledger-button" type="button" disabled={retryingId===invoice.id} onClick={() => void onRetry(invoice)}>{retryingId===invoice.id ? "Trying again…" : "Try again"}</button>}{invoice.status === "ready" && invoice.priceChangeCount > 0 && <button className="price-change-alert" type="button" onClick={() => onPriceChanges(invoice.id)}><span aria-hidden="true">!</span>{invoice.priceChangeCount} {invoice.priceChangeCount === 1 ? "price" : "prices"} changed</button>}{invoice.status === "ready" && <button className={invoice.purchaseReceiptRecorded ? "file-button" : "ledger-button"} type="button" onClick={() => onPurchases(invoice.id)}>{invoice.purchaseReceiptRecorded ? "View receipt" : "Review purchases"}</button>}<button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void onOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></div></article>; }
+function InvoiceCard({invoice,openingId,retryingId,deletingId,onReview,onRetry,onPriceChanges,onPurchases,onOriginal,onDelete}:{invoice:Invoice;openingId:string;retryingId:string;deletingId:string;onReview:(id:string)=>void;onRetry:(invoice:Invoice)=>void;onPriceChanges:(id:string)=>void;onPurchases:(id:string)=>void;onOriginal:(invoice:Invoice)=>void;onDelete:(invoice:Invoice)=>void}) { return <article className="invoice-card"><div><p className="invoice-status">{invoice.status === "ready" && invoice.purchaseReceiptRecorded ? "Approved" : invoice.status === "ready" ? "Purchases need review" : importStatusLabel(invoice.status, invoice.delayed, "invoice")}</p><h3>{invoiceDisplayName(invoice)}</h3><p>{formatDate(invoice.invoiceDate)}</p><p className="invoice-filename">{invoice.originalFilename} · {formatBytes(invoice.sizeBytes)}</p></div><div className="card-actions">{invoice.status === "needs_review" && <button className="ledger-button" type="button" onClick={() => onReview(invoice.id)}>Review invoice</button>}{invoice.status === "failed" && <button className="ledger-button" type="button" disabled={retryingId===invoice.id} onClick={() => void onRetry(invoice)}>{retryingId===invoice.id ? "Trying again…" : "Try again"}</button>}{invoice.status === "ready" && invoice.priceChangeCount > 0 && <button className="price-change-alert" type="button" onClick={() => onPriceChanges(invoice.id)}><span aria-hidden="true">!</span>{invoice.priceChangeCount} {invoice.priceChangeCount === 1 ? "price" : "prices"} changed</button>}{invoice.status === "ready" && <button className={invoice.purchaseReceiptRecorded ? "file-button" : "ledger-button"} type="button" onClick={() => onPurchases(invoice.id)}>{invoice.purchaseReceiptRecorded ? "View receipt" : "Review purchases"}</button>}{invoice.status !== "ready" && <button className="text-button" type="button" disabled={deletingId===invoice.id} onClick={() => void onDelete(invoice)}>{deletingId===invoice.id ? "Deleting…" : "Delete"}</button>}<button className="file-button" type="button" disabled={openingId === invoice.id} onClick={() => void onOriginal(invoice)}>{openingId === invoice.id ? "Opening…" : "View original"}</button></div></article>; }
 function groupInvoicesByMonth(invoices: Invoice[]): [string, Invoice[]][] { const groups=new Map<string,Invoice[]>(); invoices.forEach(invoice=>{const month=invoice.invoiceDate.slice(0,7);groups.set(month,[...(groups.get(month)??[]),invoice])}); return [...groups.entries()].sort(([a],[b])=>b.localeCompare(a)); }
 function formatInvoiceMonth(value:string) { const [year,month]=value.split("-").map(Number); return new Intl.DateTimeFormat(undefined,{month:"long",year:"numeric",timeZone:"UTC"}).format(new Date(Date.UTC(year,month-1,1))); }
 

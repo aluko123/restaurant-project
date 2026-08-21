@@ -78,6 +78,8 @@ const completedCount = {
 const guide = {
   id: "guide-1",
   sourceCountId: "count-1",
+  sourceCountCompletedAt: "2026-08-21T10:00:00Z",
+  newerCountExists: false,
   status: "draft",
   revision: 0,
   createdAt: "2026-08-21T10:00:01Z",

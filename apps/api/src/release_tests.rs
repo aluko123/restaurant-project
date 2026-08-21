@@ -261,6 +261,39 @@ async fn multipart_csv(app: Router, token: &str, csv: &str) -> ApiResponse {
     }
 }
 
+async fn multipart_invoice(app: Router, token: &str, filename: &str, bytes: &[u8]) -> ApiResponse {
+    let boundary = "release-test-invoice-boundary";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/pdf\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/invoices")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .expect("router request failed");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .expect("response body could not be read");
+    ApiResponse {
+        status,
+        body: serde_json::from_slice(&bytes).expect("response was not JSON"),
+    }
+}
+
 fn decimal(value: &str) -> BigDecimal {
     BigDecimal::from_str(value).unwrap()
 }
@@ -2561,6 +2594,317 @@ async fn inventory_walk_order_scope_skip_and_history() {
     .await;
     assert_eq!(third.status, StatusCode::CREATED);
     assert_decimal_json(&third.body["entries"][0]["previousQuantity"], "6");
+
+    fixture.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn focused_counts_and_draft_discard_keep_ordering_alive() {
+    let fixture = ApiFixture::create("focused_count_ordering").await;
+    let owner = fixture.token("owner-a");
+    let other = fixture.token("owner-b");
+
+    // A second par-configured item so a tomato-only spot check is partial.
+    sqlx::query(
+        "INSERT INTO inventory_items(id,restaurant_id,name,count_unit,par_level)
+         VALUES($1,$2,'Tenant A Onions','case',$3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(fixture.ids.restaurant_a)
+    .bind(decimal("10"))
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+
+    // 1. Complete a full count covering every par item.
+    let started = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        None,
+    )
+    .await;
+    assert_eq!(started.status, StatusCode::CREATED);
+    let full_count_id = started.body["id"].as_str().unwrap().to_owned();
+    let entries = started.body["entries"].as_array().unwrap();
+    let onion_entry = entries
+        .iter()
+        .find(|entry| entry["name"] == "Tenant A Onions")
+        .unwrap();
+    let tomato_entry = entries
+        .iter()
+        .find(|entry| entry["name"] == "Tenant A Tomatoes")
+        .unwrap();
+    let full_uri = format!("/v1/inventory-counts/{full_count_id}");
+    let saved = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        &full_uri,
+        Some(json!({
+            "revision": 0,
+            "entries": [
+                {"id": onion_entry["id"], "quantity": "2", "skipped": false},
+                {"id": tomato_entry["id"], "quantity": "5", "skipped": false}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK);
+    let completed = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        &format!("{full_uri}/complete"),
+        Some(json!({"revision": 1, "confirmSkipped": false})),
+    )
+    .await;
+    assert_eq!(completed.status, StatusCode::OK);
+
+    // 2. Complete a focused spot-check that does not cover the onions.
+    let focused = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        Some(json!({"itemIds": [fixture.ids.inventory_a]})),
+    )
+    .await;
+    assert_eq!(focused.status, StatusCode::CREATED);
+    assert_eq!(focused.body["scope"], "focused");
+    let focused_id = focused.body["id"].as_str().unwrap().to_owned();
+    let focused_entry = focused.body["entries"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let focused_uri = format!("/v1/inventory-counts/{focused_id}");
+    let saved = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::PUT,
+        &focused_uri,
+        Some(json!({
+            "revision": 0,
+            "entries": [{"id": focused_entry, "quantity": "4", "skipped": false}]
+        })),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK);
+    let completed = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        &format!("{focused_uri}/complete"),
+        Some(json!({"revision": 1, "confirmSkipped": false})),
+    )
+    .await;
+    assert_eq!(completed.status, StatusCode::OK);
+
+    // 3. Guide creation falls back to the newest FULL count instead of failing.
+    let guide = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/order-guides",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(guide.status, StatusCode::CREATED);
+    assert_eq!(guide.body["sourceCountId"], full_count_id.as_str());
+    assert_eq!(guide.body["newerCountExists"], true);
+    assert!(!guide.body["sourceCountCompletedAt"].is_null());
+    assert_eq!(guide.body["lines"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        guide.body["lines"][0]["inventoryItemName"],
+        "Tenant A Onions"
+    );
+
+    // 4. Ordering is allowed even though a newer partial count exists.
+    let guide_id = guide.body["id"].as_str().unwrap().to_owned();
+    let ordered = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        &format!("/v1/order-guides/{guide_id}/ordered"),
+        Some(json!({"revision": 0})),
+    )
+    .await;
+    assert_eq!(ordered.status, StatusCode::OK);
+    assert_eq!(ordered.body["status"], "ordered");
+
+    // 5. A draft count can be discarded, and counting is not wedged afterwards.
+    let draft = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        None,
+    )
+    .await;
+    assert_eq!(draft.status, StatusCode::CREATED);
+    let draft_id = draft.body["id"].as_str().unwrap().to_owned();
+    let draft_uri = format!("/v1/inventory-counts/{draft_id}");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&other),
+            Method::DELETE,
+            &draft_uri,
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::DELETE,
+            &draft_uri,
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    let draft_after = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/inventory-counts/draft",
+        None,
+    )
+    .await;
+    assert_eq!(draft_after.status, StatusCode::OK);
+    assert!(draft_after.body["count"].is_null());
+
+    // 6. Completed counts stay immutable.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::DELETE,
+            &full_uri,
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+
+    // 7. A fresh count can start right away.
+    let restarted = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        None,
+    )
+    .await;
+    assert_eq!(restarted.status, StatusCode::CREATED);
+
+    fixture.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn invoice_uploads_dedupe_by_content_and_allow_unapproved_deletes() {
+    let fixture = ApiFixture::create("invoice_dedupe_delete").await;
+    let owner = fixture.token("owner-a");
+    let other = fixture.token("owner-b");
+    let pdf_a: &[u8] = b"%PDF-1.7\n%release-test-invoice-a\n";
+    let pdf_b: &[u8] = b"%PDF-1.7\n%release-test-invoice-b\n";
+
+    let first = multipart_invoice(fixture.app.clone(), &owner, "invoice-a.pdf", pdf_a).await;
+    assert_eq!(first.status, StatusCode::CREATED);
+    assert_eq!(first.body["duplicate"], false);
+    let first_id = first.body["id"].as_str().unwrap().to_owned();
+
+    // The same bytes in the same restaurant return the existing invoice.
+    let replay = multipart_invoice(fixture.app.clone(), &owner, "invoice-a.pdf", pdf_a).await;
+    assert_eq!(replay.status, StatusCode::OK);
+    assert_eq!(replay.body["duplicate"], true);
+    assert_eq!(replay.body["id"], first_id.as_str());
+
+    // The same bytes in another restaurant are a separate invoice.
+    let cross_tenant = multipart_invoice(fixture.app.clone(), &other, "invoice-a.pdf", pdf_a).await;
+    assert_eq!(cross_tenant.status, StatusCode::CREATED);
+    assert_eq!(cross_tenant.body["duplicate"], false);
+
+    // Different content is a separate invoice.
+    let second = multipart_invoice(fixture.app.clone(), &owner, "invoice-b.pdf", pdf_b).await;
+    assert_eq!(second.status, StatusCode::CREATED);
+    assert_eq!(second.body["duplicate"], false);
+    let second_id = second.body["id"].as_str().unwrap().to_owned();
+
+    // Cross-tenant deletes cannot see or touch the invoice.
+    let first_uri = format!("/v1/invoices/{first_id}");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&other),
+            Method::DELETE,
+            &first_uri,
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+
+    // Approved invoices are part of purchase and price history and stay.
+    sqlx::query("UPDATE invoices SET status='ready' WHERE id=$1")
+        .bind(Uuid::parse_str(&second_id).unwrap())
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    let second_uri = format!("/v1/invoices/{second_id}");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::DELETE,
+            &second_uri,
+            None,
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+
+    // An unapproved invoice can be deleted by its own restaurant.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::DELETE,
+            &first_uri,
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    let remaining = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/invoices",
+        None,
+    )
+    .await;
+    assert_eq!(remaining.status, StatusCode::OK);
+    assert!(
+        remaining
+            .body
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["id"] != first_id.as_str())
+    );
 
     fixture.drop().await;
 }

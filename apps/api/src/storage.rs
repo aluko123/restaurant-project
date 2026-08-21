@@ -9,10 +9,20 @@ use aws_sdk_s3::{
 use bytes::Bytes;
 use std::{env, time::Duration};
 
+#[cfg(test)]
+use std::{collections::HashMap, sync::Arc};
+#[cfg(test)]
+use tokio::sync::Mutex;
+
+#[cfg(test)]
+type MemoryObjects = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
 #[derive(Clone)]
 pub(crate) struct ObjectStorage {
     client: Client,
     bucket: String,
+    #[cfg(test)]
+    memory: Option<MemoryObjects>,
 }
 
 impl ObjectStorage {
@@ -32,9 +42,13 @@ impl ObjectStorage {
         Ok(Self {
             client: Client::from_conf(config),
             bucket,
+            #[cfg(test)]
+            memory: None,
         })
     }
 
+    // In-memory backend so release tests exercise upload and cleanup paths
+    // without touching real object storage.
     #[cfg(test)]
     pub(crate) fn inert_for_tests() -> Self {
         let config = Builder::new()
@@ -53,10 +67,17 @@ impl ObjectStorage {
         Self {
             client: Client::from_conf(config),
             bucket: "release-tests".into(),
+            memory: Some(Arc::new(Mutex::new(HashMap::new()))),
         }
     }
 
     pub(crate) async fn put(&self, key: &str, content_type: &str, body: Bytes) -> Result<()> {
+        #[cfg(test)]
+        if let Some(memory) = &self.memory {
+            let mut objects = memory.lock().await;
+            objects.insert(key.to_owned(), body.to_vec());
+            return Ok(());
+        }
         self.client
             .put_object()
             .bucket(&self.bucket)
@@ -70,6 +91,11 @@ impl ObjectStorage {
     }
 
     pub(crate) async fn delete(&self, key: &str) -> Result<()> {
+        #[cfg(test)]
+        if let Some(memory) = &self.memory {
+            memory.lock().await.remove(key);
+            return Ok(());
+        }
         self.client
             .delete_object()
             .bucket(&self.bucket)
@@ -81,6 +107,15 @@ impl ObjectStorage {
     }
 
     pub(crate) async fn get(&self, key: &str) -> Result<Bytes> {
+        #[cfg(test)]
+        if let Some(memory) = &self.memory {
+            let objects = memory.lock().await;
+            return objects
+                .get(key)
+                .cloned()
+                .map(Bytes::from)
+                .context("object not found in test storage");
+        }
         let object = self
             .client
             .get_object()
@@ -98,6 +133,12 @@ impl ObjectStorage {
     }
 
     pub(crate) async fn signed_get_url(&self, key: &str) -> Result<String> {
+        #[cfg(test)]
+        if let Some(memory) = &self.memory {
+            let exists = memory.lock().await.contains_key(key);
+            anyhow::ensure!(exists, "object not found in test storage");
+            return Ok(format!("http://test-storage.local/{key}"));
+        }
         let config = PresigningConfig::expires_in(Duration::from_secs(300))
             .context("invalid signed URL expiry")?;
         let request = self
