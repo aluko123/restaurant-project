@@ -36,6 +36,7 @@ pub(crate) struct Import {
     original_filename: String,
     status: String,
     delayed: bool,
+    last_error: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 #[derive(Serialize, sqlx::FromRow)]
@@ -83,7 +84,7 @@ pub(crate) async fn list(
     headers: HeaderMap,
 ) -> Result<Json<Vec<Import>>, ApiError> {
     let m = membership(&s, &headers).await?;
-    Ok(Json(sqlx::query_as("SELECT id,original_filename,status,status='processing' AND updated_at<NOW()-INTERVAL '5 minutes' AS delayed,created_at FROM menu_imports WHERE restaurant_id=$1 ORDER BY created_at DESC LIMIT 20").bind(m.restaurant_id).fetch_all(&s.pool).await.map_err(crate::database_error)?))
+    Ok(Json(sqlx::query_as("SELECT i.id,i.original_filename,i.status,i.status='processing' AND i.updated_at<NOW()-INTERVAL '5 minutes' AS delayed,j.last_error,i.created_at FROM menu_imports i LEFT JOIN menu_import_jobs j ON j.menu_import_id=i.id WHERE i.restaurant_id=$1 ORDER BY i.created_at DESC LIMIT 20").bind(m.restaurant_id).fetch_all(&s.pool).await.map_err(crate::database_error)?))
 }
 
 pub(crate) async fn create(
@@ -126,7 +127,7 @@ pub(crate) async fn create(
                 "We couldn't store this menu. Please try again.",
             )
         })?;
-    let result:Result<Import,sqlx::Error>=async { let mut tx=s.pool.begin().await?; let import=sqlx::query_as("INSERT INTO menu_imports(id,restaurant_id,uploaded_by,original_filename,content_type,size_bytes,object_key) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,original_filename,status,FALSE AS delayed,created_at")
+    let result:Result<Import,sqlx::Error>=async { let mut tx=s.pool.begin().await?; let import=sqlx::query_as("INSERT INTO menu_imports(id,restaurant_id,uploaded_by,original_filename,content_type,size_bytes,object_key) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,original_filename,status,FALSE AS delayed,NULL AS last_error,created_at")
         .bind(id).bind(m.restaurant_id).bind(m.user_id).bind(original_filename).bind(content_type).bind(size_bytes).bind(&key).fetch_one(&mut *tx).await?;
         sqlx::query("INSERT INTO menu_import_jobs(menu_import_id) VALUES($1)").bind(id).execute(&mut *tx).await?; tx.commit().await?; Ok(import)}.await;
     match result {
@@ -425,6 +426,13 @@ fn validate_extracted(
 ) -> Result<Vec<ValidatedItem>> {
     if items.is_empty() {
         return Err(anyhow!("menu extraction did not contain any items"));
+    }
+    let total = items.len();
+    if total > 200 {
+        // Applying silently would drop rows; failing loudly keeps the review honest.
+        return Err(anyhow!(
+            "This menu contains {total} items; Parline reads up to 200 items per menu. Upload the menu in sections."
+        ));
     }
     items
         .into_iter()

@@ -707,6 +707,11 @@ struct SyncJob {
     claim_token: Uuid,
 }
 
+/// How often each connected restaurant's sales are refreshed automatically.
+const AUTO_SYNC_INTERVAL_MINUTES: i64 = 30;
+/// How often the worker looks for connections whose auto-sync is due.
+const AUTO_SYNC_TICK_SECS: u64 = 60;
+
 pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>) {
     let Some(config) = config else {
         tracing::info!("Square sync worker idle (not configured)");
@@ -714,7 +719,19 @@ pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>) {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     };
+    let mut last_tick =
+        tokio::time::Instant::now() - std::time::Duration::from_secs(AUTO_SYNC_TICK_SECS);
     loop {
+        if last_tick.elapsed().as_secs() >= AUTO_SYNC_TICK_SECS {
+            last_tick = tokio::time::Instant::now();
+            match enqueue_due_auto_syncs(&pool).await {
+                Ok(count) if count > 0 => {
+                    tracing::info!(enqueued = count, "scheduled automatic Square syncs");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "Square auto-sync scheduling failed"),
+            }
+        }
         match claim_job(&pool).await {
             Ok(Some(job)) => {
                 if let Err(error) = process_job(&pool, &config, job).await {
@@ -728,6 +745,41 @@ pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>) {
             }
         }
     }
+}
+
+// Queues an incremental refresh for every healthy connected restaurant whose
+// newest run is older than the interval. The NOT EXISTS guard keeps this safe
+// under overlapping ticks; a duplicate that slips through is harmless because
+// day writes are idempotent.
+async fn enqueue_due_auto_syncs(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO source_sync_runs(id,connection_id,restaurant_id,kind,status)
+         SELECT gen_random_uuid(), connection.id, connection.restaurant_id, 'incremental', 'queued'
+         FROM source_connections connection
+         WHERE connection.provider=$1
+           AND connection.status='connected'
+           AND (SELECT COUNT(*) FROM restaurant_setup_streams setup
+                WHERE setup.restaurant_id=connection.restaurant_id
+                  AND setup.stream IN ('menu','sales')
+                  AND setup.method='connector'
+                  AND setup.connector_provider='square')=2
+           AND NOT EXISTS (SELECT 1 FROM source_sync_runs run
+                           WHERE run.connection_id=connection.id
+                             AND run.status IN ('queued','running'))
+           AND EXISTS (SELECT 1 FROM source_sync_runs done
+                       WHERE done.connection_id=connection.id AND done.status='succeeded')
+           AND COALESCE((SELECT MAX(run.created_at) FROM source_sync_runs run
+                         WHERE run.connection_id=connection.id),
+                        '-infinity'::timestamptz) <= NOW() - make_interval(mins => $2)",
+    )
+    .bind(PROVIDER)
+    .bind(AUTO_SYNC_INTERVAL_MINUTES)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(inserted)
 }
 
 async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {

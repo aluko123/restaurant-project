@@ -1,9 +1,11 @@
 use crate::{
     ApiError, AppState, authenticated_subject, database_error,
-    extraction::{ExtractedInventoryCsv, ProviderError},
+    extraction::{ExtractedInventoryCsv, GeminiClient, MAX_ATTEMPTS, ProviderError, STALE_MINUTES},
     inventory::ItemInput,
+    storage::ObjectStorage,
     uploads::multipart_error,
 };
+use anyhow::{Result, anyhow};
 use axum::{
     Json,
     extract::{Multipart, Path, State},
@@ -11,9 +13,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use sqlx::PgPool;
+use std::{collections::HashSet, time::Duration};
 use uuid::Uuid;
 const MAX_BYTES: usize = 1024 * 1024;
+const RETRY_DELAYS_SECS: [u64; 5] = [30, 5 * 60, 60 * 60, 6 * 60 * 60, 18 * 60 * 60];
 #[cfg(test)]
 const MAX_ROWS: usize = 2000;
 #[cfg(test)]
@@ -44,6 +48,7 @@ struct Head {
     original_filename: String,
     content_hash: String,
     status: String,
+    delayed: bool,
     revision: i64,
 }
 #[derive(Serialize)]
@@ -104,54 +109,160 @@ pub(crate) async fn create(
             "CSV files must be between 1 byte and 1 MiB.",
         ));
     }
-    #[cfg(test)]
-    let parsed = if s.gemini.is_inert_for_tests() {
-        parse(&b)?
-    } else {
-        let extracted = s
-            .gemini
-            .extract_inventory_csv(b.clone())
-            .await
-            .map_err(extraction_error)?;
-        validate_extracted(extracted.extracted)?
-    };
-    #[cfg(not(test))]
-    let parsed = {
-        let extracted = s
-            .gemini
-            .extract_inventory_csv(b.clone())
-            .await
-            .map_err(extraction_error)?;
-        validate_extracted(extracted.extracted)?
-    };
     let hash = format!("{:x}", Sha256::digest(&b));
-    let existing: HashSet<String> = sqlx::query_scalar::<_, String>(
-        "SELECT LOWER(BTRIM(name)) FROM inventory_items WHERE restaurant_id=$1",
+
+    // Re-uploading the same file returns the existing import so retries are
+    // safe and never duplicate records.
+    if let Some(existing) = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM inventory_imports WHERE restaurant_id=$1 AND content_hash=$2",
     )
     .bind(m.restaurant_id)
-    .fetch_all(&s.pool)
+    .bind(&hash)
+    .fetch_optional(&s.pool)
     .await
     .map_err(database_error)?
-    .into_iter()
-    .collect();
+    {
+        return Ok((
+            StatusCode::OK,
+            Json(load(&s, existing, m.restaurant_id).await?),
+        ));
+    }
+
+    // Release tests use the deterministic parser and expect the preview to be
+    // ready immediately; production enqueues a background extraction job.
+    #[cfg(test)]
+    if s.gemini.is_inert_for_tests() {
+        let parsed = parse(&b)?;
+        return insert_import_sync(&s, &m, name, hash, parsed).await;
+    }
+
+    let id = Uuid::now_v7();
+    let key = format!(
+        "restaurants/{}/inventory-imports/{id}/original.csv",
+        m.restaurant_id
+    );
+    s.storage.put(&key, "text/csv", b).await.map_err(|error| {
+        tracing::error!(%error, "inventory import upload to object storage failed");
+        ApiError(
+            StatusCode::BAD_GATEWAY,
+            "We couldn't store this inventory file. Please try again.",
+        )
+    })?;
+
+    let result: Result<Uuid, sqlx::Error> = async {
+        let mut tx = s.pool.begin().await?;
+        let inserted = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO inventory_imports(id,restaurant_id,original_filename,content_hash,status,object_key,created_by)
+             VALUES($1,$2,$3,$4,'processing',$5,$6)
+             ON CONFLICT (restaurant_id,content_hash) DO NOTHING RETURNING id",
+        )
+        .bind(id)
+        .bind(m.restaurant_id)
+        .bind(&name)
+        .bind(&hash)
+        .bind(&key)
+        .bind(m.user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(inserted) = inserted else {
+            tx.commit().await?;
+            let existing = sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM inventory_imports WHERE restaurant_id=$1 AND content_hash=$2",
+            )
+        .bind(m.restaurant_id)
+        .bind(hash.clone())
+            .fetch_one(&s.pool)
+            .await?;
+            return Ok(existing);
+        };
+        sqlx::query("INSERT INTO inventory_import_jobs(import_id) VALUES($1)")
+            .bind(inserted)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+    .await;
+
+    match result {
+        Ok(import_id) => {
+            if import_id != id {
+                // A concurrent upload of the same file won the race.
+                if let Err(delete_error) = s.storage.delete(&key).await {
+                    tracing::error!(%delete_error, object_key = %key, "inventory import R2 cleanup failed");
+                }
+                return Ok((
+                    StatusCode::OK,
+                    Json(load(&s, import_id, m.restaurant_id).await?),
+                ));
+            }
+            Ok((
+                StatusCode::CREATED,
+                Json(load(&s, id, m.restaurant_id).await?),
+            ))
+        }
+        Err(error) => {
+            tracing::error!(%error, "inventory import metadata insert failed");
+            if let Err(delete_error) = s.storage.delete(&key).await {
+                tracing::error!(%delete_error, object_key = %key, "inventory import R2 cleanup failed");
+            }
+            Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "We couldn't save this inventory file. Please try again.",
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+async fn insert_import_sync(
+    s: &AppState,
+    m: &Member,
+    name: String,
+    hash: String,
+    parsed: Vec<(Row, Vec<String>)>,
+) -> Result<(StatusCode, Json<Import>), ApiError> {
     let id = Uuid::now_v7();
     let mut tx = s.pool.begin().await.map_err(database_error)?;
     let inserted = sqlx::query_scalar::<_, Uuid>("INSERT INTO inventory_imports(id,restaurant_id,original_filename,content_hash,created_by)VALUES($1,$2,$3,$4,$5) ON CONFLICT (restaurant_id,content_hash) DO NOTHING RETURNING id").bind(id).bind(m.restaurant_id).bind(name).bind(&hash).bind(m.user_id).fetch_optional(&mut*tx).await.map_err(database_error)?;
-    if inserted.is_none() {
+    let Some(import_id) = inserted else {
         let existing = sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM inventory_imports WHERE restaurant_id=$1 AND content_hash=$2",
         )
         .bind(m.restaurant_id)
-        .bind(hash)
+        .bind(&hash)
         .fetch_one(&mut *tx)
         .await
         .map_err(database_error)?;
         tx.commit().await.map_err(database_error)?;
         return Ok((
             StatusCode::OK,
-            Json(load(&s, existing, m.restaurant_id).await?),
+            Json(load(s, existing, m.restaurant_id).await?),
         ));
-    }
+    };
+    insert_rows(&mut tx, m.restaurant_id, import_id, parsed).await?;
+    tx.commit().await.map_err(database_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(load(s, import_id, m.restaurant_id).await?),
+    ))
+}
+
+async fn insert_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    restaurant_id: Uuid,
+    import_id: Uuid,
+    parsed: Vec<(Row, Vec<String>)>,
+) -> Result<(), ApiError> {
+    let existing: HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT LOWER(BTRIM(name)) FROM inventory_items WHERE restaurant_id=$1",
+    )
+    .bind(restaurant_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_error)?
+    .into_iter()
+    .collect();
     let mut seen = HashSet::new();
     for (r, mut errors) in parsed {
         let key = r.name.trim().to_lowercase();
@@ -161,24 +272,9 @@ pub(crate) async fn create(
         if existing.contains(&key) {
             errors.push("An inventory item with this name already exists.".into())
         }
-        sqlx::query("INSERT INTO inventory_import_rows(id,restaurant_id,import_id,row_number,name,category,count_unit,par_level,validation_errors)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)").bind(Uuid::now_v7()).bind(m.restaurant_id).bind(id).bind(r.row_number).bind(r.name).bind(r.category).bind(r.count_unit).bind(r.par_level).bind(serde_json::json!(errors)).execute(&mut*tx).await.map_err(database_error)?;
+        sqlx::query("INSERT INTO inventory_import_rows(id,restaurant_id,import_id,row_number,name,category,count_unit,par_level,validation_errors)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)").bind(Uuid::now_v7()).bind(restaurant_id).bind(import_id).bind(r.row_number).bind(r.name).bind(r.category).bind(r.count_unit).bind(r.par_level).bind(serde_json::json!(errors)).execute(&mut **tx).await.map_err(database_error)?;
     }
-    tx.commit().await.map_err(database_error)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(load(&s, id, m.restaurant_id).await?),
-    ))
-}
-
-fn extraction_error(error: ProviderError) -> ApiError {
-    let detail = match error {
-        ProviderError::Retryable { error, .. } | ProviderError::Terminal(error) => error,
-    };
-    tracing::warn!(%detail, "inventory CSV extraction failed");
-    ApiError(
-        StatusCode::BAD_GATEWAY,
-        "We couldn't read this inventory file. Try again, or export it again from your inventory system.",
-    )
+    Ok(())
 }
 
 fn validate_extracted(
@@ -273,7 +369,8 @@ pub(crate) async fn discard(
 ) -> Result<StatusCode, ApiError> {
     let m = member(&s, &h).await?;
     let result = sqlx::query(
-        "DELETE FROM inventory_imports WHERE id=$1 AND restaurant_id=$2 AND status='needs_review'",
+        "DELETE FROM inventory_imports
+         WHERE id=$1 AND restaurant_id=$2 AND status IN ('needs_review','failed')",
     )
     .bind(id)
     .bind(m.restaurant_id)
@@ -287,6 +384,42 @@ pub(crate) async fn discard(
         ));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn retry(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let m = member(&s, &h).await?;
+    let mut tx = s.pool.begin().await.map_err(database_error)?;
+    let n = sqlx::query(
+        "UPDATE inventory_imports SET status='processing',updated_at=NOW()
+         WHERE id=$1 AND restaurant_id=$2 AND status='failed'",
+    )
+    .bind(id)
+    .bind(m.restaurant_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error)?
+    .rows_affected();
+    if n == 0 {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Only a failed inventory import can be retried.",
+        ));
+    }
+    sqlx::query(
+        "UPDATE inventory_import_jobs SET status='queued',attempts=0,available_at=NOW(),
+         locked_at=NULL,lock_token=NULL,last_error=NULL,updated_at=NOW()
+         WHERE import_id=$1 AND status='failed'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    tx.commit().await.map_err(database_error)?;
+    Ok(StatusCode::ACCEPTED)
 }
 pub(crate) async fn apply(
     State(s): State<AppState>,
@@ -365,10 +498,266 @@ pub(crate) async fn apply(
     Ok(Json(load(&s, id, m.restaurant_id).await?))
 }
 async fn load(s: &AppState, id: Uuid, r: Uuid) -> Result<Import, ApiError> {
-    let head=sqlx::query_as("SELECT id,original_filename,content_hash,status,revision FROM inventory_imports WHERE id=$1 AND restaurant_id=$2").bind(id).bind(r).fetch_optional(&s.pool).await.map_err(database_error)?.ok_or(ApiError(StatusCode::NOT_FOUND,"Inventory import not found."))?;
+    let head=sqlx::query_as("SELECT id,original_filename,content_hash,status,status='processing' AND updated_at<NOW()-INTERVAL '5 minutes' AS delayed,revision FROM inventory_imports WHERE id=$1 AND restaurant_id=$2").bind(id).bind(r).fetch_optional(&s.pool).await.map_err(database_error)?.ok_or(ApiError(StatusCode::NOT_FOUND,"Inventory import not found."))?;
     let rows=sqlx::query_as("SELECT id,row_number,name,category,count_unit,par_level,validation_errors,selected,created_inventory_item_id FROM inventory_import_rows WHERE import_id=$1 ORDER BY row_number").bind(id).fetch_all(&s.pool).await.map_err(database_error)?;
     Ok(Import { head, rows })
 }
+#[derive(sqlx::FromRow)]
+struct Job {
+    import_id: Uuid,
+    restaurant_id: Uuid,
+    object_key: String,
+    lock_token: Uuid,
+}
+
+pub(crate) async fn run_worker(pool: PgPool, storage: ObjectStorage, gemini: GeminiClient) {
+    loop {
+        match run_once(&pool, &storage, &gemini).await {
+            Ok(true) => {}
+            Ok(false) => tokio::time::sleep(Duration::from_secs(15)).await,
+            Err(error) => {
+                tracing::error!(%error, "inventory import claim failed");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
+    }
+}
+
+/// Claims and processes at most one job. Returns whether a job was found so
+/// release tests can drain the queue deterministically.
+pub(crate) async fn run_once(
+    pool: &PgPool,
+    storage: &ObjectStorage,
+    gemini: &GeminiClient,
+) -> Result<bool> {
+    match claim(pool).await? {
+        Some(job) => {
+            process(pool, storage, gemini, job).await;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+async fn claim(pool: &PgPool) -> Result<Option<Job>> {
+    let mut tx = pool.begin().await?;
+    let exhausted = sqlx::query_scalar::<_, Uuid>(
+        "SELECT import_id FROM inventory_import_jobs
+         WHERE status='processing' AND attempts >= $1
+           AND locked_at < NOW()-make_interval(mins => $2)
+         ORDER BY locked_at FOR UPDATE SKIP LOCKED LIMIT 1",
+    )
+    .bind(MAX_ATTEMPTS)
+    .bind(STALE_MINUTES)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(id) = exhausted {
+        sqlx::query("UPDATE inventory_import_jobs SET status='failed',locked_at=NULL,lock_token=NULL,last_error='Inventory worker stopped during the final attempt.',updated_at=NOW() WHERE import_id=$1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE inventory_imports SET status='failed',updated_at=NOW() WHERE id=$1 AND status='processing'")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(None);
+    }
+    let id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT import_id FROM inventory_import_jobs
+         WHERE attempts<$1
+           AND ((status='queued' AND available_at<=NOW())
+             OR (status='processing' AND locked_at<NOW()-make_interval(mins => $2)))
+         ORDER BY available_at,created_at FOR UPDATE SKIP LOCKED LIMIT 1",
+    )
+    .bind(MAX_ATTEMPTS)
+    .bind(STALE_MINUTES)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(id) = id else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let token = Uuid::now_v7();
+    sqlx::query("UPDATE inventory_import_jobs SET status='processing',attempts=attempts+1,locked_at=NOW(),lock_token=$2,updated_at=NOW() WHERE import_id=$1")
+        .bind(id)
+        .bind(token)
+        .execute(&mut *tx)
+        .await?;
+    let job = sqlx::query_as(
+        "SELECT i.id import_id,i.restaurant_id,i.object_key,$2::uuid lock_token
+         FROM inventory_imports i WHERE i.id=$1 AND i.object_key IS NOT NULL",
+    )
+    .bind(id)
+    .bind(token)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(job))
+}
+
+async fn process(pool: &PgPool, storage: &ObjectStorage, g: &GeminiClient, j: Job) {
+    let bytes = match storage.get(&j.object_key).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            failure(
+                pool,
+                &j,
+                error.context("could not read the stored file"),
+                false,
+                None,
+            )
+            .await;
+            return;
+        }
+    };
+    // Release tests use the deterministic parser so the whole queue runs
+    // without network access; production always extracts via Gemini.
+    #[cfg(test)]
+    let result = if g.is_inert_for_tests() {
+        match parse(&bytes) {
+            Ok(parsed) => Ok(parsed),
+            Err(error) => Err(ProviderError::Terminal(anyhow!(error.1))),
+        }
+    } else {
+        extract(g, bytes).await
+    };
+    #[cfg(not(test))]
+    let result = extract(g, bytes).await;
+    match result {
+        Ok(parsed) => {
+            if let Err(error) = persist_rows_and_finish(pool, &j, parsed).await {
+                failure(pool, &j, error, false, None).await;
+            }
+        }
+        Err(ProviderError::Retryable { error, retry_after }) => {
+            failure(pool, &j, error, false, retry_after).await
+        }
+        Err(ProviderError::Terminal(error)) => failure(pool, &j, error, true, None).await,
+    }
+}
+
+async fn extract(
+    g: &GeminiClient,
+    bytes: bytes::Bytes,
+) -> Result<Vec<(Row, Vec<String>)>, ProviderError> {
+    let extracted = g.extract_inventory_csv(bytes).await?;
+    validate_extracted(extracted.extracted)
+        .map_err(|error| ProviderError::Terminal(anyhow!(error.1)))
+}
+
+async fn persist_rows_and_finish(
+    pool: &PgPool,
+    j: &Job,
+    parsed: Vec<(Row, Vec<String>)>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let own = sqlx::query_scalar::<_, Uuid>(
+        "SELECT import_id FROM inventory_import_jobs
+         WHERE import_id=$1 AND status='processing' AND lock_token=$2 FOR UPDATE",
+    )
+    .bind(j.import_id)
+    .bind(j.lock_token)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if own.is_none() {
+        tx.commit().await?;
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM inventory_import_rows WHERE import_id=$1")
+        .bind(j.import_id)
+        .execute(&mut *tx)
+        .await?;
+    insert_rows(&mut tx, j.restaurant_id, j.import_id, parsed)
+        .await
+        .map_err(|error| anyhow!(error.1.to_string()))?;
+    sqlx::query("UPDATE inventory_imports SET status='needs_review',updated_at=NOW() WHERE id=$1")
+        .bind(j.import_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE inventory_import_jobs SET status='completed',locked_at=NULL,lock_token=NULL,
+         last_error=NULL,updated_at=NOW()
+         WHERE import_id=$1 AND lock_token=$2",
+    )
+    .bind(j.import_id)
+    .bind(j.lock_token)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn failure(
+    pool: &PgPool,
+    j: &Job,
+    error: anyhow::Error,
+    terminal: bool,
+    retry_after: Option<Duration>,
+) {
+    tracing::warn!(import_id=%j.import_id, terminal, %error, "inventory extraction attempt failed");
+    if let Err(db_error) = fail_or_retry(pool, j, &error.to_string(), terminal, retry_after).await {
+        tracing::error!(%db_error, import_id=%j.import_id, "could not update inventory import job");
+    }
+}
+
+async fn fail_or_retry(
+    pool: &PgPool,
+    j: &Job,
+    error: &str,
+    terminal: bool,
+    retry_after: Option<Duration>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let attempts = sqlx::query_scalar::<_, i32>(
+        "SELECT attempts FROM inventory_import_jobs
+         WHERE import_id=$1 AND status='processing' AND lock_token=$2 FOR UPDATE",
+    )
+    .bind(j.import_id)
+    .bind(j.lock_token)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(attempts) = attempts else {
+        tx.commit().await?;
+        return Ok(());
+    };
+    let safe_error = error.chars().take(500).collect::<String>();
+    if terminal || attempts >= MAX_ATTEMPTS {
+        sqlx::query("UPDATE inventory_import_jobs SET status='failed',locked_at=NULL,lock_token=NULL,last_error=$3,updated_at=NOW() WHERE import_id=$1 AND lock_token=$2")
+            .bind(j.import_id)
+            .bind(j.lock_token)
+            .bind(safe_error)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE inventory_imports SET status='failed',updated_at=NOW() WHERE id=$1 AND status='processing'")
+            .bind(j.import_id)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        let delay = retry_delay(attempts, retry_after);
+        sqlx::query("UPDATE inventory_import_jobs SET status='queued',available_at=NOW()+make_interval(secs=>$3::double precision),locked_at=NULL,lock_token=NULL,last_error=$4,updated_at=NOW() WHERE import_id=$1 AND lock_token=$2")
+            .bind(j.import_id)
+            .bind(j.lock_token)
+            .bind(delay.as_secs_f64())
+            .bind(safe_error)
+            .execute(&mut *tx)
+            .await?;
+        tracing::info!(import_id=%j.import_id, attempts, retry_in_seconds=delay.as_secs(), "inventory extraction retry scheduled");
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+fn retry_delay(attempts: i32, retry_after: Option<Duration>) -> Duration {
+    let index = attempts.saturating_sub(1) as usize;
+    let base = Duration::from_secs(
+        RETRY_DELAYS_SECS[index.min(RETRY_DELAYS_SECS.len().saturating_sub(1))],
+    );
+    let minimum = retry_after.unwrap_or_default().max(base);
+    let jitter = fastrand::u64(0..=base.as_secs() / 4);
+    minimum.saturating_add(Duration::from_secs(jitter))
+}
+
 #[cfg(test)]
 fn parse(b: &[u8]) -> Result<Vec<(Row, Vec<String>)>, ApiError> {
     use std::collections::HashMap;

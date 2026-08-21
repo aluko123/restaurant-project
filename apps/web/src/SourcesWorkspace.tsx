@@ -730,6 +730,7 @@ function SourceHealthCard({
     bookkeeping_export: ["Bookkeeping export", null],
   } as const;
   const [name, path] = names[stream.stream];
+  const isDeferredFeature = stream.stream === "bookkeeping_export";
   const activity = stream.evidence.lastSuccessfulSyncAt
     ?? stream.evidence.latestAt
     ?? stream.evidence.latestBusinessDate;
@@ -743,15 +744,18 @@ function SourceHealthCard({
     ? stream.selection.connectorProvider
       ? `${stream.selection.connectorProvider} connector`
       : stream.selection.method.replace("_", " ")
-    : "Not selected";
+    : isDeferredFeature
+      ? "Arrives in a later release"
+      : "Not selected";
   const hasBacklog = backlog.pendingCount + backlog.reviewCount + backlog.failedCount > 0;
-  const status = !stream.selection ? "Not selected"
-    : stream.lifecycle === "needs_attention" || backlog.failedCount ? "Needs attention"
-    : backlog.pendingCount ? "Processing"
-    : backlog.reviewCount ? "Review"
-    : stream.lifecycle === "deferred" ? "Deferred"
-    : stream.lifecycle === "ready" && !hasBacklog ? "Ready"
-    : "Processing";
+  const status = stream.selection
+    ? stream.lifecycle === "needs_attention" || backlog.failedCount ? "Needs attention"
+      : backlog.pendingCount ? "Processing"
+      : backlog.reviewCount ? "Review"
+      : stream.lifecycle === "deferred" ? "Deferred"
+      : stream.lifecycle === "ready" && !hasBacklog ? "Ready"
+      : "Processing"
+    : isDeferredFeature ? "Later" : "Not selected";
 
   return (
     <article className={`setup-action${status === "Needs attention" ? " setup-action-attention" : status === "Ready" ? " setup-action-complete" : ""}`}>
@@ -765,7 +769,7 @@ function SourceHealthCard({
         </p>
         {stream.issue && <p className="form-error" role="alert">{stream.issue.message}</p>}
       </div>
-      {path ? <button className="text-button" type="button" onClick={() => onNavigate(path)}>Manage</button> : <span>Not available</span>}
+      {path ? <button className="text-button" type="button" onClick={() => onNavigate(path)}>Manage</button> : <span>{isDeferredFeature ? "Planned" : "Not available"}</span>}
     </article>
   );
 }
