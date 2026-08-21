@@ -387,8 +387,14 @@ fn validate_extracted_sales(extracted: ExtractedSalesCsv) -> Result<ParsedCsv, S
             "We couldn't find item-level sales in this file.".into(),
         ));
     }
+    let total_rows = extracted.rows.len();
+    if total_rows > MAX_SALES_LINES {
+        return Err(SalesImportError::unprocessable(format!(
+            "This file contains {total_rows} item rows for one day. Parline imports up to {MAX_SALES_LINES} item rows per day, so nothing was read. Filter or split the file, then try again."
+        )));
+    }
     let mut rows = Vec::new();
-    for (index, row) in extracted.rows.into_iter().take(MAX_SALES_LINES).enumerate() {
+    for (index, row) in extracted.rows.into_iter().enumerate() {
         let name = row.item_name.trim().to_owned();
         let quantity = row
             .quantity
@@ -1305,6 +1311,30 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_files_with_more_rows_than_the_import_cap() {
+        let row = |index: usize| ExtractedSalesRow {
+            item_name: format!("Taco {index}"),
+            item_code: None,
+            quantity: Some("1".into()),
+            net_sales: None,
+            currency: None,
+        };
+        let at_cap = validate_extracted_sales(ExtractedSalesCsv {
+            business_date: Some("2026-07-21".into()),
+            rows: (0..MAX_SALES_LINES).map(row).collect(),
+        })
+        .unwrap();
+        assert_eq!(at_cap.rows.len(), MAX_SALES_LINES);
+        let error = validate_extracted_sales(ExtractedSalesCsv {
+            business_date: Some("2026-07-21".into()),
+            rows: (0..=MAX_SALES_LINES).map(row).collect(),
+        })
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.message.contains(&format!("{}", MAX_SALES_LINES + 1)));
     }
 
     #[test]

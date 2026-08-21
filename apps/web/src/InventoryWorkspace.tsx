@@ -541,6 +541,31 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
     }
   }
 
+  async function discardCount() {
+    if (!count) return;
+    if (
+      !window.confirm(
+        "Discard this count? Everything entered for it is deleted, and nothing is recorded in history.",
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await request(`/v1/inventory-counts/${count.id}`, { method: "DELETE" });
+      setCount(null);
+      setEntryState({});
+      setMode("overview");
+      await loadOverview();
+      showNotice("Count discarded.");
+    } catch (reason) {
+      showError(reason instanceof Error ? reason.message : "The count couldn't be discarded.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function continueFromChanges() {
     const completed = completedForChanges;
     setCompletedForChanges(null);
@@ -1192,6 +1217,14 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
           <button className="ledger-button" type="button" disabled={busy} onClick={() => void reviewCount()}>
             Review count
           </button>
+          <button
+            className="text-button"
+            type="button"
+            disabled={busy}
+            onClick={() => void discardCount()}
+          >
+            Discard count
+          </button>
         </div>
       </section>
     );
@@ -1256,6 +1289,19 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
             Draft in progress · {countScopeLabel(count.scope)} ·{" "}
             {count.entries.filter((e) => e.quantity !== null || e.skipped).length} of{" "}
             {count.entries.length} done
+            {manager && (
+              <>
+                {" · "}
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void discardCount()}
+                >
+                  Discard draft
+                </button>
+              </>
+            )}
           </p>
         )}
       </header>

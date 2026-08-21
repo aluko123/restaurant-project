@@ -924,6 +924,37 @@ pub(crate) async fn complete(
     Ok(Json(load_count(&state, id, m.restaurant_id).await?))
 }
 
+pub(crate) async fn discard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let m = membership(&state, &headers).await?;
+    let mut tx = state.pool.begin().await.map_err(database_error)?;
+    sqlx::query("SELECT id FROM restaurants WHERE id=$1 FOR UPDATE")
+        .bind(m.restaurant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    let deleted = sqlx::query(
+        "DELETE FROM inventory_count_sessions WHERE id=$1 AND restaurant_id=$2 AND status='draft'",
+    )
+    .bind(id)
+    .bind(m.restaurant_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error)?
+    .rows_affected();
+    if deleted == 0 {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "No draft inventory count to discard.",
+        ));
+    }
+    tx.commit().await.map_err(database_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn load_count(state: &AppState, id: Uuid, restaurant: Uuid) -> Result<Count, ApiError> {
     let mut tx = state.pool.begin().await.map_err(database_error)?;
     let h = sqlx::query_as::<_, CountHeader>(

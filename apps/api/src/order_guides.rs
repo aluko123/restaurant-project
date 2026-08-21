@@ -44,6 +44,8 @@ struct Line {
 pub(crate) struct Guide {
     id: Uuid,
     source_count_id: Uuid,
+    source_count_completed_at: Option<DateTime<Utc>>,
+    newer_count_exists: bool,
     status: String,
     revision: i64,
     created_at: DateTime<Utc>,
@@ -60,6 +62,8 @@ pub(crate) struct Guide {
 struct Header {
     id: Uuid,
     source_count_id: Uuid,
+    source_count_completed_at: Option<DateTime<Utc>>,
+    newer_count_exists: bool,
     status: String,
     revision: i64,
     created_at: DateTime<Utc>,
@@ -185,6 +189,38 @@ type MappingRow = (
     BigDecimal,
 );
 
+async fn newest_full_coverage_count(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    restaurant: Uuid,
+) -> Result<Option<(Uuid, DateTime<Utc>)>, ApiError> {
+    sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
+        "WITH par_items AS (
+           SELECT id FROM inventory_items
+           WHERE restaurant_id=$1 AND active AND par_level IS NOT NULL
+         ),
+         recent AS (
+           SELECT id, completed_at FROM inventory_count_sessions
+           WHERE restaurant_id=$1 AND status='completed'
+           ORDER BY completed_at DESC, id DESC LIMIT 50
+         )
+         SELECT r.id, r.completed_at
+         FROM recent r
+         WHERE NOT EXISTS (
+           SELECT 1 FROM par_items p
+           WHERE NOT EXISTS (
+             SELECT 1 FROM inventory_count_entries e
+             WHERE e.session_id=r.id AND e.inventory_item_id=p.id AND e.quantity IS NOT NULL
+           )
+         )
+         ORDER BY r.completed_at DESC, r.id DESC
+         LIMIT 1",
+    )
+    .bind(restaurant)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(database_error)
+}
+
 pub(crate) async fn create(
     State(s): State<AppState>,
     h: HeaderMap,
@@ -198,11 +234,17 @@ pub(crate) async fn create(
         .execute(&mut *tx)
         .await
         .map_err(database_error)?;
-    let latest=sqlx::query_scalar::<_,Uuid>("SELECT id FROM inventory_count_sessions WHERE restaurant_id=$1 AND status='completed' ORDER BY completed_at DESC,id DESC LIMIT 1 FOR SHARE").bind(m.restaurant_id).fetch_optional(&mut *tx).await.map_err(database_error)?.ok_or(ApiError(StatusCode::UNPROCESSABLE_ENTITY,"Complete an inventory count before creating an order guide."))?;
+    let (latest, _latest_completed_at) =
+        newest_full_coverage_count(&mut tx, m.restaurant_id)
+            .await?
+            .ok_or(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Complete a full inventory count covering every par item before creating an order guide.",
+            ))?;
     if i.count_id.is_some_and(|count_id| latest != count_id) {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            "Order guides can only use the latest completed count.",
+            "Order guides can only use the latest full inventory count.",
         ));
     }
     if let Some(id) = sqlx::query_scalar::<_, Uuid>(
@@ -421,12 +463,21 @@ async fn transition(
             "This draft changed or has already transitioned. Reload it before ordering.",
         ));
     }
-    let latest=sqlx::query_scalar::<_,Uuid>("SELECT id FROM inventory_count_sessions WHERE restaurant_id=$1 AND status='completed' ORDER BY completed_at DESC,id DESC LIMIT 1").bind(m.restaurant_id).fetch_optional(&mut *tx).await.map_err(database_error)?;
-    if latest != Some(source) {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "A newer inventory count exists. Create a new order guide.",
-        ));
+    let eligible = newest_full_coverage_count(&mut tx, m.restaurant_id).await?;
+    match eligible {
+        Some((id, _)) if id == source => {}
+        Some(_) => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "A newer full inventory count exists. Create a new order guide.",
+            ));
+        }
+        None => {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Complete a full inventory count covering every par item before ordering this guide.",
+            ));
+        }
     }
     sqlx::query("UPDATE order_guides SET status='ordered',ordered_by=$3,ordered_at=NOW(),revision=revision+1,updated_at=NOW() WHERE id=$1 AND restaurant_id=$2").bind(id).bind(m.restaurant_id).bind(m.user_id).execute(&mut *tx).await.map_err(database_error)?;
     tx.commit().await.map_err(database_error)?;
@@ -687,10 +738,15 @@ async fn resolve_edit_supplier(
 }
 async fn load(s: &AppState, id: Uuid, r: Uuid) -> Result<Guide, ApiError> {
     let h = sqlx::query_as::<_, Header>(
-        "SELECT g.id,g.source_count_id,g.status,g.revision,g.created_at,g.updated_at,
+        "SELECT g.id,g.source_count_id,s.completed_at source_count_completed_at,
+                EXISTS(SELECT 1 FROM inventory_count_sessions s2
+                       WHERE s2.restaurant_id=g.restaurant_id AND s2.status='completed'
+                         AND (s2.completed_at,s2.id) > (s.completed_at,s.id)) newer_count_exists,
+                g.status,g.revision,g.created_at,g.updated_at,
                 g.ordered_at,g.received_at,g.cancelled_at,g.linked_invoice_id,
                 i.supplier_name linked_invoice_supplier_name,i.invoice_date linked_invoice_date
          FROM order_guides g
+         LEFT JOIN inventory_count_sessions s ON s.id=g.source_count_id
          LEFT JOIN invoices i ON i.id=g.linked_invoice_id AND i.restaurant_id=g.restaurant_id
          WHERE g.id=$1 AND g.restaurant_id=$2",
     )
@@ -715,6 +771,8 @@ async fn load(s: &AppState, id: Uuid, r: Uuid) -> Result<Guide, ApiError> {
     Ok(Guide {
         id: h.id,
         source_count_id: h.source_count_id,
+        source_count_completed_at: h.source_count_completed_at,
+        newer_count_exists: h.newer_count_exists,
         status: h.status,
         revision: h.revision,
         created_at: h.created_at,

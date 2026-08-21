@@ -16,6 +16,8 @@ use crate::{
     uploads::{UploadedFile, multipart_error},
 };
 
+use sha2::{Digest, Sha256};
+
 const MAX_SUPPLIER_CHARS: usize = 120;
 /// Placeholder until extraction (or review) supplies the real supplier name.
 pub(crate) const READING_SUPPLIER: &str = "Reading invoice…";
@@ -40,6 +42,7 @@ pub(crate) struct Invoice {
     delayed: bool,
     price_change_count: i64,
     purchase_receipt_recorded: bool,
+    duplicate: bool,
     created_at: chrono::DateTime<Utc>,
 }
 
@@ -72,6 +75,8 @@ pub(crate) struct FileUrl {
     url: String,
 }
 
+const DUPLICATE_INVOICE_MESSAGE: &str = "This invoice file was already uploaded.";
+
 pub(crate) async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -80,6 +85,14 @@ pub(crate) async fn create(
     let membership = membership(&state, &headers).await?;
     let today = restaurant_local_today(&membership.timezone, Utc::now());
     let upload = parse_upload(multipart, today).await?;
+    let content_hash = hex::encode(Sha256::digest(&upload.bytes));
+
+    if let Some(existing) =
+        find_by_content_hash(&state, membership.restaurant_id, &content_hash).await?
+    {
+        return Ok((StatusCode::OK, Json(existing)));
+    }
+
     let id = Uuid::now_v7();
     let key = object_key(membership.restaurant_id, id, upload.extension);
     let size_bytes = upload.bytes.len() as i64;
@@ -100,11 +113,11 @@ pub(crate) async fn create(
         let invoice = sqlx::query_as::<_, Invoice>(
             "INSERT INTO invoices
          (id, restaurant_id, uploaded_by, supplier_name, invoice_date, original_filename,
-          content_type, size_bytes, object_key, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing')
+          content_type, size_bytes, object_key, content_hash, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'processing')
          RETURNING id, supplier_name, invoice_date, original_filename, content_type,
                    size_bytes, status, FALSE AS delayed, 0::bigint AS price_change_count,
-                   FALSE AS purchase_receipt_recorded,
+                   FALSE AS purchase_receipt_recorded, FALSE AS duplicate,
                    created_at",
         )
         .bind(id)
@@ -116,9 +129,20 @@ pub(crate) async fn create(
         .bind(upload.content_type)
         .bind(size_bytes)
         .bind(&key)
+        .bind(&content_hash)
         .fetch_one(&mut *tx)
         .await
-        .map_err(crate::database_error)?;
+        .map_err(|error| {
+            if error
+                .as_database_error()
+                .and_then(|code| code.code())
+                .is_some_and(|code| code == "23505")
+            {
+                ApiError(StatusCode::CONFLICT, DUPLICATE_INVOICE_MESSAGE)
+            } else {
+                crate::database_error(error)
+            }
+        })?;
         sqlx::query("INSERT INTO invoice_extraction_jobs (invoice_id) VALUES ($1)")
             .bind(id)
             .execute(&mut *tx)
@@ -132,6 +156,16 @@ pub(crate) async fn create(
 
     match result {
         Ok(invoice) => Ok((StatusCode::CREATED, Json(invoice))),
+        Err(ApiError(StatusCode::CONFLICT, message)) if message == DUPLICATE_INVOICE_MESSAGE => {
+            // A concurrent upload of the same file won the race; return its record.
+            if let Err(delete_error) = state.storage.delete(&key).await {
+                tracing::error!(%delete_error, object_key = %key, "invoice R2 cleanup failed");
+            }
+            match find_by_content_hash(&state, membership.restaurant_id, &content_hash).await? {
+                Some(existing) => Ok((StatusCode::OK, Json(existing))),
+                None => Err(ApiError(StatusCode::CONFLICT, DUPLICATE_INVOICE_MESSAGE)),
+            }
+        }
         Err(error) => {
             tracing::error!("invoice metadata insert failed");
             if let Err(delete_error) = state.storage.delete(&key).await {
@@ -146,6 +180,42 @@ pub(crate) async fn create(
             })
         }
     }
+}
+
+async fn find_by_content_hash(
+    state: &AppState,
+    restaurant_id: Uuid,
+    content_hash: &str,
+) -> Result<Option<Invoice>, ApiError> {
+    sqlx::query_as::<_, Invoice>(
+        "SELECT invoice.id,invoice.supplier_name,invoice.invoice_date,
+                invoice.original_filename,invoice.content_type,invoice.size_bytes,invoice.status,
+                invoice.status = 'processing'
+                    AND invoice.updated_at < NOW() - INTERVAL '5 minutes' AS delayed,
+                (SELECT COUNT(*) FROM invoice_price_findings finding
+                 WHERE finding.restaurant_id=invoice.restaurant_id
+                   AND finding.invoice_id=invoice.id AND finding.status='open') AS price_change_count,
+                EXISTS(
+                    SELECT 1 FROM purchase_receipts receipt
+                    WHERE receipt.invoice_id=invoice.id
+                      AND receipt.restaurant_id=invoice.restaurant_id
+                ) AS purchase_receipt_recorded,
+                TRUE AS duplicate,
+                invoice.created_at
+         FROM invoices invoice
+         WHERE invoice.restaurant_id=$1 AND invoice.content_hash=$2",
+    )
+    .bind(restaurant_id)
+    .bind(content_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "invoice dedupe lookup failed");
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "We couldn't check this invoice. Please try again.",
+        )
+    })
 }
 
 pub(crate) async fn list(
@@ -166,10 +236,11 @@ pub(crate) async fn list(
                     WHERE receipt.invoice_id=invoice.id
                       AND receipt.restaurant_id=invoice.restaurant_id
                 ) AS purchase_receipt_recorded,
+                FALSE AS duplicate,
                 invoice.created_at
-         FROM invoices invoice
-         WHERE invoice.restaurant_id=$1
-         ORDER BY invoice.created_at DESC,invoice.id DESC LIMIT 100",
+          FROM invoices invoice
+          WHERE invoice.restaurant_id=$1
+          ORDER BY invoice.created_at DESC,invoice.id DESC LIMIT 100",
     )
     .bind(membership.restaurant_id)
     .fetch_all(&state.pool)
@@ -711,6 +782,66 @@ pub(crate) async fn retry(
         .bind(id).execute(&mut *tx).await.map_err(crate::database_error)?;
     tx.commit().await.map_err(crate::database_error)?;
     Ok(StatusCode::ACCEPTED)
+}
+
+pub(crate) async fn delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let member = membership(&state, &headers).await?;
+    let mut tx = state.pool.begin().await.map_err(crate::database_error)?;
+    let existing = sqlx::query_as::<_, (String, String)>(
+        "SELECT status,object_key FROM invoices WHERE id=$1 AND restaurant_id=$2 FOR UPDATE",
+    )
+    .bind(id)
+    .bind(member.restaurant_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "invoice delete lookup failed");
+        crate::database_error(error)
+    })?;
+    let (status, object_key) = match existing {
+        Some(row) => row,
+        None => return Err(ApiError(StatusCode::NOT_FOUND, "Invoice not found.")),
+    };
+    if !matches!(status.as_str(), "processing" | "failed" | "needs_review") {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Only an invoice that hasn't been approved yet can be deleted.",
+        ));
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM invoices
+         WHERE id=$1 AND restaurant_id=$2
+           AND NOT EXISTS(
+               SELECT 1 FROM purchase_receipts receipt WHERE receipt.invoice_id=invoices.id
+           )
+           AND NOT EXISTS(
+               SELECT 1 FROM order_guides guide WHERE guide.linked_invoice_id=invoices.id
+           )",
+    )
+    .bind(id)
+    .bind(member.restaurant_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "invoice delete failed");
+        crate::database_error(error)
+    })?
+    .rows_affected();
+    tx.commit().await.map_err(crate::database_error)?;
+    if deleted == 0 {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Only an invoice that hasn't been approved yet can be deleted.",
+        ));
+    }
+    if let Err(delete_error) = state.storage.delete(&object_key).await {
+        tracing::error!(%delete_error, object_key = %object_key, "invoice R2 cleanup failed");
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn validate_review(mut i: ReviewInput, today: NaiveDate) -> Result<ReviewInput, ApiError> {

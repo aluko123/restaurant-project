@@ -32,7 +32,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -271,6 +271,7 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
                 .layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
         )
         .route("/v1/invoices/{id}/file", get(invoices::file_url))
+        .route("/v1/invoices/{id}", delete(invoices::delete))
         .route(
             "/v1/invoices/{id}/review",
             get(invoices::get_review).put(invoices::put_review),
@@ -373,7 +374,9 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         )
         .route(
             "/v1/inventory-counts/{id}",
-            get(inventory::get_count).put(inventory::save),
+            get(inventory::get_count)
+                .put(inventory::save)
+                .delete(inventory::discard),
         )
         .route(
             "/v1/inventory-counts/{id}/complete",
