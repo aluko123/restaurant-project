@@ -78,6 +78,7 @@ cargo test --workspace
 TEST_DATABASE_URL=postgres://restaurant:restaurant@localhost:5432/postgres \
   cargo test -p restaurant-api release_tests -- --ignored --test-threads=1
 npm run check --prefix apps/web
+npm run test --prefix apps/web
 npm run build --prefix apps/web
 npm run test:e2e --prefix apps/web
 ```

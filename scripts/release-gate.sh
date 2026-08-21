@@ -25,4 +25,5 @@ else
   npm run install:e2e --prefix "$ROOT/apps/web"
 fi
 npm run check --prefix "$ROOT/apps/web"
+npm run test --prefix "$ROOT/apps/web"
 npm run test:e2e --prefix "$ROOT/apps/web"

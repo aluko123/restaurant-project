@@ -37,6 +37,12 @@ test.describe("@authenticated credential-dependent owner smoke", () => {
     await expect(page.getByRole("heading", { name: / inventory$/i })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Add an item" })).toBeVisible();
 
+    await page.getByRole("button", { name: "Past counts" }).click();
+    await expect(page.getByRole("heading", { name: "Past counts" })).toBeVisible();
+    await expect(
+      page.getByText("Completed physical counts stay here for reference."),
+    ).toBeVisible();
+
     await page.getByRole("button", { name: "Losses" }).click();
     await expect(page.getByRole("heading", { name: "Waste & stockouts" })).toBeVisible();
 
