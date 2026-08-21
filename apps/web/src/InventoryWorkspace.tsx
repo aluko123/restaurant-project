@@ -155,7 +155,8 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
   };
 
   const clearFeedback = useCallback(() => {
-    clearFeedback();
+    setError("");
+    setNotice("");
   }, []);
   const showError = useCallback((message: string) => {
     setNotice("");
