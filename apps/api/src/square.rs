@@ -774,7 +774,7 @@ async fn enqueue_due_auto_syncs(pool: &PgPool) -> Result<u64, sqlx::Error> {
                        WHERE done.connection_id=connection.id AND done.status='succeeded')
            AND COALESCE((SELECT MAX(run.created_at) FROM source_sync_runs run
                          WHERE run.connection_id=connection.id),
-                        '-infinity'::timestamptz) <= NOW() - make_interval(mins => $2)",
+                        '-infinity'::timestamptz) <= NOW() - make_interval(mins => $2::int)",
     )
     .bind(PROVIDER)
     .bind(AUTO_SYNC_INTERVAL_MINUTES)
