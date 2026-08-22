@@ -97,6 +97,13 @@ type SquareConnection = {
   lastSyncAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
+  lastSyncStats: {
+    ordersSeen?: number;
+    linesMatched?: number;
+    linesSkipped?: number;
+    daysWritten?: number;
+    menu?: { upserted?: number; skipped?: number };
+  } | null;
   configured: boolean;
 };
 
@@ -454,6 +461,14 @@ export function SourcesWorkspace({
                   {squareConnection.lastError && (
                     <p className="form-error" role="alert">
                       {squareConnection.lastError}
+                    </p>
+                  )}
+                  {(squareConnection.lastSyncStats?.linesSkipped ?? 0) > 0 && (
+                    <p className="review-warning" role="status">
+                      {squareConnection.lastSyncStats?.linesSkipped} order line
+                      {(squareConnection.lastSyncStats?.linesSkipped ?? 0) === 1 ? "" : "s"}{" "}
+                      couldn't be matched to menu items and weren't counted in sales. Review Menu —
+                      custom or removed Square items are usually the cause.
                     </p>
                   )}
                   <p>

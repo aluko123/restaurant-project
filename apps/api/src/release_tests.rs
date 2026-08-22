@@ -3094,3 +3094,151 @@ async fn weekly_brief_saves_snapshots_and_replays_past_weeks() {
 
     fixture.drop().await;
 }
+
+/// Drives the real Square connector code against a local mock of the Square
+/// API, proving categories land on menu items and unmatched order lines are
+/// counted instead of silently dropped.
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn square_sync_maps_categories_and_reports_unmatched_order_lines() {
+    use crate::square::{SyncJob, sync_catalog, sync_orders};
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let fixture = ApiFixture::create("square_sync_gaps").await;
+
+    let server = MockServer::start().await;
+    // Single-threaded gate (--test-threads=1); points api_base() at the mock.
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe {
+        std::env::set_var("SQUARE_API_BASE_URL", server.uri());
+    }
+
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/list"))
+        .and(query_param("types", "CATEGORY"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "objects": [{"type":"CATEGORY","id":"CAT-1","category_data":{"name":"Beverages"}}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "objects": [{
+                "type":"ITEM","id":"ITEM-1","is_deleted":false,
+                "item_data":{
+                    "name":"Cold Brew",
+                    "categories":[{"id":"CAT-1"}],
+                    "variations":[{
+                        "type":"ITEM_VARIATION","id":"VAR-1",
+                        "item_variation_data":{
+                            "name":"Regular",
+                            "price_money":{"amount":550,"currency":"USD"}
+                        }
+                    }]
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    let closed_at = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    Mock::given(method("POST"))
+        .and(path("/v2/orders/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "orders": [{
+                "closed_at": closed_at,
+                "line_items": [
+                    {"catalog_object_id":"VAR-1","quantity":"2",
+                     "total_money":{"amount":1100,"currency":"USD"}},
+                    {"quantity":"1","total_money":{"amount":300,"currency":"USD"}}
+                ]
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let config = crate::square::SquareConfig::test_config();
+    let owner_user: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE auth_subject='owner-a'")
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+
+    // Catalog: category name lands on the synced menu item.
+    let catalog = sync_catalog(
+        &fixture.database.pool,
+        &config,
+        "access-token",
+        fixture.ids.restaurant_a,
+    )
+    .await
+    .unwrap();
+    assert_eq!(catalog["upserted"], 1);
+    let item = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT name,category FROM menu_items
+         WHERE restaurant_id=$1 AND external_source='square' AND external_id='VAR-1'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(item.0, "Cold Brew");
+    assert_eq!(item.1.as_deref(), Some("Beverages"));
+
+    // Orders: matched lines aggregate into the day; custom lines are counted.
+    let connection_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO source_connections
+         (id,restaurant_id,provider,status,external_location_id,last_success_at,created_by)
+         VALUES($1,$2,'square','connected','LOC-1',NULL,$3)",
+    )
+    .bind(connection_id)
+    .bind(fixture.ids.restaurant_a)
+    .bind(owner_user)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    let job = SyncJob {
+        id: Uuid::now_v7(),
+        connection_id,
+        restaurant_id: fixture.ids.restaurant_a,
+        kind: "full".into(),
+        claim_token: Uuid::now_v7(),
+    };
+    let stats = sync_orders(
+        &fixture.database.pool,
+        &config,
+        "access-token",
+        &job,
+        "LOC-1",
+        "UTC",
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats["ordersSeen"], 1);
+    assert_eq!(stats["linesMatched"], 1);
+    assert_eq!(stats["linesSkipped"], 1);
+    assert_eq!(stats["daysWritten"], 1);
+
+    let day = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT revision,external_source FROM sales_days
+         WHERE restaurant_id=$1 AND external_source='square'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(day.1.as_deref(), Some("square"));
+    let line = sqlx::query_as::<_, (BigDecimal, Option<String>)>(
+        "SELECT quantity,reported_net_sales::text FROM sales_lines
+         WHERE sales_day_id IN (SELECT id FROM sales_days WHERE restaurant_id=$1)",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(line.0.normalized().to_string(), "2");
+    assert_eq!(line.1.as_deref(), Some("11.0000"));
+
+    fixture.drop().await;
+}
