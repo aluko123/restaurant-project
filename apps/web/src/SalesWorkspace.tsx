@@ -42,6 +42,19 @@ type SalesDaySummary = {
 };
 
 type Entry = { quantity: string; reportedNetSales: string };
+type ConflictLine = {
+  menuItemId: string;
+  name: string;
+  mine: Entry | null;
+  theirs: Entry | null;
+  choice: "mine" | "theirs";
+};
+type SalesConflict = { serverDay: SalesDay; lines: ConflictLine[] };
+
+function entryChanged(a: Entry | null, b: Entry | null) {
+  return (a?.quantity ?? "") !== (b?.quantity ?? "")
+    || (a?.reportedNetSales ?? "") !== (b?.reportedNetSales ?? "");
+}
 type SalesRow = {
   id: string;
   name: string;
@@ -113,6 +126,7 @@ export function SalesWorkspace({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [stale, setStale] = useState(false);
+  const [conflict, setConflict] = useState<SalesConflict | null>(null);
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importPreview, setImportPreview] = useState<SalesImportPreview | null>(null);
   const [importDecisions, setImportDecisions] = useState<Record<number, ImportDecision | undefined>>({});
@@ -121,22 +135,24 @@ export function SalesWorkspace({
   const [salesCategory, setSalesCategory] = useState("all");
   const [salesView, setSalesView] = useState<"all" | "entered">("all");
   const requestGeneration = useRef(0);
+  const baselineRef = useRef<Record<string, Entry>>({});
 
   const adoptDay = useCallback((value: SalesDay | null, businessDate: string) => {
+    const adopted = Object.fromEntries(
+      (value?.lines ?? []).map((line) => [
+        line.menuItemId,
+        {
+          quantity: trimDecimal(line.quantity),
+          reportedNetSales: line.reportedNetSales === null ? "" : trimDecimal(line.reportedNetSales),
+        },
+      ]),
+    );
+    baselineRef.current = adopted;
+    setConflict(null);
     setDay(value);
     setLoadedDate(businessDate);
     setDateInput(businessDate);
-    setEntries(
-      Object.fromEntries(
-        (value?.lines ?? []).map((line) => [
-          line.menuItemId,
-          {
-            quantity: trimDecimal(line.quantity),
-            reportedNetSales: line.reportedNetSales === null ? "" : trimDecimal(line.reportedNetSales),
-          },
-        ]),
-      ),
-    );
+    setEntries(adopted);
     setMode("entry");
     setStale(false);
   }, []);
@@ -240,7 +256,7 @@ export function SalesWorkspace({
     setNotice("");
   }
 
-  async function previewCsv(file = importFile) {
+  async function previewCsv(file = importFile, preserveDecisions = false) {
     if (!file) {
       setError("Choose a sales CSV to read.");
       return;
@@ -266,11 +282,28 @@ export function SalesWorkspace({
       if (generation !== requestGeneration.current) return;
       setOptions(nextOptions);
       setImportPreview(value);
-      setImportDecisions(Object.fromEntries(
+      const defaults = Object.fromEntries(
         value.rows
           .filter((row) => row.matchedMenuItemId)
           .map((row) => [row.rowNumber, row.matchedMenuItemId as string]),
-      ));
+      );
+      if (preserveDecisions && importPreview) {
+        // Same file re-read after a conflict: keep every hand-set match or
+        // exclusion by matching rows through their stable row numbers.
+        const priorByLabel = new Map(
+          importPreview.rows.map((row) => [row.rawItemLabel, importDecisions[row.rowNumber]]),
+        );
+        setImportDecisions(
+          Object.fromEntries(
+            value.rows.map((row) => [
+              row.rowNumber,
+              priorByLabel.get(row.rawItemLabel) ?? defaults[row.rowNumber],
+            ]),
+          ),
+        );
+      } else {
+        setImportDecisions(defaults);
+      }
       setStale(false);
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (reason) {
@@ -382,9 +415,100 @@ export function SalesWorkspace({
       if (requestStatus(reason) === 409) {
         setStale(true);
         setMode("entry");
-        setError("This sales day changed since you opened it. Reload the saved day before editing again.");
+        setError("This sales day changed since you opened it. Choose how to combine your entries with the saved day.");
+        await enterConflict();
       } else {
         setError(errorMessage(reason, "The sales day couldn't be saved. Check the entries and try again."));
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function enterConflict() {
+    try {
+      const serverDay = await request<SalesDay>(`/v1/sales-days/${loadedDate}`);
+      const nameById = new Map(options.map((option) => [option.id, option.name]));
+      const ids = new Set<string>([
+        ...Object.keys(entries),
+        ...serverDay.lines.map((line) => line.menuItemId),
+      ]);
+      const lines: ConflictLine[] = [];
+      for (const id of ids) {
+        const mine = entries[id]?.quantity.trim() ? entries[id] : null;
+        const serverLine = serverDay.lines.find((line) => line.menuItemId === id);
+        const theirs = serverLine
+          ? {
+              quantity: trimDecimal(serverLine.quantity),
+              reportedNetSales:
+                serverLine.reportedNetSales === null ? "" : trimDecimal(serverLine.reportedNetSales),
+            }
+          : null;
+        if (!entryChanged(mine, theirs)) continue;
+        const baseline = baselineRef.current[id] ?? null;
+        const changedMine = entryChanged(mine, baseline);
+        const changedTheirs = entryChanged(theirs, baseline);
+        lines.push({
+          menuItemId: id,
+          name: nameById.get(id) ?? `Item ${id.slice(0, 8)}`,
+          mine,
+          theirs,
+          choice: changedMine && !changedTheirs ? "mine" : "theirs",
+        });
+      }
+      setConflict(lines.length > 0 ? { serverDay, lines } : null);
+    } catch {
+      setConflict(null);
+    }
+  }
+
+  async function saveResolvedDay() {
+    if (!conflict) return;
+    setSaving(true);
+    setError("");
+    setNotice("");
+    try {
+      const conflictedIds = new Set(conflict.lines.map((line) => line.menuItemId));
+      const merged = new Map<string, Entry & { currency?: string }>();
+      for (const line of conflict.serverDay.lines) {
+        merged.set(line.menuItemId, {
+          quantity: trimDecimal(line.quantity),
+          reportedNetSales:
+            line.reportedNetSales === null ? "" : trimDecimal(line.reportedNetSales),
+        });
+      }
+      for (const line of conflict.lines) {
+        if (line.choice === "theirs") continue;
+        if (line.mine) merged.set(line.menuItemId, line.mine);
+        else merged.delete(line.menuItemId);
+      }
+      for (const [id, entry] of Object.entries(entries)) {
+        if (!entry.quantity.trim() || conflictedIds.has(id)) continue;
+        merged.set(id, entry);
+      }
+      const value = await request<SalesDay>(`/v1/sales-days/${loadedDate}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          expectedRevision: conflict.serverDay.revision,
+          lines: [...merged.entries()]
+            .filter(([, entry]) => entry.quantity.trim())
+            .map(([menuItemId, entry]) => ({
+              menuItemId,
+              quantity: entry.quantity.trim(),
+              reportedNetSales: entry.reportedNetSales.trim() || null,
+            })),
+        }),
+      });
+      setNotice("Merged sales day saved.");
+      setConflict(null);
+      adoptDay(value, loadedDate);
+      await loadRecent();
+    } catch (reason) {
+      if (requestStatus(reason) === 409) {
+        setError("The day moved again while merging. Review once more.");
+        await enterConflict();
+      } else {
+        setError(errorMessage(reason, "The merged sales day couldn't be saved. Try again."));
       }
     } finally {
       setSaving(false);
@@ -430,7 +554,94 @@ export function SalesWorkspace({
       )}
       {error && <p className="form-error sales-message" role="alert">{error}</p>}
       {notice && <p className="success-notice sales-message" role="status">{notice}</p>}
-      {stale && (
+      {conflict ? (
+        <div className="stale-sales" role="alert">
+          <strong>Resolve changes to {formatBusinessDate(loadedDate)}</strong>
+          <p>
+            Someone else saved this day while you were editing. Your other entries are kept —
+            choose below for the items that changed in both places.
+          </p>
+          <div className="recent-sales-list">
+            {conflict.lines.map((line) => (
+              <article key={line.menuItemId}>
+                <div>
+                  <h3>{line.name}</h3>
+                  <p>
+                    Saved: {line.theirs ? `${line.theirs.quantity}${line.theirs.reportedNetSales.trim() ? ` · ${line.theirs.reportedNetSales}` : ""}` : "removed"}
+                    {" · Yours: "}
+                    {line.mine ? `${line.mine.quantity}${line.mine.reportedNetSales.trim() ? ` · ${line.mine.reportedNetSales}` : ""}` : "removed"}
+                  </p>
+                </div>
+                <div role="radiogroup" aria-label={`Keep which value for ${line.name}`}>
+                  <label className="active-toggle">
+                    <input
+                      type="radio"
+                      name={`conflict-${line.menuItemId}`}
+                      checked={line.choice === "theirs"}
+                      onChange={() =>
+                        setConflict((current) =>
+                          current
+                            ? {
+                                ...current,
+                                lines: current.lines.map((row) =>
+                                  row.menuItemId === line.menuItemId
+                                    ? { ...row, choice: "theirs" as const }
+                                    : row,
+                                ),
+                              }
+                            : current,
+                        )
+                      }
+                    />
+                    Use saved
+                  </label>
+                  <label className="active-toggle">
+                    <input
+                      type="radio"
+                      name={`conflict-${line.menuItemId}`}
+                      checked={line.choice === "mine"}
+                      onChange={() =>
+                        setConflict((current) =>
+                          current
+                            ? {
+                                ...current,
+                                lines: current.lines.map((row) =>
+                                  row.menuItemId === line.menuItemId
+                                    ? { ...row, choice: "mine" as const }
+                                    : row,
+                                ),
+                              }
+                            : current,
+                        )
+                      }
+                    />
+                    Use mine
+                  </label>
+                </div>
+              </article>
+            ))}
+          </div>
+          <button
+            className="ledger-button"
+            type="button"
+            disabled={saving}
+            onClick={() => void saveResolvedDay()}
+          >
+            {saving ? "Saving…" : "Save combined day"}
+          </button>
+          <button
+            className="text-button"
+            type="button"
+            disabled={saving}
+            onClick={() => {
+              setConflict(null);
+              void loadDay(loadedDate);
+            }}
+          >
+            Discard my entries and reload
+          </button>
+        </div>
+      ) : stale && (
         <div className="stale-sales" role="alert">
           <strong>Reload before saving</strong>
           <p>
@@ -441,7 +652,7 @@ export function SalesWorkspace({
           <button
             className="file-button"
             type="button"
-            onClick={() => importPreview && importFile ? void previewCsv(importFile) : void loadDay(loadedDate)}
+            onClick={() => importPreview && importFile ? void previewCsv(importFile, true) : void loadDay(loadedDate)}
           >
             {importPreview ? "Refresh CSV preview" : "Reload saved day"}
           </button>

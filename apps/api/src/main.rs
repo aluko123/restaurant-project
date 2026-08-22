@@ -193,7 +193,13 @@ async fn main() -> Result<()> {
     } else {
         info!("Square connect not configured (set SQUARE_* env vars to enable)");
     }
-    tokio::spawn(square::run_worker(pool.clone(), square_config.clone()));
+    for worker_index in 0..3 {
+        tokio::spawn(square::run_worker(
+            pool.clone(),
+            square_config.clone(),
+            worker_index == 0,
+        ));
+    }
 
     let app = router(
         AppState {

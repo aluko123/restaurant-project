@@ -166,7 +166,7 @@ describe("InventoryWorkspace count flow", () => {
       { method: "POST", path: "/v1/order-guides", respond: () => guide },
       {
         method: "GET",
-        path: /\/v1\/inventory-counts\?/,
+        path: /\/v1\/inventory-counts(\?.*)?$/,
         respond: () => countSummary,
       },
     ]);

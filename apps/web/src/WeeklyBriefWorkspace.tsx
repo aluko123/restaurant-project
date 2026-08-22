@@ -29,7 +29,7 @@ type WeeklyBriefResponse = {
   utcStart: string;
   utcEnd: string;
   generatedAt: string;
-  isLivePreview: true;
+  isLivePreview: boolean;
   daysElapsed: number;
   caveats: string[];
   sales: {
@@ -64,7 +64,14 @@ type WeeklyBriefResponse = {
 type BriefState =
   | { status: "loading" }
   | { status: "error"; message: string }
+  | { status: "missing"; weekStart: string }
   | { status: "ready"; response: WeeklyBriefResponse };
+
+function shiftWeek(isoDate: string, days: number) {
+  const date = new Date(`${isoDate}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
 
 export function WeeklyBriefWorkspace({
   request,
@@ -74,55 +81,93 @@ export function WeeklyBriefWorkspace({
   active: boolean;
 }) {
   const [state, setState] = useState<BriefState>({ status: "loading" });
+  // null = the live current week; otherwise a saved snapshot's week start.
+  const [week, setWeek] = useState<string | null>(null);
 
-  const load = useCallback(() => {
+  const load = useCallback((weekStart?: string | null) => {
     setState({ status: "loading" });
-    void request<WeeklyBriefResponse>("/v1/weekly-brief")
+    void request<WeeklyBriefResponse>(
+      weekStart ? `/v1/weekly-brief?week=${encodeURIComponent(weekStart)}` : "/v1/weekly-brief",
+    )
       .then((response) => setState({ status: "ready", response }))
-      .catch((cause: unknown) =>
+      .catch((cause: unknown) => {
+        const status = (cause as { status?: number } | null)?.status;
+        if (status === 404) {
+          setState({ status: "missing", weekStart: weekStart ?? "" });
+          return;
+        }
         setState({
           status: "error",
           message:
             cause instanceof Error
               ? cause.message
-              : "The current-week brief couldn't load. Please try again.",
-        }),
-      );
+              : "The weekly brief couldn't load. Please try again.",
+        });
+      });
   }, [request]);
 
   useEffect(() => {
-    if (active) load();
-  }, [active, load]);
+    if (active) load(week);
+  }, [active, week, load]);
+
+  const ready = state.status === "ready" ? state.response : null;
 
   return (
     <section className="weekly-brief-workspace" aria-labelledby="weekly-brief-heading">
       <header className="weekly-brief-heading">
         <div className="weekly-brief-eyebrow">
           <p className="section-code">Weekly brief</p>
-          <span>Live preview</span>
+          <span>{ready?.isLivePreview === false ? "Saved snapshot" : "Live preview"}</span>
         </div>
-        <h1 id="weekly-brief-heading">Current week</h1>
-        {state.status === "ready" ? (
-          <div className="weekly-brief-dates">
-            <p>{formatWeekRange(state.response.weekStart, state.response.weekEnd)}</p>
-            <p>
-              {state.response.timezone} · Day {state.response.daysElapsed} of 7 · Generated{" "}
-              <time dateTime={state.response.generatedAt}>
-                {formatTimestamp(state.response.generatedAt, state.response.timezone)}
-              </time>
-            </p>
-          </div>
+        <h1 id="weekly-brief-heading">{ready?.isLivePreview === false ? "Past week" : "Current week"}</h1>
+        {ready ? (
+          <>
+            <div className="weekly-brief-dates">
+              <p>{formatWeekRange(ready.weekStart, ready.weekEnd)}</p>
+              <p>
+                {ready.timezone} · Day {ready.daysElapsed} of 7 · Generated{" "}
+                <time dateTime={ready.generatedAt}>
+                  {formatTimestamp(ready.generatedAt, ready.timezone)}
+                </time>
+              </p>
+            </div>
+            <div className="weekly-brief-nav">
+              {week !== null && (
+                <button className="text-button" type="button" onClick={() => setWeek(null)}>
+                  Back to current week
+                </button>
+              )}
+              {ready && (
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => setWeek(shiftWeek(ready.weekStart, -7))}
+                >
+                  ← Previous week
+                </button>
+              )}
+            </div>
+          </>
         ) : (
           <p>A read-only view of facts entered for this restaurant's current local week.</p>
         )}
       </header>
 
       {state.status === "loading" ? (
-        <p className="weekly-brief-status" role="status">Loading current-week records…</p>
+        <p className="weekly-brief-status" role="status">
+          {week ? "Loading that week's snapshot…" : "Loading current-week records…"}
+        </p>
       ) : state.status === "error" ? (
         <div className="weekly-brief-error">
           <p className="form-error" role="alert">{state.message}</p>
-          <button className="file-button" type="button" onClick={load}>Retry brief</button>
+          <button className="file-button" type="button" onClick={() => load(week)}>Retry brief</button>
+        </div>
+      ) : state.status === "missing" ? (
+        <div className="weekly-brief-error">
+          <p>No brief was saved for that week. Briefs save whenever the current week is opened.</p>
+          <button className="file-button" type="button" onClick={() => setWeek(null)}>
+            Back to current week
+          </button>
         </div>
       ) : (
         <BriefContents response={state.response} />
