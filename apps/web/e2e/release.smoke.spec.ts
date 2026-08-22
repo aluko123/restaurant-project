@@ -24,7 +24,7 @@ for (const route of releaseRoutes) {
     const response = await page.goto(route);
 
     expect(response?.status()).toBe(200);
-    await expect(page).toHaveTitle("parline:the best restaurant inventory management app");
+    await expect(page).toHaveTitle("Parline — restaurant inventory and purchasing actions");
     await expect(page.getByRole("heading", { level: 1 })).toContainText("Count accurately");
     await expect(page.getByRole("button", { name: /Set up your restaurant/i })).toBeDisabled();
     await expect(page.getByText("© 2026 Parline").first()).toBeVisible();

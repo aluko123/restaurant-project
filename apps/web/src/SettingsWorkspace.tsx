@@ -13,6 +13,7 @@ export type SettingsRestaurant = {
   serviceStyle: ServiceStyle;
   timezone: string;
   role: Role;
+  updatedAt: string;
 };
 
 type TeamMember = {
@@ -37,7 +38,7 @@ type SettingsResponse = {
   invitationsEnabled: boolean;
 };
 
-type Draft = Pick<SettingsRestaurant, "name" | "city" | "serviceStyle" | "timezone"> & { region: string; country: string };
+type Draft = Pick<SettingsRestaurant, "name" | "city" | "serviceStyle" | "timezone" | "updatedAt"> & { region: string; country: string };
 
 type Props = {
   restaurant: SettingsRestaurant;
@@ -129,8 +130,8 @@ export function SettingsWorkspace({ restaurant, request, active, onRestaurantCha
     event.preventDefault();
     setError("");
     setNotice("");
-    if (!draft.name.trim() || !draft.city.trim() || !draft.region.trim() || !draft.country.trim()) {
-      setError("Add the restaurant name and location.");
+    if (!draft.name.trim() || !draft.city.trim()) {
+      setError("Add the restaurant name and city.");
       return;
     }
     if (!isSupportedTimezone(draft.timezone.trim())) {
@@ -141,7 +142,7 @@ export function SettingsWorkspace({ restaurant, request, active, onRestaurantCha
     try {
       adopt(await request<SettingsResponse>("/v1/settings", {
         method: "PUT",
-        body: JSON.stringify(draft),
+        body: JSON.stringify({ ...draft, region: draft.region.trim(), country: draft.country.trim(), expectedUpdatedAt: draft.updatedAt }),
       }));
       setNotice("Settings saved. New local-day and weekly boundaries will use this timezone.");
     } catch (cause) {
@@ -332,7 +333,7 @@ export function SettingsWorkspace({ restaurant, request, active, onRestaurantCha
 }
 
 function restaurantDraft(restaurant: SettingsRestaurant): Draft {
-  return { name: restaurant.name, city: restaurant.city, region: restaurant.region ?? "", country: restaurant.country ?? "", serviceStyle: restaurant.serviceStyle, timezone: restaurant.timezone };
+  return { name: restaurant.name, city: restaurant.city, region: restaurant.region ?? "", country: restaurant.country ?? "", serviceStyle: restaurant.serviceStyle, timezone: restaurant.timezone, updatedAt: restaurant.updatedAt };
 }
 
 function isSupportedTimezone(value: string) {

@@ -42,7 +42,7 @@ type ServiceStyle = "counter_service" | "full_service" | "fast_casual" | "cafe_b
 type AppState = { status: "loading" } | { status: "error"; message: string } | { status: "ready"; restaurant: Restaurant | null };
 type Workspace = "today" | "sources" | "brief" | "invoices" | "sales" | "menu" | "inventory" | "losses" | "settings";
 
-const LANDING_TITLE = "parline:the best restaurant inventory management app";
+const LANDING_TITLE = "Parline — restaurant inventory and purchasing actions";
 
 const workspaceTitles: Record<Workspace, string> = {
   today: "Today",
@@ -826,6 +826,7 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
         <button className="ledger-button" type="submit" disabled={uploading}>{uploading ? "Uploading invoice…" : "Upload invoice"}<span aria-hidden="true">→</span></button>
       </form>
       <div className="invoice-list"><div className="list-heading"><h2>Recent invoices</h2>{!loading && <button className="text-button" type="button" onClick={loadInvoices}>Refresh</button>}</div>
+        {!loading && invoices.length >= 100 && <p className="empty-state">Showing the latest 100 invoices.</p>}
         {listError && <p className="form-error" role="alert">{listError}</p>}
         {!loading&&invoices.length>0&&<div className="collection-toolbar invoice-toolbar" aria-label="Filter invoices"><label className="collection-search">Search all invoices<input type="search" placeholder="Supplier or filename" value={invoiceSearch} onChange={event=>{const value=event.target.value;if(!invoiceSearch.trim()&&value.trim()){setInvoiceStatus("all");setInvoicePeriod("all")}setInvoiceSearch(value)}}/></label><label>Status<select value={invoiceStatus} onChange={event=>setInvoiceStatus(event.target.value as typeof invoiceStatus)}><option value="action">Needs action</option><option value="processing">Processing</option><option value="approved">Approved</option><option value="all">All statuses</option></select></label><label>Period<select value={invoicePeriod} onChange={event=>setInvoicePeriod(event.target.value as typeof invoicePeriod)}><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="year">This year</option><option value="all">All history</option></select></label><div className="collection-toolbar-summary"><strong>{filteredInvoices.length} {filteredInvoices.length===1?"invoice":"invoices"}</strong>{invoiceFiltersActive&&<button className="text-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("action");setInvoicePeriod("90")}}>Clear filters</button>}</div></div>}
         {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload one to capture its purchases, compare supplier prices, and create supported Today actions.</p> : filteredInvoices.length===0 ? <div className="filtered-empty"><h3>{invoiceStatus === "action" && !invoiceSearch.trim() ? "No invoices need action" : "No invoices match"}</h3><p>{invoiceStatus === "action" && !invoiceSearch.trim() ? "You're caught up for this period. Approved invoices remain available in history." : "Try a different status, period, or search."}</p><button className="file-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("all");setInvoicePeriod("all")}}>Show all invoices</button></div> : <div className="invoice-results">
@@ -838,10 +839,8 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
 }
 
 function invoiceDisplayName(invoice: Invoice) {
-  if (invoice.status === "processing" || invoice.status === "uploaded") {
-    if (!invoice.supplierName || invoice.supplierName === "Reading invoice…") {
-      return "Reading invoice…";
-    }
+  if (invoice.status === "processing" && (!invoice.supplierName || invoice.supplierName === "Reading invoice…")) {
+    return "Reading invoice…";
   }
   if (invoice.supplierName === "Reading invoice…") return "Supplier needs review";
   return invoice.supplierName;
@@ -875,7 +874,7 @@ function ReviewInvoice({ invoiceId, request, onBack, onApproved, onViewOriginal 
 function isValidInvoiceHeader(review:Review){return Boolean(review.supplierName.trim())&&review.supplierName.trim().length<=120&&/^[A-Z]{3}$/.test(review.currency.trim())&&(review.invoiceNumber?.trim().length??0)<=120&&[review.subtotal,review.tax,review.fees,review.discount,review.total].every(value=>isValidOptionalDecimal(value,4))}
 function isValidInvoiceLine(line:ReviewLine){return Boolean(line.description.trim())&&line.description.trim().length<=500&&(line.sku?.trim().length??0)<=120&&(line.unit?.trim().length??0)<=40&&isValidOptionalDecimal(line.quantity,6)&&isValidOptionalDecimal(line.unitPrice,4)&&isValidOptionalDecimal(line.lineTotal,4)}
 function isValidInvoiceReview(review:Review){return isValidInvoiceHeader(review)&&review.lineItems.length<=200&&review.lineItems.every(isValidInvoiceLine)}
-function isValidOptionalDecimal(value:string|null,scale:number){if(!value?.trim())return true;const normalized=value.trim();const match=/^[+-]?(\d+)(?:\.(\d*))?$/.exec(normalized);return Boolean(match&&normalized.length<=32&&(match[2]?.length??0)<=scale&&match[1].replace(/^0+/,"").length<=18-scale)}
+function isValidOptionalDecimal(value:string|null,scale:number){if(!value?.trim())return true;const normalized=value.trim();const match=/^(\d+)(?:\.(\d*))?$/.exec(normalized);return Boolean(match&&normalized.length<=32&&(match[2]?.length??0)<=scale&&match[1].replace(/^0+/,"").length<=18-scale)}
 
 function PriceChanges({ invoiceId, request, initialChanges, onBack }: { invoiceId:string; request:<T>(path:string, init?:RequestInit)=>Promise<T>; initialChanges:PriceChange[]|null; onBack:()=>void }) {
   const [changes,setChanges]=useState<PriceChange[]|null>(initialChanges); const [error,setError]=useState(""); const [reviewing,setReviewing]=useState("");

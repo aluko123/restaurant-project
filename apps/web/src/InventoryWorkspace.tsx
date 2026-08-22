@@ -677,7 +677,7 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
     setBusy(true);
     clearFeedback();
     try {
-      const rows = await request<CountSummary[]>("/v1/inventory-counts?limit=20");
+      const rows = await request<CountSummary[]>("/v1/inventory-counts?limit=50");
       setHistory(rows);
       setMode("history");
     } catch (reason) {
@@ -872,7 +872,11 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
         {history.length === 0 ? (
           <p className="empty-state">No completed counts yet. Finish a count to build history.</p>
         ) : (
-          <div className="count-history-list">
+          <>
+            {history.length >= 50 && (
+              <p className="empty-state">Showing the latest 50 completed counts.</p>
+            )}
+            <div className="count-history-list">
             {history.map((row) => (
               <article className="count-history-card" key={row.id}>
                 <div>
@@ -896,7 +900,8 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
                 </button>
               </article>
             ))}
-          </div>
+            </div>
+          </>
         )}
       </section>
     );

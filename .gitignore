@@ -11,3 +11,7 @@ sample-invoices/
 apps/web/playwright-report/
 apps/web/test-results/
 apps/web/.auth/
+
+# Local-only artifacts
+daybook-*.png
+sample-inventory.csv
