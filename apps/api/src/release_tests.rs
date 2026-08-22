@@ -150,6 +150,8 @@ struct ApiFixture {
     auth: TestAuth,
     ids: FixtureIds,
     workos: MockWorkos,
+    storage: ObjectStorage,
+    gemini: crate::extraction::GeminiClient,
 }
 
 impl ApiFixture {
@@ -179,6 +181,8 @@ impl ApiFixture {
             auth,
             ids,
             workos,
+            storage: ObjectStorage::inert_for_tests(),
+            gemini: crate::extraction::GeminiClient::inert_for_tests(),
         }
     }
 
@@ -2907,4 +2911,98 @@ async fn invoice_uploads_dedupe_by_content_and_allow_unapproved_deletes() {
     );
 
     fixture.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn inventory_import_worker_processes_enqueued_files() {
+    use bytes::Bytes;
+
+    let fixture = ApiFixture::create("inventory_import_worker").await;
+    let owner = fixture.token("owner-a");
+
+    // Seed a processing import whose file lives in object storage, then let
+    // one worker tick claim and finish it.
+    let import_id = Uuid::now_v7();
+    let key = format!(
+        "restaurants/{}/inventory-imports/{import_id}/original.csv",
+        fixture.ids.restaurant_a
+    );
+    fixture
+        .storage
+        .put(
+            &key,
+            "text/csv",
+            Bytes::from_static(b"name,count_unit\nFlour,bag\nSugar,bag\n"),
+        )
+        .await
+        .expect("test storage put failed");
+    let created_by: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE auth_subject='owner-a'")
+        .bind(fixture.ids.restaurant_a)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO inventory_imports(id,restaurant_id,original_filename,content_hash,status,object_key,created_by)
+         VALUES($1,$2,'inventory.csv',$3,'processing',$4,$5)",
+    )
+    .bind(import_id)
+    .bind(fixture.ids.restaurant_a)
+    .bind(format!("{:064x}", 7))
+    .bind(&key)
+    .bind(created_by)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO inventory_import_jobs(import_id) VALUES($1)")
+        .bind(import_id)
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+
+    while crate::inventory_imports::run_once(
+        &fixture.database.pool,
+        &fixture.storage,
+        &fixture.gemini,
+    )
+    .await
+    .unwrap()
+    {}
+
+    let uri = format!("/v1/inventory-imports/{import_id}");
+    let view = request(fixture.app.clone(), Some(&owner), Method::GET, &uri, None).await;
+    assert_eq!(view.status, StatusCode::OK);
+    assert_eq!(view.body["status"], "needs_review");
+    assert_eq!(view.body["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(view.body["rows"][0]["name"], "Flour");
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&other_token(&fixture)),
+            Method::DELETE,
+            &uri,
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::DELETE,
+            &uri,
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+
+    fixture.drop().await;
+}
+
+fn other_token(fixture: &ApiFixture) -> String {
+    fixture.token("owner-b")
 }

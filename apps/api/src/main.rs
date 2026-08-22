@@ -182,6 +182,11 @@ async fn main() -> Result<()> {
         storage.clone(),
         gemini.clone(),
     ));
+    tokio::spawn(inventory_imports::run_worker(
+        pool.clone(),
+        storage.clone(),
+        gemini.clone(),
+    ));
     let square_config = square::SquareConfig::from_env(&web_origin);
     if square_config.is_some() {
         info!("Square connect configured");
@@ -343,6 +348,10 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
                 .delete(inventory_imports::discard),
         )
         .route(
+            "/v1/inventory-imports/{id}/retry",
+            post(inventory_imports::retry),
+        )
+        .route(
             "/v1/suppliers",
             get(suppliers::list).post(suppliers::create),
         )
@@ -488,6 +497,22 @@ async fn update_migration_setup(
     .execute(&mut *tx)
     .await
     .map_err(database_error)?;
+    if input.mark_complete && current.completed_at.is_none() {
+        // Findings recorded before setup finished were held back as baseline;
+        // completing setup makes them visible like any other price change.
+        let promoted = sqlx::query(
+            "UPDATE invoice_price_findings SET status='open'
+             WHERE restaurant_id=$1 AND status='baseline'",
+        )
+        .bind(restaurant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?
+        .rows_affected();
+        if promoted > 0 {
+            tracing::info!(restaurant_id = %restaurant_id, promoted, "promoted baseline price findings");
+        }
+    }
     tx.commit().await.map_err(database_error)?;
     Ok(Json(load_migration_setup(&state, restaurant_id).await?))
 }

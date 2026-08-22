@@ -245,6 +245,13 @@ impl GeminiClient {
         } else {
             json!({"thinkingBudget":0})
         };
+        // gemini-1.x caps output at 8192 tokens; 2.x and 3.x accept far more,
+        // and long invoices/menus/inventory lists overflow the old fixed cap.
+        let max_output_tokens: i64 = if self.model.starts_with("gemini-1") {
+            8192
+        } else {
+            32768
+        };
         let body = json!({
             "contents":[{"role":"user","parts":[
                 {"text":prompt},
@@ -254,7 +261,7 @@ impl GeminiClient {
                 "responseMimeType":"application/json",
                 "responseJsonSchema":schema,
                 "thinkingConfig":thinking_config,
-                "maxOutputTokens":8192
+                "maxOutputTokens":max_output_tokens
             }
         });
         let result = async {
@@ -620,7 +627,11 @@ fn parse_structured<T: DeserializeOwned>(
         .ok_or_else(|| anyhow!("Gemini response contained no finish reason"))?;
     anyhow::ensure!(
         finish_reason == "STOP",
-        "Gemini response did not finish normally: {finish_reason}"
+        if finish_reason == "MAX_TOKENS" {
+            "Gemini hit its output limit before finishing this document"
+        } else {
+            "Gemini response did not finish normally"
+        }
     );
     let text = raw
         .pointer("/candidates/0/content/parts/0/text")
