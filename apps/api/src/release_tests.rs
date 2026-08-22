@@ -3006,3 +3006,91 @@ async fn inventory_import_worker_processes_enqueued_files() {
 fn other_token(fixture: &ApiFixture) -> String {
     fixture.token("owner-b")
 }
+
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn weekly_brief_saves_snapshots_and_replays_past_weeks() {
+    use chrono::{Datelike, Utc};
+
+    let fixture = ApiFixture::create("weekly_brief_snapshot").await;
+    let owner = fixture.token("owner-a");
+    let manager = fixture.token("manager-a");
+
+    // Viewing the current week saves a snapshot.
+    let live = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/weekly-brief",
+        None,
+    )
+    .await;
+    assert_eq!(live.status, StatusCode::OK);
+    assert_eq!(live.body["isLivePreview"], true);
+    let week_start = live.body["weekStart"].as_str().unwrap().to_owned();
+
+    let saved: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM weekly_brief_snapshots WHERE week_start=$1")
+            .bind(chrono::NaiveDate::parse_from_str(&week_start, "%Y-%m-%d").unwrap())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(saved, 1);
+
+    // The saved snapshot replays as history.
+    let uri = format!("/v1/weekly-brief?week={week_start}");
+    let past = request(fixture.app.clone(), Some(&owner), Method::GET, &uri, None).await;
+    assert_eq!(past.status, StatusCode::OK);
+    assert_eq!(past.body["isLivePreview"], false);
+    assert_eq!(past.body["weekStart"], week_start.as_str());
+    assert!(
+        past.body["caveats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|caveat| caveat.as_str().unwrap().contains("saved snapshot"))
+    );
+
+    // Weeks without a snapshot 404, managers stay locked out, and the query
+    // is validated.
+    let empty_week = format!(
+        "/v1/weekly-brief?week={}",
+        (Utc::now().date_naive()
+            - chrono::Duration::days(
+                21 + i64::from(Utc::now().date_naive().weekday().num_days_from_monday(),)
+            ))
+        .format("%Y-%m-%d")
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::GET,
+            &empty_week,
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(fixture.app.clone(), Some(&manager), Method::GET, &uri, None,)
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::GET,
+            "/v1/weekly-brief?week=not-a-date",
+            None,
+        )
+        .await
+        .status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    fixture.drop().await;
+}

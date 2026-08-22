@@ -709,15 +709,21 @@ const AUTO_SYNC_INTERVAL_MINUTES: i64 = 30;
 /// How often the worker looks for connections whose auto-sync is due.
 const AUTO_SYNC_TICK_SECS: u64 = 60;
 
-pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>) {
+pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>, runs_scheduler: bool) {
     let Some(config) = config else {
         tracing::info!("Square sync worker idle (not configured)");
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     };
-    let mut last_tick =
-        tokio::time::Instant::now() - std::time::Duration::from_secs(AUTO_SYNC_TICK_SECS);
+    // One tenant's large first sync must not head-of-line block everyone
+    // else, so main() spawns several workers. claim_job already refuses a
+    // second concurrent run per connection, making this safe.
+    let mut last_tick = if runs_scheduler {
+        tokio::time::Instant::now() - std::time::Duration::from_secs(AUTO_SYNC_TICK_SECS)
+    } else {
+        tokio::time::Instant::now()
+    };
     loop {
         if last_tick.elapsed().as_secs() >= AUTO_SYNC_TICK_SECS {
             last_tick = tokio::time::Instant::now();

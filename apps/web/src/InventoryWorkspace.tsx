@@ -139,6 +139,8 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
   const [areaName, setAreaName] = useState("");
   const [editingArea, setEditingArea] = useState<StorageArea | null>(null);
   const [history, setHistory] = useState<CountSummary[]>([]);
+  const [historyCursor, setHistoryCursor] = useState<{ completedAt: string; id: string } | null>(null);
+  const [loadingHistoryMore, setLoadingHistoryMore] = useState(false);
   const [historyDetail, setHistoryDetail] = useState<InventoryCount | null>(null);
   const [completedForChanges, setCompletedForChanges] = useState<InventoryCount | null>(null);
 
@@ -677,13 +679,32 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
     setBusy(true);
     clearFeedback();
     try {
-      const rows = await request<CountSummary[]>("/v1/inventory-counts?limit=50");
+      const rows = await request<CountSummary[]>("/v1/inventory-counts");
       setHistory(rows);
+      const last = rows[rows.length - 1];
+      setHistoryCursor(rows.length >= 50 && last?.completedAt ? { completedAt: last.completedAt, id: last.id } : null);
       setMode("history");
     } catch (reason) {
       showError(reason instanceof Error ? reason.message : "Past counts couldn't load.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function loadMoreHistory() {
+    if (!historyCursor) return;
+    setLoadingHistoryMore(true);
+    setError("");
+    try {
+      const query = `beforeCompletedAt=${encodeURIComponent(historyCursor.completedAt)}&beforeId=${historyCursor.id}`;
+      const rows = await request<CountSummary[]>(`/v1/inventory-counts?${query}`);
+      setHistory((current) => [...current, ...rows]);
+      const last = rows[rows.length - 1];
+      setHistoryCursor(rows.length >= 50 && last?.completedAt ? { completedAt: last.completedAt, id: last.id } : null);
+    } catch (reason) {
+      showError(reason instanceof Error ? reason.message : "Older counts couldn't load.");
+    } finally {
+      setLoadingHistoryMore(false);
     }
   }
 
@@ -873,8 +894,15 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
           <p className="empty-state">No completed counts yet. Finish a count to build history.</p>
         ) : (
           <>
-            {history.length >= 50 && (
-              <p className="empty-state">Showing the latest 50 completed counts.</p>
+            {historyCursor && (
+              <button
+                className="file-button"
+                type="button"
+                disabled={loadingHistoryMore || busy}
+                onClick={() => void loadMoreHistory()}
+              >
+                {loadingHistoryMore ? "Loading older counts…" : "Load older counts"}
+              </button>
             )}
             <div className="count-history-list">
             {history.map((row) => (

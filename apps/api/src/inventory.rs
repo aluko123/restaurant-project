@@ -197,9 +197,13 @@ pub(crate) struct CompleteInput {
 pub(crate) struct HistoryQuery {
     #[serde(default = "default_history_limit")]
     limit: i64,
+    #[serde(default)]
+    before_completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    before_id: Option<Uuid>,
 }
 fn default_history_limit() -> i64 {
-    20
+    50
 }
 
 pub(crate) async fn list_areas(
@@ -538,11 +542,16 @@ pub(crate) async fn list_counts(
                   WHERE sa.session_id=s.id) area_names
          FROM inventory_count_sessions s
          WHERE s.restaurant_id=$1 AND s.status='completed'
+           AND ($3::timestamptz IS NULL
+                OR s.completed_at < $3::timestamptz
+                OR (s.completed_at = $3::timestamptz AND s.id < $4))
          ORDER BY s.completed_at DESC,s.id DESC
          LIMIT $2",
     )
     .bind(m.restaurant_id)
     .bind(limit)
+    .bind(query.before_completed_at)
+    .bind(query.before_id)
     .fetch_all(&state.pool)
     .await
     .map_err(database_error)?;

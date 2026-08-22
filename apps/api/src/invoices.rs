@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
 use bigdecimal::BigDecimal;
@@ -219,9 +219,19 @@ async fn find_by_content_hash(
     })
 }
 
+#[derive(Deserialize)]
+pub(crate) struct ListQuery {
+    /// Keyset cursor: only rows strictly older than this pair are returned.
+    #[serde(default)]
+    before_created_at: Option<chrono::DateTime<Utc>>,
+    #[serde(default)]
+    before_id: Option<Uuid>,
+}
+
 pub(crate) async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<Invoice>>, ApiError> {
     let membership = membership(&state, &headers).await?;
     let invoices = sqlx::query_as::<_, Invoice>(
@@ -241,9 +251,14 @@ pub(crate) async fn list(
                 invoice.created_at
           FROM invoices invoice
           WHERE invoice.restaurant_id=$1
+            AND ($2::timestamptz IS NULL
+                 OR invoice.created_at < $2::timestamptz
+                 OR (invoice.created_at = $2::timestamptz AND invoice.id < $3))
           ORDER BY invoice.created_at DESC,invoice.id DESC LIMIT 100",
     )
     .bind(membership.restaurant_id)
+    .bind(query.before_created_at)
+    .bind(query.before_id)
     .fetch_all(&state.pool)
     .await
     .map_err(|error| {

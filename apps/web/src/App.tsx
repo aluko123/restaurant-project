@@ -716,17 +716,37 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
   const [approvedPriceChanges, setApprovedPriceChanges] = useState<PriceChange[] | null>(null);
   const [retryingId, setRetryingId] = useState("");
   const [deletingId, setDeletingId] = useState("");
+  const [invoiceCursor, setInvoiceCursor] = useState<{ createdAt: string; id: string } | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [invoiceSearch, setInvoiceSearch] = useState("");
   const [invoiceStatus, setInvoiceStatus] = useState<"action" | "processing" | "approved" | "all">("action");
   const [invoicePeriod, setInvoicePeriod] = useState<"30" | "90" | "year" | "all">("90");
 
   const loadInvoices = useCallback(() => {
-    setLoading(true); setListError("");
+    setLoading(true); setListError(""); setInvoiceCursor(null);
     void request<Invoice[]>("/v1/invoices")
-      .then(setInvoices)
+      .then((rows) => {
+        setInvoices(rows);
+        const last = rows[rows.length - 1];
+        setInvoiceCursor(rows.length === 100 && last ? { createdAt: last.createdAt, id: last.id } : null);
+      })
       .catch((error: unknown) => setListError(error instanceof Error ? error.message : "Invoices couldn't load. Please try again."))
       .finally(() => setLoading(false));
   }, [request]);
+  const loadMoreInvoices = useCallback(async () => {
+    if (!invoiceCursor) return;
+    setLoadingMore(true); setListError("");
+    try {
+      const rows = await request<Invoice[]>(`/v1/invoices?beforeCreatedAt=${encodeURIComponent(invoiceCursor.createdAt)}&beforeId=${invoiceCursor.id}`);
+      setInvoices((current) => [...current, ...rows]);
+      const last = rows[rows.length - 1];
+      setInvoiceCursor(rows.length === 100 && last ? { createdAt: last.createdAt, id: last.id } : null);
+    } catch (error: unknown) {
+      setListError(error instanceof Error ? error.message : "Older invoices couldn't load. Please try again.");
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [invoiceCursor, request]);
   useEffect(() => { if (active) loadInvoices(); }, [active, loadInvoices]);
   useEffect(() => {
     if (!active || !invoices.some((invoice) => invoice.status === "processing")) return;
@@ -826,7 +846,11 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
         <button className="ledger-button" type="submit" disabled={uploading}>{uploading ? "Uploading invoice…" : "Upload invoice"}<span aria-hidden="true">→</span></button>
       </form>
       <div className="invoice-list"><div className="list-heading"><h2>Recent invoices</h2>{!loading && <button className="text-button" type="button" onClick={loadInvoices}>Refresh</button>}</div>
-        {!loading && invoices.length >= 100 && <p className="empty-state">Showing the latest 100 invoices.</p>}
+        {!loading && invoices.length > 0 && invoiceCursor && (
+          <button className="file-button" type="button" disabled={loadingMore} onClick={() => void loadMoreInvoices()}>
+            {loadingMore ? "Loading older invoices…" : "Load older invoices"}
+          </button>
+        )}
         {listError && <p className="form-error" role="alert">{listError}</p>}
         {!loading&&invoices.length>0&&<div className="collection-toolbar invoice-toolbar" aria-label="Filter invoices"><label className="collection-search">Search all invoices<input type="search" placeholder="Supplier or filename" value={invoiceSearch} onChange={event=>{const value=event.target.value;if(!invoiceSearch.trim()&&value.trim()){setInvoiceStatus("all");setInvoicePeriod("all")}setInvoiceSearch(value)}}/></label><label>Status<select value={invoiceStatus} onChange={event=>setInvoiceStatus(event.target.value as typeof invoiceStatus)}><option value="action">Needs action</option><option value="processing">Processing</option><option value="approved">Approved</option><option value="all">All statuses</option></select></label><label>Period<select value={invoicePeriod} onChange={event=>setInvoicePeriod(event.target.value as typeof invoicePeriod)}><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="year">This year</option><option value="all">All history</option></select></label><div className="collection-toolbar-summary"><strong>{filteredInvoices.length} {filteredInvoices.length===1?"invoice":"invoices"}</strong>{invoiceFiltersActive&&<button className="text-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("action");setInvoicePeriod("90")}}>Clear filters</button>}</div></div>}
         {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload one to capture its purchases, compare supplier prices, and create supported Today actions.</p> : filteredInvoices.length===0 ? <div className="filtered-empty"><h3>{invoiceStatus === "action" && !invoiceSearch.trim() ? "No invoices need action" : "No invoices match"}</h3><p>{invoiceStatus === "action" && !invoiceSearch.trim() ? "You're caught up for this period. Approved invoices remain available in history." : "Try a different status, period, or search."}</p><button className="file-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("all");setInvoicePeriod("all")}}>Show all invoices</button></div> : <div className="invoice-results">

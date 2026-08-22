@@ -2,19 +2,21 @@ use std::collections::HashMap;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
 };
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Datelike, Days, Duration, LocalResult, NaiveDate, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{ApiError, AppState, authenticated_subject};
 
 const WEEK_DAYS: u32 = 7;
 const MAX_GROUPS: usize = 5;
+const MAX_SNAPSHOT_AGE_DAYS: i64 = 370;
 
 #[derive(sqlx::FromRow)]
 struct Membership {
@@ -176,10 +178,18 @@ struct WasteAccumulator {
     last_logged_at: DateTime<Utc>,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct BriefQuery {
+    /// Week start (YYYY-MM-DD, restaurant-local). Absent = current live week.
+    #[serde(default)]
+    week: Option<String>,
+}
+
 pub(crate) async fn get(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<WeeklyBriefResponse>, ApiError> {
+    Query(query): Query<BriefQuery>,
+) -> Result<Json<Value>, ApiError> {
     let subject = authenticated_subject(&state, &headers).await?;
     let member = sqlx::query_as::<_, Membership>(
         "SELECT membership.restaurant_id,membership.role,restaurant.timezone
@@ -200,6 +210,10 @@ pub(crate) async fn get(
     // The brief combines sales and purchase financial facts. Reject other roles before any of
     // those queries execute, rather than relying on the web navigation to hide the workspace.
     require_owner(&member.role)?;
+
+    if let Some(week) = query.week.as_deref() {
+        return serve_snapshot(&state, member.restaurant_id, week).await;
+    }
 
     let generated_at = Utc::now();
     let timezone = member.timezone.parse::<Tz>().unwrap_or_else(|_| {
@@ -314,7 +328,7 @@ pub(crate) async fn get(
     let losses = aggregate_losses(loss_rows);
     tx.commit().await.map_err(weekly_brief_database_error)?;
 
-    Ok(Json(WeeklyBriefResponse {
+    let response = WeeklyBriefResponse {
         timezone: timezone.name().to_owned(),
         week_start: window.local_start,
         week_end: window.local_end,
@@ -357,7 +371,76 @@ pub(crate) async fn get(
             ],
             ..losses
         },
-    }))
+    };
+
+    // Persist what was computed so the week survives rollover as history.
+    let payload = serde_json::to_value(&response).map_err(|error| {
+        tracing::error!(%error, "weekly brief serialization failed");
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The weekly brief couldn't be built. Please try again.",
+        )
+    })?;
+    if let Err(error) = sqlx::query(
+        "INSERT INTO weekly_brief_snapshots(restaurant_id,week_start,payload)
+         VALUES($1,$2,$3)
+         ON CONFLICT (restaurant_id,week_start) DO UPDATE SET payload=$3,updated_at=NOW()",
+    )
+    .bind(member.restaurant_id)
+    .bind(window.local_start)
+    .bind(&payload)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(%error, "weekly brief snapshot save failed; serving live value");
+    }
+
+    Ok(Json(payload))
+}
+
+/// Serves a saved snapshot for a past week. Payloads are stored camelCase;
+/// the live-preview flag flips off and provenance caveats are added here.
+async fn serve_snapshot(
+    state: &AppState,
+    restaurant_id: Uuid,
+    week: &str,
+) -> Result<Json<Value>, ApiError> {
+    let week_start = NaiveDate::parse_from_str(week, "%Y-%m-%d")
+        .ok()
+        .filter(|date| date.format("%Y-%m-%d").to_string() == week)
+        .ok_or(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Week must use YYYY-MM-DD.",
+        ))?;
+    let today = Utc::now().date_naive();
+    let oldest = today
+        .checked_sub_signed(Duration::days(MAX_SNAPSHOT_AGE_DAYS))
+        .unwrap_or(week_start);
+    if week_start > today || week_start < oldest {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Week must be within the past year and not in the future.",
+        ));
+    }
+    let payload: Option<Value> = sqlx::query_scalar(
+        "SELECT payload FROM weekly_brief_snapshots WHERE restaurant_id=$1 AND week_start=$2",
+    )
+    .bind(restaurant_id)
+    .bind(week_start)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(crate::database_error)?;
+    let mut payload = payload.ok_or(ApiError(
+        StatusCode::NOT_FOUND,
+        "No weekly brief was saved for that week. Briefs are saved whenever the current week is viewed.",
+    ))?;
+    payload["isLivePreview"] = json!(false);
+    let generated = payload["generatedAt"].clone();
+    payload["caveats"] = json!([format!(
+        "This is the saved snapshot generated {} for that week. It does not include later corrections.",
+        generated.as_str().unwrap_or("previously")
+    )]);
+    Ok(Json(payload))
 }
 
 fn require_owner(role: &str) -> Result<(), ApiError> {
