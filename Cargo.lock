@@ -2333,6 +2333,7 @@ dependencies = [
  "hex",
  "httpdate",
  "jsonwebtoken",
+ "num-bigint",
  "rand 0.8.7",
  "reqwest",
  "rsa",

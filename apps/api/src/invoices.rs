@@ -7,6 +7,7 @@ use bigdecimal::BigDecimal;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
+use num_bigint::Sign;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
@@ -882,9 +883,9 @@ fn validate_review(mut i: ReviewInput, today: NaiveDate) -> Result<ReviewInput, 
                 "Check each line's description, SKU, and unit.",
             ));
         }
-        parse_decimal(&line.quantity, 6)?;
-        parse_decimal(&line.unit_price, 4)?;
-        parse_decimal(&line.line_total, 4)?;
+        parse_nonnegative_decimal(&line.quantity, 6)?;
+        parse_nonnegative_decimal(&line.unit_price, 4)?;
+        parse_nonnegative_decimal(&line.line_total, 4)?;
     }
     i.invoice_number = trim_optional(i.invoice_number.take());
     if i.invoice_number
@@ -897,7 +898,7 @@ fn validate_review(mut i: ReviewInput, today: NaiveDate) -> Result<ReviewInput, 
         ));
     }
     for value in [&i.subtotal, &i.tax, &i.fees, &i.discount, &i.total] {
-        parse_decimal(value, 4)?;
+        parse_nonnegative_decimal(value, 4)?;
     }
     if let Some(date) = &i.invoice_date {
         validate_date(date, today)?;
@@ -918,6 +919,22 @@ fn parse_decimal(v: &Option<String>, scale: i64) -> Result<Option<BigDecimal>, A
         )
     })?;
     Ok(Some(n))
+}
+
+fn parse_nonnegative_decimal(
+    v: &Option<String>,
+    scale: i64,
+) -> Result<Option<BigDecimal>, ApiError> {
+    let n = parse_decimal(v, scale)?;
+    if n.as_ref()
+        .is_some_and(|amount| amount.sign() == Sign::Minus)
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Amounts can't be negative. Remove the minus sign or correct the value.",
+        ));
+    }
+    Ok(n)
 }
 
 pub(crate) fn strict_decimal(value: &str, scale: usize) -> Result<BigDecimal, &'static str> {

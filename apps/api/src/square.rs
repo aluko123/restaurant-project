@@ -242,9 +242,6 @@ pub(crate) async fn list(
     for row in &mut rows {
         row.configured = configured;
     }
-    if rows.is_empty() && configured {
-        // Synthetic “available to connect” is handled by the UI via configured flag on empty list.
-    }
     Ok(Json(rows))
 }
 

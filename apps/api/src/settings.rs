@@ -21,12 +21,14 @@ struct SettingsContext {
     service_style: String,
     timezone: String,
     role: String,
+    updated_at: DateTime<Utc>,
     user_id: Uuid,
 }
 
 #[derive(sqlx::FromRow)]
 struct Actor {
     restaurant_id: Uuid,
+    restaurant_updated_at: DateTime<Utc>,
     user_id: Uuid,
     role: String,
 }
@@ -48,6 +50,7 @@ struct RestaurantSettings {
     service_style: String,
     timezone: String,
     role: String,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -109,6 +112,9 @@ pub(crate) struct UpdateRestaurant {
     country: Option<String>,
     service_style: String,
     timezone: String,
+    /// Optimistic-concurrency token; absent or null skips the check.
+    #[serde(default)]
+    expected_updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -136,9 +142,22 @@ pub(crate) async fn update(
     let actor = lock_actor(&mut transaction, &subject).await?;
     require_owner(&actor)?;
 
+    if input
+        .expected_updated_at
+        .is_some_and(|expected| expected != actor.restaurant_updated_at)
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Settings changed while you were editing. Reload and try again.",
+        ));
+    }
+
     sqlx::query(
         "UPDATE restaurants
-         SET name=$1,city=$2,region=COALESCE($3,region),country=COALESCE($4,country),service_style=$5,timezone=$6,updated_at=NOW()
+         SET name=$1,city=$2,
+             region=CASE WHEN $3::text IS NULL THEN region ELSE NULLIF(BTRIM($3),'') END,
+             country=CASE WHEN $4::text IS NULL THEN country ELSE NULLIF(BTRIM($4),'') END,
+             service_style=$5,timezone=$6,updated_at=NOW()
          WHERE id=$7",
     )
     .bind(&input.name)
@@ -478,7 +497,7 @@ async fn invitation_target(
 
 async fn load_settings(state: &AppState, subject: &str) -> Result<SettingsResponse, ApiError> {
     let context = sqlx::query_as::<_, SettingsContext>(
-        "SELECT r.id,r.name,r.city,r.region,r.country,r.service_style,r.timezone,m.role,u.id AS user_id
+        "SELECT r.id,r.name,r.city,r.region,r.country,r.service_style,r.timezone,m.role,r.updated_at,u.id AS user_id
          FROM users u
          JOIN restaurant_memberships m ON m.user_id=u.id
          JOIN restaurants r ON r.id=m.restaurant_id
@@ -526,6 +545,7 @@ async fn load_settings(state: &AppState, subject: &str) -> Result<SettingsRespon
             city: context.city,
             region: context.region,
             country: context.country,
+            updated_at: context.updated_at,
             service_style: context.service_style,
             timezone: context.timezone,
             role: context.role,
@@ -540,8 +560,8 @@ async fn lock_actor(
     transaction: &mut Transaction<'_, Postgres>,
     subject: &str,
 ) -> Result<Actor, ApiError> {
-    let restaurant_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT r.id FROM users u
+    let (restaurant_id, restaurant_updated_at) = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
+        "SELECT r.id,r.updated_at FROM users u
          JOIN restaurant_memberships m ON m.user_id=u.id
          JOIN restaurants r ON r.id=m.restaurant_id
          WHERE u.auth_subject=$1 FOR UPDATE OF r",
@@ -556,12 +576,13 @@ async fn lock_actor(
     ))?;
 
     sqlx::query_as::<_, Actor>(
-        "SELECT m.restaurant_id,u.id AS user_id,m.role FROM users u
+        "SELECT m.restaurant_id,$3 AS restaurant_updated_at,u.id AS user_id,m.role FROM users u
          JOIN restaurant_memberships m ON m.user_id=u.id
          WHERE u.auth_subject=$1 AND m.restaurant_id=$2",
     )
     .bind(subject)
     .bind(restaurant_id)
+    .bind(restaurant_updated_at)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(database_error)?
@@ -713,14 +734,9 @@ impl UpdateRestaurant {
     fn validated(mut self) -> Result<Self, ApiError> {
         self.name = self.name.trim().to_owned();
         self.city = self.city.trim().to_owned();
-        self.region = self
-            .region
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
-        self.country = self
-            .country
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
+        // Empty strings clear the field; null leaves it unchanged.
+        self.region = self.region.map(|value| value.trim().to_owned());
+        self.country = self.country.map(|value| value.trim().to_owned());
         self.service_style = self.service_style.trim().to_owned();
         self.timezone = self.timezone.trim().to_owned();
         if self.name.is_empty() || self.name.chars().count() > 50 {
@@ -817,12 +833,14 @@ mod tests {
             country: Some(" United States ".into()),
             service_style: "fast_casual".into(),
             timezone: timezone.into(),
+            expected_updated_at: None,
         }
     }
 
     fn actor(id: Uuid, role: &str) -> Actor {
         Actor {
             restaurant_id: Uuid::nil(),
+            restaurant_updated_at: Utc::now(),
             user_id: id,
             role: role.into(),
         }

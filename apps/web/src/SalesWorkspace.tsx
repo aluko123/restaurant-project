@@ -1002,31 +1002,38 @@ function RecentSales({
       ) : recent.length === 0 ? (
         <p className="empty-state">No sales days yet. Record the first complete business day above.</p>
       ) : (
-        <div className="recent-sales-list">
-          {recent.map((summary) => (
-            <article key={summary.businessDate}>
-              <div>
-                <p className="invoice-status">
-                  {summary.lineCount} {summary.lineCount === 1 ? "item" : "items"} · revision {summary.revision}
-                </p>
-                <h3>{formatBusinessDate(summary.businessDate)}</h3>
-                <p>
-                  {trimDecimal(summary.totalQuantity)} total quantity · {summary.reportedLineCount} with
-                  reported sales
-                </p>
-              </div>
-              <button
-                className="file-button"
-                type="button"
-                aria-current={summary.businessDate === currentDate ? "true" : undefined}
-                disabled={disabled}
-                onClick={() => onOpen(summary.businessDate)}
-              >
-                {summary.businessDate === currentDate ? "Reload day" : "Open day"}
-              </button>
-            </article>
-          ))}
-        </div>
+        <>
+          <div className="recent-sales-list">
+            {recent.map((summary) => (
+              <article key={summary.businessDate}>
+                <div>
+                  <p className="invoice-status">
+                    {summary.lineCount} {summary.lineCount === 1 ? "item" : "items"} · revision {summary.revision}
+                  </p>
+                  <h3>{formatBusinessDate(summary.businessDate)}</h3>
+                  <p>
+                    {trimDecimal(summary.totalQuantity)} total quantity · {summary.reportedLineCount} with
+                    reported sales
+                  </p>
+                </div>
+                <button
+                  className="file-button"
+                  type="button"
+                  aria-current={summary.businessDate === currentDate ? "true" : undefined}
+                  disabled={disabled}
+                  onClick={() => onOpen(summary.businessDate)}
+                >
+                  {summary.businessDate === currentDate ? "Reload day" : "Open day"}
+                </button>
+              </article>
+            ))}
+          </div>
+          {recent.length >= 30 && (
+            <p className="empty-state">
+              Showing the latest 30 saved days. Open an older day by picking its date above.
+            </p>
+          )}
+        </>
       )}
     </section>
   );

@@ -346,7 +346,10 @@ function formatTimestamp(value: string, timezone: string) {
 }
 
 function formatDecimal(value: string) {
-  return value;
+  const [whole, fraction] = value.split(".");
+  if (fraction === undefined) return value;
+  const trimmed = fraction.replace(/0+$/, "");
+  return trimmed ? `${whole}.${trimmed}` : whole;
 }
 
 function reasonLabel(value: string) {

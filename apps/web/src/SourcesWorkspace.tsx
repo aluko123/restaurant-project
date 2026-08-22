@@ -125,6 +125,7 @@ export function SourcesWorkspace({
   const [squareConnection, setSquareConnection] = useState<SquareConnection | null>(null);
   const [squareSyncPending, setSquareSyncPending] = useState(false);
   const priorSquareStatus = useRef<string | null>(null);
+  const toolsDirtyRef = useRef(false);
 
   const load = useCallback((opts?: { quiet?: boolean }) => {
     if (!opts?.quiet) {
@@ -142,8 +143,10 @@ export function SourcesWorkspace({
       .then(([next, plan, status, connections]) => {
         setSetup(next);
         setSetupPlan(plan);
-        setPosSystem(next.posSystem ?? "");
-        setAccountingSystem(next.accountingSystem ?? "");
+        if (!toolsDirtyRef.current) {
+          setPosSystem(next.posSystem ?? "");
+          setAccountingSystem(next.accountingSystem ?? "");
+        }
         setSquareConfigured(status.configured);
         const square = connections.find((c) => c.provider === "square") ?? null;
         setSquareConnection(square);
@@ -251,12 +254,13 @@ export function SourcesWorkspace({
       await request<MigrationSetup>("/v1/migration-setup", {
         method: "PUT",
         body: JSON.stringify({
-          posSystem: "Square",
+          posSystem: posSystem.trim() || "Square",
           accountingSystem: accountingSystem.trim() || null,
           setupApproach: setup.setupApproach,
           markComplete: false,
         }),
       });
+      toolsDirtyRef.current = false;
       const { url } = await request<{ url: string }>("/v1/connections/square/authorize");
       window.location.href = url;
     } catch (cause) {
@@ -296,7 +300,7 @@ export function SourcesWorkspace({
       await request("/v1/connections/square/disconnect", { method: "POST", body: "{}" });
       setNotice("Square disconnected.");
       setSquareConnection(null);
-      load();
+      void load();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Square couldn't be disconnected.");
     } finally {
@@ -322,6 +326,7 @@ export function SourcesWorkspace({
       });
       setSetup(next);
       setSetupPlan(await request<SetupPlan>("/v1/setup"));
+      toolsDirtyRef.current = false;
       setNotice("Saved your menu and sales source.");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "That source couldn't be saved.");
@@ -533,7 +538,10 @@ export function SourcesWorkspace({
                 POS <span>Optional</span>
                 <select
                   value={posSystem}
-                  onChange={(e) => setPosSystem(e.target.value)}
+                  onChange={(e) => {
+                    toolsDirtyRef.current = true;
+                    setPosSystem(e.target.value);
+                  }}
                 >
                   <option value="">Not set</option>
                   {posOptions.map((option) => (
