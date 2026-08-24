@@ -129,7 +129,7 @@ fn token_key_from_env() -> Result<[u8; 32], ()> {
     Ok(key)
 }
 
-fn encrypt_secret(key: &[u8; 32], plain: &str) -> Result<String, ApiError> {
+pub(crate) fn encrypt_secret(key: &[u8; 32], plain: &str) -> Result<String, ApiError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| encrypt_error())?;
     let mut nonce_bytes = [0u8; 12];
     getrandom::getrandom(&mut nonce_bytes).map_err(|_| encrypt_error())?;
@@ -171,10 +171,10 @@ fn http_client() -> reqwest::Client {
 }
 
 #[derive(sqlx::FromRow)]
-struct Member {
-    restaurant_id: Uuid,
-    user_id: Uuid,
-    role: String,
+pub(crate) struct Member {
+    pub(crate) restaurant_id: Uuid,
+    pub(crate) user_id: Uuid,
+    pub(crate) role: String,
     #[allow(dead_code)]
     timezone: String,
 }
@@ -214,7 +214,7 @@ pub(crate) struct CallbackQuery {
     error_description: Option<String>,
 }
 
-async fn member(state: &AppState, headers: &HeaderMap) -> Result<Member, ApiError> {
+pub(crate) async fn member(state: &AppState, headers: &HeaderMap) -> Result<Member, ApiError> {
     let subject = authenticated_subject(state, headers).await?;
     sqlx::query_as(
         "SELECT m.restaurant_id,u.id user_id,m.role,r.timezone
@@ -233,7 +233,7 @@ async fn member(state: &AppState, headers: &HeaderMap) -> Result<Member, ApiErro
     ))
 }
 
-fn manager(m: &Member) -> Result<(), ApiError> {
+pub(crate) fn manager(m: &Member) -> Result<(), ApiError> {
     if matches!(m.role.as_str(), "owner" | "manager") {
         Ok(())
     } else {
@@ -329,7 +329,7 @@ pub(crate) async fn authorize(
     }))
 }
 
-fn urlencoding_encode(value: &str) -> String {
+pub(crate) fn urlencoding_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len() * 3);
     for byte in value.bytes() {
         match byte {

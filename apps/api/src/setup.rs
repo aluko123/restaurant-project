@@ -187,9 +187,11 @@ pub(crate) async fn put_stream(
     let mut tx = state.pool.begin().await.map_err(database_error)?;
     lock_restaurant(&mut tx, actor.restaurant_id).await?;
     if matches!(stream.as_str(), "menu" | "sales")
-        && square_selected(&mut tx, actor.restaurant_id).await?
+        && let Some(provider) = active_connector(&mut tx, actor.restaurant_id).await?
+        && !(input.method == "connector"
+            && input.connector_provider.as_deref() == Some(provider.as_str()))
     {
-        return Err(ApiError(StatusCode::CONFLICT, "Deselect Square first."));
+        return Err(deselect_conflict(&provider));
     }
     sqlx::query(
         "INSERT INTO restaurant_setup_streams
@@ -224,9 +226,9 @@ pub(crate) async fn delete_stream(
     let mut tx = state.pool.begin().await.map_err(database_error)?;
     lock_restaurant(&mut tx, actor.restaurant_id).await?;
     if matches!(stream.as_str(), "menu" | "sales")
-        && square_selected(&mut tx, actor.restaurant_id).await?
+        && let Some(provider) = active_connector(&mut tx, actor.restaurant_id).await?
     {
-        return Err(ApiError(StatusCode::CONFLICT, "Deselect Square first."));
+        return Err(deselect_conflict(&provider));
     }
     sqlx::query("DELETE FROM restaurant_setup_streams WHERE restaurant_id=$1 AND stream=$2")
         .bind(actor.restaurant_id)
@@ -238,40 +240,93 @@ pub(crate) async fn delete_stream(
     Ok(Json(load(&state, actor.restaurant_id).await?))
 }
 
-pub(crate) async fn put_square(
+pub(crate) async fn put_connector(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Path(provider): Path<String>,
     Json(input): Json<SelectSquare>,
 ) -> Result<Json<SetupResponse>, ApiError> {
+    if !CONNECTOR_PROVIDERS.contains(&provider.as_str()) {
+        return Err(ApiError(StatusCode::NOT_FOUND, "Unknown connector."));
+    }
     let actor = actor(&state, &headers).await?;
     manager(&actor)?;
     let mut tx = state.pool.begin().await.map_err(database_error)?;
     lock_restaurant(&mut tx, actor.restaurant_id).await?;
     if input.selected {
-        select_square(&mut tx, actor.restaurant_id, actor.user_id).await?;
+        select_connector(&mut tx, actor.restaurant_id, actor.user_id, &provider).await?;
     } else {
-        deselect_square(&mut tx, actor.restaurant_id).await?;
+        deselect_connector(&mut tx, actor.restaurant_id, &provider).await?;
     }
     tx.commit().await.map_err(database_error)?;
     Ok(Json(load(&state, actor.restaurant_id).await?))
 }
 
-pub(crate) async fn select_square(
+/// Providers that can own the menu+sales streams. Grows as connectors land.
+pub(crate) const CONNECTOR_PROVIDERS: [&str; 2] = ["square", "clover"];
+
+fn provider_label(provider: &str) -> &'static str {
+    match provider {
+        "clover" => "Clover",
+        "square" => "Square",
+        _ => "the connector",
+    }
+}
+
+fn deselect_conflict(provider: &str) -> ApiError {
+    ApiError(
+        StatusCode::CONFLICT,
+        match provider_label(provider) {
+            "Clover" => "Deselect Clover first.",
+            "Square" => "Deselect Square first.",
+            _ => "Deselect the current connector first.",
+        },
+    )
+}
+
+/// The provider that currently owns both menu+sales streams, if any.
+async fn active_connector(
+    tx: &mut Transaction<'_, Postgres>,
+    restaurant_id: Uuid,
+) -> Result<Option<String>, ApiError> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT MIN(connector_provider) FROM restaurant_setup_streams
+         WHERE restaurant_id=$1 AND stream IN ('menu','sales') AND method='connector'",
+    )
+    .bind(restaurant_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(database_error)
+}
+
+pub(crate) async fn select_connector(
     tx: &mut Transaction<'_, Postgres>,
     restaurant_id: Uuid,
     user_id: Uuid,
+    provider: &str,
 ) -> Result<(), ApiError> {
+    sqlx::query(
+        "DELETE FROM restaurant_setup_streams
+         WHERE restaurant_id=$1 AND stream IN ('menu','sales')
+           AND method='connector' AND connector_provider<>$2",
+    )
+    .bind(restaurant_id)
+    .bind(provider)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_error)?;
     for stream in ["menu", "sales"] {
         sqlx::query(
             "INSERT INTO restaurant_setup_streams
              (restaurant_id,stream,method,owner,connector_provider,created_by,updated_by)
-             VALUES($1,$2,'connector','restaurant','square',$3,$3)
+             VALUES($1,$2,'connector','restaurant',$3,$4,$4)
              ON CONFLICT (restaurant_id,stream) DO UPDATE SET
-               method='connector',owner='restaurant',connector_provider='square',
+               method='connector',owner='restaurant',connector_provider=EXCLUDED.connector_provider,
                updated_by=EXCLUDED.updated_by,updated_at=NOW()",
         )
         .bind(restaurant_id)
         .bind(stream)
+        .bind(provider)
         .bind(user_id)
         .execute(&mut **tx)
         .await
@@ -288,11 +343,15 @@ pub(crate) async fn sync_legacy_sources(
     setup_approach: Option<&str>,
 ) -> Result<(), ApiError> {
     lock_restaurant(tx, restaurant_id).await?;
-    if pos_system == Some("Square") {
-        return select_square(tx, restaurant_id, user_id).await;
+    match pos_system {
+        Some("Square") => return select_connector(tx, restaurant_id, user_id, "square").await,
+        Some("Clover") => return select_connector(tx, restaurant_id, user_id, "clover").await,
+        _ => {}
     }
 
-    deselect_square(tx, restaurant_id).await?;
+    for provider in CONNECTOR_PROVIDERS {
+        deselect_connector(tx, restaurant_id, provider).await?;
+    }
     let Some(_) = pos_system else {
         sqlx::query(
             "DELETE FROM restaurant_setup_streams
@@ -339,52 +398,40 @@ pub(crate) async fn sync_legacy_sources(
     Ok(())
 }
 
-async fn deselect_square(
+async fn deselect_connector(
     tx: &mut Transaction<'_, Postgres>,
     restaurant_id: Uuid,
+    provider: &str,
 ) -> Result<(), ApiError> {
     let running = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM source_sync_runs run
          JOIN source_connections connection
            ON connection.id=run.connection_id AND connection.restaurant_id=run.restaurant_id
-         WHERE connection.restaurant_id=$1 AND connection.provider='square'
+         WHERE connection.restaurant_id=$1 AND connection.provider=$2
            AND run.status='running')",
     )
     .bind(restaurant_id)
+    .bind(provider)
     .fetch_one(&mut **tx)
     .await
     .map_err(database_error)?;
     if running {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            "Wait for the Square sync to finish.",
+            "Wait for the sync to finish.",
         ));
     }
     sqlx::query(
         "DELETE FROM restaurant_setup_streams
          WHERE restaurant_id=$1 AND stream IN ('menu','sales')
-           AND method='connector' AND connector_provider='square'",
+           AND method='connector' AND connector_provider=$2",
     )
     .bind(restaurant_id)
+    .bind(provider)
     .execute(&mut **tx)
     .await
     .map_err(database_error)?;
-    cancel_queued(tx, restaurant_id).await
-}
-
-async fn square_selected(
-    tx: &mut Transaction<'_, Postgres>,
-    restaurant_id: Uuid,
-) -> Result<bool, ApiError> {
-    sqlx::query_scalar(
-        "SELECT COUNT(*)=2 FROM restaurant_setup_streams
-         WHERE restaurant_id=$1 AND stream IN ('menu','sales')
-           AND method='connector' AND connector_provider='square'",
-    )
-    .bind(restaurant_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(database_error)
+    cancel_queued(tx, restaurant_id, provider).await
 }
 
 async fn lock_restaurant(
@@ -402,17 +449,19 @@ async fn lock_restaurant(
 async fn cancel_queued(
     tx: &mut Transaction<'_, Postgres>,
     restaurant_id: Uuid,
+    provider: &str,
 ) -> Result<(), ApiError> {
     sqlx::query(
         "UPDATE source_sync_runs run SET status='failed',
-           error='Square was removed from setup.',finished_at=NOW()
+           error='The connector was removed from setup.',finished_at=NOW()
          FROM source_connections connection
          WHERE run.connection_id=connection.id
            AND run.restaurant_id=connection.restaurant_id
-           AND connection.restaurant_id=$1 AND connection.provider='square'
+           AND connection.restaurant_id=$1 AND connection.provider=$2
            AND run.status='queued'",
     )
     .bind(restaurant_id)
+    .bind(provider)
     .execute(&mut **tx)
     .await
     .map_err(database_error)?;

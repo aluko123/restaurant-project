@@ -172,6 +172,7 @@ impl ApiFixture {
                 gemini: crate::extraction::GeminiClient::inert_for_tests(),
                 workos: WorkosClient::mock(workos.clone()),
                 square: None,
+                clover: crate::clover::CloverConfig::from_env("http://localhost:5173"),
             },
             HeaderValue::from_static("http://localhost:5173"),
         );
@@ -3450,6 +3451,132 @@ async fn location_options_seed_and_capture_cities_added_via_other() {
             .count();
         assert_eq!(matches, 1, "{expected_city} should appear exactly once");
     }
+
+    fixture.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn clover_oauth_connects_and_disconnects_a_merchant() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Sandbox-only override lets the connector talk to the mock server.
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe {
+        std::env::set_var("CLOVER_APPLICATION_ID", "test-app-id");
+        std::env::set_var("CLOVER_APPLICATION_SECRET", "test-app-secret");
+        std::env::set_var(
+            "CLOVER_REDIRECT_URI",
+            "http://localhost:8080/v1/connections/clover/callback",
+        );
+        std::env::set_var("CLOVER_ENVIRONMENT", "sandbox");
+        std::env::set_var("CONNECTIONS_TOKEN_KEY", "release-test-token-key");
+    }
+    let server = MockServer::start().await;
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe {
+        std::env::set_var("CLOVER_API_BASE_URL", server.uri());
+    }
+
+    let fixture = ApiFixture::create("clover_oauth").await;
+    let owner = fixture.token("owner-a");
+    let other = fixture.token("owner-b");
+
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::GET,
+            "/v1/connections/clover/status",
+            None,
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/oauth_v2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "clover-access",
+            "refresh_token": "clover-refresh"
+        })))
+        .mount(&server)
+        .await;
+
+    let authorize = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/connections/clover/authorize",
+        None,
+    )
+    .await;
+    assert_eq!(authorize.status, StatusCode::OK);
+    let url = authorize.body["url"].as_str().unwrap().to_owned();
+    assert!(url.contains("/oauth_v2/authorize"));
+    let state = url.rsplit("state=").next().unwrap().to_owned();
+
+    let callback = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        &format!("/v1/connections/clover/callback?merchant_id=MCH-1&code=auth-code&state={state}"),
+        None,
+    )
+    .await;
+    // Success and failure both 307 back to /sources; the DB assertions below
+    // prove this one took the success path.
+    assert_eq!(callback.status, StatusCode::TEMPORARY_REDIRECT);
+    let connection = sqlx::query_as::<_, (String, String, bool)>(
+        "SELECT status,external_merchant_id,(access_token_encrypted IS NOT NULL)
+         FROM source_connections WHERE restaurant_id=$1 AND provider='clover'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(connection.0, "connected");
+    assert_eq!(connection.1, "MCH-1");
+    assert!(connection.2);
+
+    // Tenant isolation: another restaurant cannot see or disconnect it.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&other),
+            Method::POST,
+            "/v1/connections/clover/disconnect",
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::POST,
+            "/v1/connections/clover/disconnect",
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    let after = sqlx::query_as::<_, (String, bool, bool)>(
+        "SELECT status,(access_token_encrypted IS NULL),(refresh_token_encrypted IS NULL)
+         FROM source_connections WHERE restaurant_id=$1 AND provider='clover'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(after.0, "disconnected");
+    assert!(after.1 && after.2);
 
     fixture.drop().await;
 }
