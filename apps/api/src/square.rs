@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -28,6 +28,7 @@ use crate::{ApiError, AppState, authenticated_subject, database_error};
 const PROVIDER: &str = "square";
 const SQUARE_VERSION: &str = "2025-01-23";
 const MENU_NAME_MAX: usize = 50;
+const MENU_CATEGORY_MAX: usize = 20;
 const INITIAL_SALES_DAYS: i64 = 90;
 
 #[derive(Clone)]
@@ -71,11 +72,21 @@ impl SquareConfig {
         }
     }
 
-    fn api_base(&self) -> &'static str {
+    fn api_base(&self) -> String {
+        // Sandbox-only override so integration tests can point the connector
+        // at a local mock server. Production always talks to Square directly.
+        if !self.environment.eq_ignore_ascii_case("production")
+            && let Ok(base) = std::env::var("SQUARE_API_BASE_URL")
+        {
+            let base = base.trim().trim_end_matches('/').to_owned();
+            if !base.is_empty() {
+                return base;
+            }
+        }
         if self.environment.eq_ignore_ascii_case("production") {
-            "https://connect.squareup.com"
+            "https://connect.squareup.com".to_owned()
         } else {
-            "https://connect.squareupsandbox.com"
+            "https://connect.squareupsandbox.com".to_owned()
         }
     }
 
@@ -85,6 +96,24 @@ impl SquareConfig {
         } else {
             // Sandbox keeps write scopes for local seed tooling. Production sync is read-only.
             "ITEMS_READ ITEMS_WRITE ORDERS_READ ORDERS_WRITE PAYMENTS_WRITE MERCHANT_PROFILE_READ"
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_config() -> Self {
+        Self {
+            application_id: "release-test-app-id".into(),
+            application_secret: "release-test-app-secret".into(),
+            environment: "sandbox".into(),
+            redirect_uri: "http://localhost:8080/v1/connections/square/callback".into(),
+            // Same derivation as token_key_from_env(), without touching process env.
+            token_key: {
+                let hash = Sha256::digest(b"release-test-token-key");
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&hash);
+                key
+            },
+            web_origin: "http://localhost:5173".into(),
         }
     }
 }
@@ -161,6 +190,9 @@ pub(crate) struct ConnectionView {
     last_sync_at: Option<DateTime<Utc>>,
     last_success_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
+    /// Stats JSON from the newest succeeded run, so the UI can surface
+    /// unmatched order lines instead of silently under-counting sales.
+    last_sync_stats: Option<Value>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     configured: bool,
@@ -227,12 +259,17 @@ pub(crate) async fn list(
     manager(&m)?;
     let configured = state.square.is_some();
     let mut rows = sqlx::query_as::<_, ConnectionView>(
-        "SELECT id,provider,status,external_merchant_id,external_location_id,
-                last_sync_at,last_success_at,last_error,created_at,updated_at,
+        "SELECT connection.id,connection.provider,connection.status,
+                connection.external_merchant_id,connection.external_location_id,
+                connection.last_sync_at,connection.last_success_at,connection.last_error,
+                (SELECT run.stats FROM source_sync_runs run
+                  WHERE run.connection_id=connection.id AND run.status='succeeded'
+                  ORDER BY run.finished_at DESC LIMIT 1) AS last_sync_stats,
+                connection.created_at,connection.updated_at,
                 FALSE AS configured
-         FROM source_connections
-         WHERE restaurant_id=$1 AND provider=$2 AND status<>'disconnected'
-         ORDER BY updated_at DESC",
+         FROM source_connections connection
+         WHERE connection.restaurant_id=$1 AND connection.provider=$2 AND connection.status<>'disconnected'
+         ORDER BY connection.updated_at DESC",
     )
     .bind(m.restaurant_id)
     .bind(PROVIDER)
@@ -695,13 +732,13 @@ struct ConnectionRow {
     last_success_at: Option<DateTime<Utc>>,
 }
 
-#[derive(sqlx::FromRow)]
-struct SyncJob {
-    id: Uuid,
-    connection_id: Uuid,
-    restaurant_id: Uuid,
-    kind: String,
-    claim_token: Uuid,
+#[derive(sqlx::FromRow, Debug)]
+pub(crate) struct SyncJob {
+    pub(crate) id: Uuid,
+    pub(crate) connection_id: Uuid,
+    pub(crate) restaurant_id: Uuid,
+    pub(crate) kind: String,
+    pub(crate) claim_token: Uuid,
 }
 
 /// How often each connected restaurant's sales are refreshed automatically.
@@ -751,9 +788,9 @@ pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>, runs_
 }
 
 // Queues an incremental refresh for every healthy connected restaurant whose
-// newest run is older than the interval. The NOT EXISTS guard keeps this safe
-// under overlapping ticks; a duplicate that slips through is harmless because
-// day writes are idempotent.
+// newest run is older than the interval. A partial unique index allows at
+// most one queued-or-running run per connection, so overlapping worker ticks
+// cannot double-enqueue.
 async fn enqueue_due_auto_syncs(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let inserted = sqlx::query(
@@ -767,14 +804,12 @@ async fn enqueue_due_auto_syncs(pool: &PgPool) -> Result<u64, sqlx::Error> {
                   AND setup.stream IN ('menu','sales')
                   AND setup.method='connector'
                   AND setup.connector_provider='square')=2
-           AND NOT EXISTS (SELECT 1 FROM source_sync_runs run
-                           WHERE run.connection_id=connection.id
-                             AND run.status IN ('queued','running'))
            AND EXISTS (SELECT 1 FROM source_sync_runs done
                        WHERE done.connection_id=connection.id AND done.status='succeeded')
            AND COALESCE((SELECT MAX(run.created_at) FROM source_sync_runs run
                          WHERE run.connection_id=connection.id),
-                        '-infinity'::timestamptz) <= NOW() - make_interval(mins => $2::int)",
+                        '-infinity'::timestamptz) <= NOW() - make_interval(mins => $2::int)
+         ON CONFLICT DO NOTHING",
     )
     .bind(PROVIDER)
     .bind(AUTO_SYNC_INTERVAL_MINUTES)
@@ -1125,12 +1160,139 @@ async fn square_post(
     response.json().await.map_err(|e| e.to_string())
 }
 
-async fn sync_catalog(
+/// Resolves an item's first Square category id to a display name, truncated
+/// to Parline's menu-category limit. Pure so it stays unit-testable.
+fn catalog_category_name(
+    category_names: &HashMap<String, String>,
+    item_data: &Value,
+) -> Option<String> {
+    let category_id = item_data
+        .get("categories")?
+        .as_array()?
+        .first()?
+        .get("id")?
+        .as_str()?;
+    let name = category_names.get(category_id)?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(name, MENU_CATEGORY_MAX))
+}
+
+async fn fetch_category_names(
+    config: &SquareConfig,
+    access: &str,
+) -> Result<HashMap<String, String>, String> {
+    let mut names = HashMap::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let path = match &cursor {
+            Some(c) => format!(
+                "/v2/catalog/list?types=CATEGORY&cursor={}",
+                urlencoding_encode(c)
+            ),
+            None => "/v2/catalog/list?types=CATEGORY".to_owned(),
+        };
+        let body = square_get(config, access, &path).await?;
+        for object in body
+            .get("objects")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            if object.get("type").and_then(|t| t.as_str()) != Some("CATEGORY") {
+                continue;
+            }
+            let id = object.get("id").and_then(|v| v.as_str());
+            let name = object
+                .pointer("/category_data/name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            if let (Some(id), Some(name)) = (id, name) {
+                names.insert(id.to_owned(), name.to_owned());
+            }
+        }
+        cursor = body
+            .get("cursor")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(names)
+}
+
+/// One menu row ready for a bulk upsert.
+struct CatalogUpsertRow {
+    external_id: String,
+    name: String,
+    category: Option<String>,
+    price: BigDecimal,
+    currency: String,
+    active: bool,
+}
+
+async fn load_menu_name_set(pool: &PgPool, restaurant_id: Uuid) -> Result<HashSet<String>, String> {
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT LOWER(name) FROM menu_items WHERE restaurant_id=$1")
+            .bind(restaurant_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Inserts or refreshes every variation in one statement. The partial unique
+/// index on (restaurant_id, external_source, external_id) arbitrates insert
+/// vs update; name collisions were resolved by the caller beforehand.
+async fn bulk_upsert_menu_items(
+    pool: &PgPool,
+    restaurant_id: Uuid,
+    rows: &[CatalogUpsertRow],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut builder = sqlx::QueryBuilder::new(
+        "INSERT INTO menu_items
+         (id,restaurant_id,name,category,selling_price,currency,active,external_source,external_id) ",
+    );
+    builder.push_values(rows.iter(), |mut bind, row| {
+        bind.push_bind(Uuid::now_v7())
+            .push_bind(restaurant_id)
+            .push_bind(&row.name)
+            .push_bind(row.category.as_deref())
+            .push_bind(&row.price)
+            .push_bind(&row.currency)
+            .push_bind(row.active)
+            .push_bind("square")
+            .push_bind(&row.external_id);
+    });
+    builder.push(
+        " ON CONFLICT (restaurant_id, external_source, external_id)
+         WHERE external_source IS NOT NULL AND external_id IS NOT NULL
+         DO UPDATE SET name=EXCLUDED.name, category=EXCLUDED.category,
+           selling_price=EXCLUDED.selling_price, currency=EXCLUDED.currency,
+           active=EXCLUDED.active, updated_at=NOW()",
+    );
+    builder
+        .build()
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub(crate) async fn sync_catalog(
     pool: &PgPool,
     config: &SquareConfig,
     access: &str,
     restaurant_id: Uuid,
 ) -> Result<Value, String> {
+    let category_names = fetch_category_names(config, access).await?;
+    let mut used_names = load_menu_name_set(pool, restaurant_id).await?;
     let mut cursor: Option<String> = None;
     let mut upserted = 0u64;
     let mut skipped = 0u64;
@@ -1148,6 +1310,7 @@ async fn sync_catalog(
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        let mut rows: Vec<CatalogUpsertRow> = Vec::new();
         for object in objects {
             if object.get("type").and_then(|t| t.as_str()) != Some("ITEM") {
                 continue;
@@ -1158,13 +1321,7 @@ async fn sync_catalog(
                 .and_then(|v| v.as_str())
                 .unwrap_or("Untitled")
                 .trim();
-            let category = item
-                .get("categories")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|c| c.get("id"))
-                .and_then(|id| id.as_str());
-            let _ = category; // category names need separate lookup; leave null for v1
+            let category = catalog_category_name(&category_names, &item);
             let variations = item
                 .get("variations")
                 .and_then(|v| v.as_array())
@@ -1207,6 +1364,16 @@ async fn sync_catalog(
                     skipped += 1;
                     continue;
                 }
+                // Resolve any name collision against everything already in the
+                // restaurant plus names claimed earlier in this same sync.
+                let lower = name.to_lowercase();
+                if used_names.contains(&lower) {
+                    let suffix =
+                        format!(" · {}", &external_id[external_id.len().saturating_sub(6)..]);
+                    let base_max = MENU_NAME_MAX.saturating_sub(suffix.chars().count());
+                    name = format!("{}{suffix}", truncate_chars(&name, base_max));
+                }
+                used_names.insert(name.to_lowercase());
                 let price_money = var_data.get("price_money").cloned().unwrap_or(json!({}));
                 let amount = price_money
                     .get("amount")
@@ -1223,22 +1390,24 @@ async fn sync_catalog(
                 }
                 let price = cents_to_decimal(amount);
                 let active = object.get("is_deleted").and_then(|v| v.as_bool()) != Some(true);
-                match upsert_menu_item(
-                    pool,
-                    restaurant_id,
-                    external_id,
-                    &name,
-                    &price,
-                    &currency,
+                rows.push(CatalogUpsertRow {
+                    external_id: external_id.to_owned(),
+                    name,
+                    category: category.clone(),
+                    price,
+                    currency,
                     active,
-                )
-                .await
-                {
-                    Ok(true) => upserted += 1,
-                    Ok(false) => skipped += 1,
-                    Err(error) => {
-                        tracing::warn!(%error, external_id, "menu upsert failed");
-                        skipped += 1;
+                });
+            }
+        }
+        match bulk_upsert_menu_items(pool, restaurant_id, &rows).await {
+            Ok(()) => upserted += rows.len() as u64,
+            Err(error) => {
+                tracing::warn!(%error, "bulk menu upsert failed; falling back per row");
+                for row in &rows {
+                    match upsert_menu_item(pool, restaurant_id, row).await {
+                        Ok(true) => upserted += 1,
+                        _ => skipped += 1,
                     }
                 }
             }
@@ -1257,12 +1426,16 @@ async fn sync_catalog(
 async fn upsert_menu_item(
     pool: &PgPool,
     restaurant_id: Uuid,
-    external_id: &str,
-    name: &str,
-    price: &BigDecimal,
-    currency: &str,
-    active: bool,
+    row: &CatalogUpsertRow,
 ) -> Result<bool, String> {
+    let CatalogUpsertRow {
+        external_id,
+        name,
+        category,
+        price,
+        currency,
+        active,
+    } = row;
     let existing = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM menu_items
          WHERE restaurant_id=$1 AND external_source='square' AND external_id=$2",
@@ -1275,12 +1448,13 @@ async fn upsert_menu_item(
     if let Some(id) = existing {
         sqlx::query(
             "UPDATE menu_items
-             SET name=$3,selling_price=$4,currency=$5,active=$6,updated_at=NOW()
+             SET name=$3,category=$4,selling_price=$5,currency=$6,active=$7,updated_at=NOW()
              WHERE id=$1 AND restaurant_id=$2",
         )
         .bind(id)
         .bind(restaurant_id)
         .bind(name)
+        .bind(category)
         .bind(price)
         .bind(currency)
         .bind(active)
@@ -1310,11 +1484,12 @@ async fn upsert_menu_item(
     let result = sqlx::query(
         "INSERT INTO menu_items
          (id,restaurant_id,name,category,selling_price,currency,active,external_source,external_id)
-         VALUES($1,$2,$3,NULL,$4,$5,$6,'square',$7)",
+         VALUES($1,$2,$3,$4,$5,$6,$7,'square',$8)",
     )
     .bind(id)
     .bind(restaurant_id)
     .bind(&final_name)
+    .bind(category)
     .bind(price)
     .bind(currency)
     .bind(active)
@@ -1354,7 +1529,7 @@ fn truncate_chars(value: &str, max: usize) -> String {
 
 type SalesLineTotal = (BigDecimal, Option<i64>, Option<String>);
 
-async fn sync_orders(
+pub(crate) async fn sync_orders(
     pool: &PgPool,
     config: &SquareConfig,
     access: &str,
@@ -1577,41 +1752,50 @@ async fn write_sales_day(
         }
     };
 
-    for (menu_item_id, (qty, net_cents, currency)) in lines {
-        let name = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM menu_items WHERE id=$1 AND restaurant_id=$2",
-        )
-        .bind(menu_item_id)
-        .bind(restaurant_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-        let Some(name) = name else {
-            continue;
-        };
-        let name = truncate_chars(&name, MENU_NAME_MAX);
-        let (net, cur) = match (net_cents, currency) {
-            (Some(cents), Some(c)) if *cents >= 0 && c.len() == 3 => {
-                (Some(cents_to_decimal(*cents)), Some(c.clone()))
-            }
-            _ => (None, None),
-        };
-        sqlx::query(
-            "INSERT INTO sales_lines
-             (sales_day_id,restaurant_id,menu_item_id,menu_item_name,quantity,reported_net_sales,currency)
-             VALUES($1,$2,$3,$4,$5,$6,$7)",
-        )
-        .bind(day_id)
-        .bind(restaurant_id)
-        .bind(menu_item_id)
-        .bind(&name)
-        .bind(qty)
-        .bind(net)
-        .bind(cur)
+    let item_ids: Vec<Uuid> = lines.keys().copied().collect();
+    let name_by_id: HashMap<Uuid, String> = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT id,name FROM menu_items WHERE restaurant_id=$1 AND id = ANY($2)",
+    )
+    .bind(restaurant_id)
+    .bind(&item_ids)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(id, name)| (id, truncate_chars(&name, MENU_NAME_MAX)))
+    .collect();
+
+    let mut builder = sqlx::QueryBuilder::new(
+        "INSERT INTO sales_lines
+         (sales_day_id,restaurant_id,menu_item_id,menu_item_name,quantity,reported_net_sales,currency) ",
+    );
+    builder.push_values(
+        lines.iter().filter_map(|(menu_item_id, line)| {
+            let name = name_by_id.get(menu_item_id)?;
+            let (net, cur) = match (&line.1, &line.2) {
+                (Some(cents), Some(c)) if *cents >= 0 && c.len() == 3 => {
+                    (Some(cents_to_decimal(*cents)), Some(c.clone()))
+                }
+                _ => (None, None),
+            };
+            Some((menu_item_id, name, &line.0, net, cur))
+        }),
+        |mut bind, (menu_item_id, name, qty, net, cur)| {
+            bind.push_bind(day_id)
+                .push_bind(restaurant_id)
+                .push_bind(*menu_item_id)
+                .push_bind(name)
+                .push_bind(qty)
+                .push_bind(net)
+                .push_bind(cur);
+        },
+    );
+    builder
+        .build()
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
-    }
+
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1629,6 +1813,28 @@ mod tests {
             10
         );
         assert!(truncate_chars("  x  ", 50) == "x");
+    }
+
+    #[test]
+    fn resolves_first_category_through_the_id_map() {
+        let mut names = HashMap::new();
+        names.insert("CAT1".into(), "  Beverages  ".into());
+        names.insert("CAT2".into(), "x".repeat(40));
+        let item = json!({"categories":[{"id":"CAT1"},{"id":"CAT2"}]});
+        assert_eq!(
+            catalog_category_name(&names, &item).as_deref(),
+            Some("Beverages")
+        );
+        let long = json!({"categories":[{"id":"CAT2"}]});
+        let resolved = catalog_category_name(&names, &long).unwrap();
+        assert_eq!(resolved.chars().count(), MENU_CATEGORY_MAX);
+        assert_eq!(catalog_category_name(&names, &json!({})), None);
+        assert_eq!(
+            catalog_category_name(&names, &json!({"categories":[{"id":"MISSING"}]})),
+            None
+        );
+        let blank = json!({"categories":[]});
+        assert_eq!(catalog_category_name(&names, &blank), None);
     }
 
     #[test]
