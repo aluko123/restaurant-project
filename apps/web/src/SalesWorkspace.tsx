@@ -1,4 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { LoadOlder } from "./LoadOlder";
 
 export type ApiRequest = <T>(path: string, init?: RequestInit) => Promise<T>;
 
@@ -117,6 +118,8 @@ export function SalesWorkspace({
   const [loadedDate, setLoadedDate] = useState(defaultDate);
   const [options, setOptions] = useState<MenuOption[]>([]);
   const [recent, setRecent] = useState<SalesDaySummary[]>([]);
+  const [recentCursor, setRecentCursor] = useState<string | null>(null);
+  const [loadingMoreSales, setLoadingMoreSales] = useState(false);
   const [day, setDay] = useState<SalesDay | null>(null);
   const [entries, setEntries] = useState<Record<string, Entry>>({});
   const [mode, setMode] = useState<"entry" | "review">("entry");
@@ -184,13 +187,40 @@ export function SalesWorkspace({
     [adoptDay, request],
   );
 
+  const adoptRecentDays = useCallback((rows: SalesDaySummary[]) => {
+    setRecent(current => {
+      const byDate = new Map(current.map(row => [row.businessDate, row]));
+      for (const row of rows) byDate.set(row.businessDate, row);
+      return [...byDate.values()].sort((a, b) => b.businessDate.localeCompare(a.businessDate));
+    });
+    const last = rows[rows.length - 1];
+    setRecentCursor(rows.length === 30 && last ? last.businessDate : null);
+  }, []);
+
   const loadRecent = useCallback(async () => {
     try {
-      setRecent(await request<SalesDaySummary[]>("/v1/sales-days"));
+      // Fresh view: replace with the newest page.
+      const rows = await request<SalesDaySummary[]>("/v1/sales-days");
+      setRecent(rows);
+      const last = rows[rows.length - 1];
+      setRecentCursor(rows.length === 30 && last ? last.businessDate : null);
     } catch (reason) {
       setError(errorMessage(reason, "Recent sales days couldn't load. Try again."));
     }
   }, [request]);
+
+  const loadMoreRecent = useCallback(async () => {
+    if (!recentCursor) return;
+    setLoadingMoreSales(true);
+    try {
+      const rows = await request<SalesDaySummary[]>(`/v1/sales-days?beforeDate=${encodeURIComponent(recentCursor)}`);
+      adoptRecentDays(rows);
+    } catch (reason) {
+      setError(errorMessage(reason, "Older sales days couldn't load. Try again."));
+    } finally {
+      setLoadingMoreSales(false);
+    }
+  }, [adoptRecentDays, recentCursor, request]);
 
   useEffect(() => {
     if (!active) return;
@@ -728,6 +758,9 @@ export function SalesWorkspace({
         loading={loadingOptions}
         disabled={loadingDay || importing || saving || importPreview !== null}
         onOpen={(businessDate) => void loadDay(businessDate)}
+        hasMore={recentCursor !== null}
+        loadingMore={loadingMoreSales}
+        onLoadMore={() => void loadMoreRecent()}
       />
     </section>
   );
@@ -1196,12 +1229,18 @@ function RecentSales({
   loading,
   disabled,
   onOpen,
+  hasMore,
+  loadingMore,
+  onLoadMore,
 }: {
   recent: SalesDaySummary[];
   currentDate: string;
   loading: boolean;
   disabled: boolean;
   onOpen: (businessDate: string) => void;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
 }) {
   return (
     <section className="recent-sales" aria-labelledby="recent-sales-heading">
@@ -1239,10 +1278,13 @@ function RecentSales({
               </article>
             ))}
           </div>
-          {recent.length >= 30 && (
-            <p className="empty-state">
-              Showing the latest 30 saved days. Open an older day by picking its date above.
-            </p>
+          {hasMore && (
+            <LoadOlder
+              label="Load older days"
+              loadingLabel="Loading older days…"
+              loading={loadingMore}
+              onMore={onLoadMore}
+            />
           )}
         </>
       )}

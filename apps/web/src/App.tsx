@@ -7,6 +7,7 @@ import { TodayWorkspace } from "./TodayWorkspace";
 import { WeeklyBriefWorkspace } from "./WeeklyBriefWorkspace";
 import { InventoryWorkspace, type InventoryItem } from "./InventoryWorkspace";
 import { SourcesWorkspace, type MigrationSetup } from "./SourcesWorkspace";
+import { LoadOlder } from "./LoadOlder";
 
 type AppProps = {
   authConfigured: boolean;
@@ -317,6 +318,8 @@ function LossesWorkspace({ restaurant, request, active }: { restaurant: Restaura
   const [logsLoading, setLogsLoading] = useState(true);
   const [itemsError, setItemsError] = useState("");
   const [logsError, setLogsError] = useState("");
+  const [lossCursor, setLossCursor] = useState<{ createdAt: string; id: string } | null>(null);
+  const [loadingMoreLogs, setLoadingMoreLogs] = useState(false);
   const [eventType, setEventType] = useState<LossEventType>("waste");
   const [inventoryItemId, setInventoryItemId] = useState("");
   const [quantity, setQuantity] = useState("");
@@ -335,14 +338,32 @@ function LossesWorkspace({ restaurant, request, active }: { restaurant: Restaura
       .catch((cause: unknown) => setItemsError(cause instanceof Error ? cause.message : "Inventory items couldn't load. Try again."))
       .finally(() => setItemsLoading(false));
   }, [request]);
+  const adoptLogs = useCallback((values: LossEvent[]) => {
+    setLogs(current => mergeLossLogs([...current, ...values]));
+    const last = values[values.length - 1];
+    setLossCursor(values.length === 50 && last ? { createdAt: last.createdAt, id: last.id } : null);
+  }, []);
   const loadLogs = useCallback(() => {
     setLogsLoading(true);
     setLogsError("");
     void request<LossEvent[]>("/v1/loss-events")
-      .then(values => setLogs(current => mergeLossLogs([...current, ...values])))
+      .then(values => adoptLogs(values))
       .catch((cause: unknown) => setLogsError(cause instanceof Error ? cause.message : "Recent logs couldn't load. Try again."))
       .finally(() => setLogsLoading(false));
-  }, [request]);
+  }, [adoptLogs]);
+  const loadMoreLogs = useCallback(async () => {
+    if (!lossCursor) return;
+    setLoadingMoreLogs(true);
+    setLogsError("");
+    try {
+      const query = `beforeCreatedAt=${encodeURIComponent(lossCursor.createdAt)}&beforeId=${lossCursor.id}`;
+      adoptLogs(await request<LossEvent[]>(`/v1/loss-events?${query}`));
+    } catch (cause: unknown) {
+      setLogsError(cause instanceof Error ? cause.message : "Older logs couldn't load. Try again.");
+    } finally {
+      setLoadingMoreLogs(false);
+    }
+  }, [adoptLogs, lossCursor, request]);
 
   useEffect(() => {
     if (!active) return;
@@ -417,13 +438,13 @@ function LossesWorkspace({ restaurant, request, active }: { restaurant: Restaura
       <div className="loss-submit"><button className="ledger-button" disabled={saving}>{saving ? "Saving…" : eventType === "waste" ? "Log waste" : "Log stockout"}</button></div>
     </form>}
     <section className="recent-losses" aria-labelledby="recent-losses-heading"><div className="list-heading"><h2 id="recent-losses-heading">Recent logs</h2><button className="text-button" type="button" disabled={logsLoading} onClick={loadLogs}>Refresh</button></div>
-      {logsLoading ? <p className="empty-state" role="status">Loading recent waste and stockouts…</p> : logsError ? <div className="loss-load-error"><p className="form-error" role="alert">{logsError}</p><button className="file-button" type="button" onClick={loadLogs}>Retry recent logs</button></div> : logs.length === 0 ? <p className="empty-state">No waste or stockouts logged yet. New logs will appear here.</p> : <div className="recent-loss-list">{logs.map(log => <article className={`recent-loss-card ${log.eventType}`} key={log.id}><div><p className="invoice-status">{log.eventType === "waste" ? "Waste" : "Stockout"}</p><h3>{log.inventoryItemName}</h3><p className="loss-result">{log.eventType === "waste" ? `${log.quantity} ${log.countUnit}` : lossOptionLabel(stockoutSeverities, log.severity)}</p></div><div className="loss-log-detail"><p><span>Reason</span>{lossOptionLabel(log.eventType === "waste" ? wasteReasons : stockoutReasons, log.reason)}</p>{log.note && <p className="loss-note">{log.note}</p>}<time dateTime={log.createdAt}>{formatInventoryDate(log.createdAt)}</time></div></article>)}</div>}
+      {logsLoading ? <p className="empty-state" role="status">Loading recent waste and stockouts…</p> : logsError ? <div className="loss-load-error"><p className="form-error" role="alert">{logsError}</p><button className="file-button" type="button" onClick={loadLogs}>Retry recent logs</button></div> : logs.length === 0 ? <p className="empty-state">No waste or stockouts logged yet. New logs will appear here.</p> : <><div className="recent-loss-list">{logs.map(log => <article className={`recent-loss-card ${log.eventType}`} key={log.id}><div><p className="invoice-status">{log.eventType === "waste" ? "Waste" : "Stockout"}</p><h3>{log.inventoryItemName}</h3><p className="loss-result">{log.eventType === "waste" ? `${log.quantity} ${log.countUnit}` : lossOptionLabel(stockoutSeverities, log.severity)}</p></div><div className="loss-log-detail"><p><span>Reason</span>{lossOptionLabel(log.eventType === "waste" ? wasteReasons : stockoutReasons, log.reason)}</p>{log.note && <p className="loss-note">{log.note}</p>}<time dateTime={log.createdAt}>{formatInventoryDate(log.createdAt)}</time></div></article>)}</div>{lossCursor && <LoadOlder label="Load older logs" loadingLabel="Loading older logs…" loading={loadingMoreLogs} onMore={() => void loadMoreLogs()} />}</>}
     </section>
   </section>;
 }
 
 function lossOptionLabel(options: { value: string; label: string }[], value: string | null) { return options.find(option => option.value === value)?.label ?? value ?? "—"; }
-function mergeLossLogs(values: LossEvent[]) { const byId = new Map(values.map(value => [value.id, value])); return [...byId.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)).slice(0, 50); }
+function mergeLossLogs(values: LossEvent[]) { const byId = new Map(values.map(value => [value.id, value])); return [...byId.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)); }
 
 function MenuWorkspace({ restaurant, request, active }: { restaurant: Restaurant; request: <T>(path: string, init?: RequestInit) => Promise<T>; active: boolean }) {
   const owner = restaurant.role === "owner";
@@ -846,16 +867,12 @@ function InvoiceWorkspace({ restaurant, request, active }: { restaurant: Restaur
         <button className="ledger-button" type="submit" disabled={uploading}>{uploading ? "Uploading invoice…" : "Upload invoice"}<span aria-hidden="true">→</span></button>
       </form>
       <div className="invoice-list"><div className="list-heading"><h2>Recent invoices</h2>{!loading && <button className="text-button" type="button" onClick={loadInvoices}>Refresh</button>}</div>
-        {!loading && invoices.length > 0 && invoiceCursor && (
-          <button className="file-button" type="button" disabled={loadingMore} onClick={() => void loadMoreInvoices()}>
-            {loadingMore ? "Loading older invoices…" : "Load older invoices"}
-          </button>
-        )}
         {listError && <p className="form-error" role="alert">{listError}</p>}
         {!loading&&invoices.length>0&&<div className="collection-toolbar invoice-toolbar" aria-label="Filter invoices"><label className="collection-search">Search all invoices<input type="search" placeholder="Supplier or filename" value={invoiceSearch} onChange={event=>{const value=event.target.value;if(!invoiceSearch.trim()&&value.trim()){setInvoiceStatus("all");setInvoicePeriod("all")}setInvoiceSearch(value)}}/></label><label>Status<select value={invoiceStatus} onChange={event=>setInvoiceStatus(event.target.value as typeof invoiceStatus)}><option value="action">Needs action</option><option value="processing">Processing</option><option value="approved">Approved</option><option value="all">All statuses</option></select></label><label>Period<select value={invoicePeriod} onChange={event=>setInvoicePeriod(event.target.value as typeof invoicePeriod)}><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="year">This year</option><option value="all">All history</option></select></label><div className="collection-toolbar-summary"><strong>{filteredInvoices.length} {filteredInvoices.length===1?"invoice":"invoices"}</strong>{invoiceFiltersActive&&<button className="text-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("action");setInvoicePeriod("90")}}>Clear filters</button>}</div></div>}
         {loading ? <p role="status">Loading invoices…</p> : invoices.length === 0 ? <p className="empty-state">No invoices yet. Upload one to capture its purchases, compare supplier prices, and create supported Today actions.</p> : filteredInvoices.length===0 ? <div className="filtered-empty"><h3>{invoiceStatus === "action" && !invoiceSearch.trim() ? "No invoices need action" : "No invoices match"}</h3><p>{invoiceStatus === "action" && !invoiceSearch.trim() ? "You're caught up for this period. Approved invoices remain available in history." : "Try a different status, period, or search."}</p><button className="file-button" type="button" onClick={()=>{setInvoiceSearch("");setInvoiceStatus("all");setInvoicePeriod("all")}}>Show all invoices</button></div> : <div className="invoice-results">
           {operationalInvoices.length>0&&<section className="invoice-result-group"><h3>Current work<span>{operationalInvoices.length}</span></h3><div className="invoice-cards">{operationalInvoices.map(invoice=><InvoiceCard key={invoice.id} invoice={invoice} openingId={openingId} retryingId={retryingId} deletingId={deletingId} onReview={setReviewId} onRetry={retry} onPriceChanges={id=>{setApprovedPriceChanges(null);setPriceChangeId(id)}} onPurchases={setPurchaseId} onOriginal={openOriginal} onDelete={removeInvoice}/>)}</div></section>}
           {invoiceMonths.map(([month,monthInvoices],index)=><details className="invoice-month" key={month} open={index===0}><summary><span>{formatInvoiceMonth(month)}</span><strong>{monthInvoices.length}</strong></summary><div className="invoice-cards">{monthInvoices.map(invoice=><InvoiceCard key={invoice.id} invoice={invoice} openingId={openingId} retryingId={retryingId} deletingId={deletingId} onReview={setReviewId} onRetry={retry} onPriceChanges={id=>{setApprovedPriceChanges(null);setPriceChangeId(id)}} onPurchases={setPurchaseId} onOriginal={openOriginal} onDelete={removeInvoice}/>)}</div></details>)}
+          {invoiceCursor && <LoadOlder label="Load older invoices" loadingLabel="Loading older invoices…" loading={loadingMore} onMore={() => void loadMoreInvoices()} />}
         </div>}
       </div>
     </div>

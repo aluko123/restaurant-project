@@ -194,6 +194,7 @@ pub(crate) struct CompleteInput {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct HistoryQuery {
     #[serde(default = "default_history_limit")]
     limit: i64,

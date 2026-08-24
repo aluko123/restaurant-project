@@ -220,6 +220,7 @@ async fn find_by_content_hash(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ListQuery {
     /// Keyset cursor: only rows strictly older than this pair are returned.
     #[serde(default)]

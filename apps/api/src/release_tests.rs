@@ -3242,3 +3242,119 @@ async fn square_sync_maps_categories_and_reports_unmatched_order_lines() {
 
     fixture.drop().await;
 }
+
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn sales_days_and_loss_events_page_with_keyset_cursors() {
+    let fixture = ApiFixture::create("keyset_paging").await;
+    let owner = fixture.token("owner-a");
+    let owner_user: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE auth_subject='owner-a'")
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+
+    // Three sales days, oldest first in insertion order.
+    for day in ["2026-01-01", "2026-01-02", "2026-01-03"] {
+        sqlx::query(
+            "INSERT INTO sales_days(id,restaurant_id,business_date,created_by,updated_by)
+             VALUES($1,$2,$3::date,$4,$4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(fixture.ids.restaurant_a)
+        .bind(day)
+        .bind(owner_user)
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    }
+
+    let page_one = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/sales-days",
+        None,
+    )
+    .await;
+    assert_eq!(page_one.status, StatusCode::OK);
+    let dates: Vec<&str> = page_one
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["businessDate"].as_str().unwrap())
+        .collect();
+    assert_eq!(dates, ["2026-01-03", "2026-01-02", "2026-01-01"]);
+
+    let older = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/sales-days?beforeDate=2026-01-02",
+        None,
+    )
+    .await;
+    assert_eq!(older.status, StatusCode::OK);
+    let older_dates: Vec<&str> = older
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["businessDate"].as_str().unwrap())
+        .collect();
+    assert_eq!(older_dates, ["2026-01-01"]);
+
+    // Three loss events a minute apart.
+    for minutes in 0..3 {
+        sqlx::query(
+            "INSERT INTO loss_events(id,restaurant_id,event_type,inventory_item_id,
+                 inventory_item_name,count_unit,quantity,reason,created_by,created_at)
+             VALUES($1,$2,'waste',$3,'Tenant A Tomatoes','lb',1,'spoilage',$4,
+                    NOW() - make_interval(mins => $5))",
+        )
+        .bind(Uuid::now_v7())
+        .bind(fixture.ids.restaurant_a)
+        .bind(fixture.ids.inventory_a)
+        .bind(owner_user)
+        .bind(minutes)
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    }
+
+    let logs_one = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/loss-events",
+        None,
+    )
+    .await;
+    assert_eq!(logs_one.status, StatusCode::OK);
+    let rows = logs_one.body.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    let first = &rows[0];
+    let cursor_created = first["createdAt"].as_str().unwrap().to_owned();
+    let cursor_id = first["id"].as_str().unwrap().to_owned();
+
+    let logs_two = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        &format!(
+            "/v1/loss-events?beforeCreatedAt={}&beforeId={}",
+            urlencoding_encode(&cursor_created),
+            cursor_id
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(logs_two.status, StatusCode::OK);
+    assert_eq!(logs_two.body.as_array().unwrap().len(), 2);
+
+    fixture.drop().await;
+}
+
+fn urlencoding_encode(value: &str) -> String {
+    value.replace('+', "%2B").replace(':', "%3A")
+}

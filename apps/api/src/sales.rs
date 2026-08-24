@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -197,9 +197,18 @@ struct ValidatedLine {
     reported_currency: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SalesListQuery {
+    /// Keyset cursor: only days strictly older than this are returned.
+    #[serde(default)]
+    before_date: Option<NaiveDate>,
+}
+
 pub(crate) async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<SalesListQuery>,
 ) -> Result<Json<Vec<SalesDaySummary>>, ApiError> {
     let member = membership(&state, &headers).await?;
     let days = sqlx::query_as::<_, SalesDaySummary>(
@@ -209,11 +218,13 @@ pub(crate) async fn list(
          FROM sales_days d
          LEFT JOIN sales_lines l ON l.sales_day_id=d.id AND l.restaurant_id=d.restaurant_id
          WHERE d.restaurant_id=$1
+           AND ($2::date IS NULL OR d.business_date < $2)
          GROUP BY d.id,d.business_date,d.revision,d.updated_at
          ORDER BY d.business_date DESC,d.updated_at DESC,d.id DESC
          LIMIT 30",
     )
     .bind(member.restaurant_id)
+    .bind(query.before_date)
     .fetch_all(&state.pool)
     .await
     .map_err(database_error)?;

@@ -1154,3 +1154,5 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+
+.load-older { display: flex; justify-content: center; padding: 8px 0 4px; }

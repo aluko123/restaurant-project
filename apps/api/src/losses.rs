@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
 };
 use bigdecimal::BigDecimal;
@@ -71,9 +71,20 @@ pub(crate) struct LossEvent {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LossListQuery {
+    /// Keyset cursor: only events strictly older than this pair are returned.
+    #[serde(default)]
+    before_created_at: Option<chrono::DateTime<Utc>>,
+    #[serde(default)]
+    before_id: Option<Uuid>,
+}
+
 pub(crate) async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<LossListQuery>,
 ) -> Result<Json<Vec<LossEvent>>, ApiError> {
     let member = membership(&state, &headers).await?;
     let events = sqlx::query_as::<_, LossEvent>(
@@ -81,10 +92,15 @@ pub(crate) async fn list(
                 quantity::text quantity,severity,reason,note,created_at
          FROM loss_events
          WHERE restaurant_id=$1
+           AND ($2::timestamptz IS NULL
+                OR created_at < $2::timestamptz
+                OR (created_at = $2::timestamptz AND id < $3))
          ORDER BY created_at DESC,id DESC
          LIMIT 50",
     )
     .bind(member.restaurant_id)
+    .bind(query.before_created_at)
+    .bind(query.before_id)
     .fetch_all(&state.pool)
     .await
     .map_err(database_error)?;
