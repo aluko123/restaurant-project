@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import type { ApiRequest } from "./SalesWorkspace";
 import { InventoryImportPanel } from "./InventoryImportPanel";
+import { LoadOlder } from "./LoadOlder";
 import { OrderGuidePanel, type OrderGuide, type SupplierOption } from "./OrderGuidePanel";
 
 export type InventoryItem = {
@@ -895,14 +896,12 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
         ) : (
           <>
             {historyCursor && (
-              <button
-                className="file-button"
-                type="button"
-                disabled={loadingHistoryMore || busy}
-                onClick={() => void loadMoreHistory()}
-              >
-                {loadingHistoryMore ? "Loading older counts…" : "Load older counts"}
-              </button>
+              <LoadOlder
+                label="Load older counts"
+                loadingLabel="Loading older counts…"
+                loading={loadingHistoryMore || busy}
+                onMore={() => void loadMoreHistory()}
+              />
             )}
             <div className="count-history-list">
             {history.map((row) => (

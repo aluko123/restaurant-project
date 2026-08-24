@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import type { ApiRequest } from "./SalesWorkspace";
 
 type Location = { city: string; region: string; country: string };
 type Place = Location;
@@ -13,66 +14,50 @@ const usRegions = [
   "Vermont", "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming",
 ];
 
-const places: Place[] = [
-  { city: "Atlanta", region: "Georgia", country: "United States" },
-  { city: "Austin", region: "Texas", country: "United States" },
-  { city: "Baltimore", region: "Maryland", country: "United States" },
-  { city: "Boston", region: "Massachusetts", country: "United States" },
-  { city: "Charlotte", region: "North Carolina", country: "United States" },
-  { city: "Chicago", region: "Illinois", country: "United States" },
-  { city: "Dallas", region: "Texas", country: "United States" },
-  { city: "Denver", region: "Colorado", country: "United States" },
-  { city: "Detroit", region: "Michigan", country: "United States" },
-  { city: "Houston", region: "Texas", country: "United States" },
-  { city: "Las Vegas", region: "Nevada", country: "United States" },
-  { city: "Los Angeles", region: "California", country: "United States" },
-  { city: "Miami", region: "Florida", country: "United States" },
-  { city: "Minneapolis", region: "Minnesota", country: "United States" },
-  { city: "Nashville", region: "Tennessee", country: "United States" },
-  { city: "New Orleans", region: "Louisiana", country: "United States" },
-  { city: "New York City", region: "New York", country: "United States" },
-  { city: "Orlando", region: "Florida", country: "United States" },
-  { city: "Philadelphia", region: "Pennsylvania", country: "United States" },
-  { city: "Phoenix", region: "Arizona", country: "United States" },
-  { city: "Portland", region: "Oregon", country: "United States" },
-  { city: "San Antonio", region: "Texas", country: "United States" },
-  { city: "San Diego", region: "California", country: "United States" },
-  { city: "San Francisco", region: "California", country: "United States" },
-  { city: "Seattle", region: "Washington", country: "United States" },
-  { city: "St. Louis", region: "Missouri", country: "United States" },
-  { city: "Tampa", region: "Florida", country: "United States" },
-  { city: "Washington", region: "District of Columbia", country: "United States" },
-  { city: "Amsterdam", region: "North Holland", country: "Netherlands" },
-  { city: "Barcelona", region: "Catalonia", country: "Spain" },
-  { city: "Berlin", region: "Berlin", country: "Germany" },
-  { city: "Dubai", region: "Dubai", country: "United Arab Emirates" },
-  { city: "Dublin", region: "Leinster", country: "Ireland" },
-  { city: "Hong Kong", region: "Hong Kong", country: "Hong Kong" },
-  { city: "Lagos", region: "Lagos", country: "Nigeria" },
-  { city: "London", region: "England", country: "United Kingdom" },
-  { city: "Madrid", region: "Community of Madrid", country: "Spain" },
-  { city: "Mexico City", region: "Mexico City", country: "Mexico" },
-  { city: "Montreal", region: "Quebec", country: "Canada" },
-  { city: "Paris", region: "Île-de-France", country: "France" },
-  { city: "Rome", region: "Lazio", country: "Italy" },
-  { city: "Singapore", region: "Singapore", country: "Singapore" },
-  { city: "Sydney", region: "New South Wales", country: "Australia" },
-  { city: "Tokyo", region: "Tokyo", country: "Japan" },
-  { city: "Toronto", region: "Ontario", country: "Canada" },
-  { city: "Vancouver", region: "British Columbia", country: "Canada" },
-];
+// Server-owned catalog of known cities (seeded, plus every city any
+// restaurant added through an "Other" flow). Cached for the session.
+let placeCache: Place[] | null = null;
+let placeFetch: Promise<Place[]> | null = null;
 
-const unique = (values: string[]) => [...new Set(values)].sort((left, right) => left.localeCompare(right));
-const countries = ["United States", ...unique(places.map(place => place.country).filter(country => country !== "United States"))];
-
-function regionsFor(country: string) {
-  return country === "United States"
-    ? usRegions
-    : unique(places.filter(place => place.country === country).map(place => place.region));
+function loadPlaces(request: ApiRequest): Promise<Place[]> {
+  if (placeCache) return Promise.resolve(placeCache);
+  placeFetch ??= request<Place[]>("/v1/location-options")
+    .then((rows) => {
+      placeCache = rows;
+      return rows;
+    })
+    .catch(() => {
+      // Unreachable server: the Other flows still work; retry next mount.
+      placeFetch = null;
+      return [];
+    });
+  return placeFetch;
 }
 
-function citiesFor(country: string, region: string) {
-  return unique(places.filter(place => place.country === country && place.region === region).map(place => place.city));
+const uniqueSorted = (values: string[]) =>
+  [...new Set(values)].sort((left, right) => left.localeCompare(right));
+
+function buildCountries(places: Place[]) {
+  return [
+    "United States",
+    ...uniqueSorted(
+      places.map(place => place.country).filter(country => country !== "United States"),
+    ),
+  ];
+}
+
+function regionsFor(places: Place[], country: string) {
+  return country === "United States"
+    ? usRegions
+    : uniqueSorted(places.filter(place => place.country === country).map(place => place.region));
+}
+
+function citiesFor(places: Place[], country: string, region: string) {
+  return uniqueSorted(
+    places
+      .filter(place => place.country === country && place.region === region)
+      .map(place => place.city),
+  );
 }
 
 export function LocationPicker({
@@ -82,6 +67,7 @@ export function LocationPicker({
   country,
   onChange,
   className,
+  request,
 }: {
   id: string;
   city: string;
@@ -89,18 +75,50 @@ export function LocationPicker({
   country: string;
   onChange: (location: Location) => void;
   className?: string;
+  request: ApiRequest;
 }) {
-  const [countryChoice, setCountryChoice] = useState(() => country ? countries.includes(country) ? country : "other" : "");
-  const [regionChoice, setRegionChoice] = useState(() => region ? regionsFor(country).includes(region) ? region : "other" : "");
-  const [cityChoice, setCityChoice] = useState(() => city ? citiesFor(country, region).includes(city) ? city : "other" : "");
+  const [places, setPlaces] = useState<Place[]>(() => placeCache ?? []);
+  const countries = buildCountries(places);
 
   useEffect(() => {
-    if (country) setCountryChoice(countries.includes(country) ? country : "other");
-    if (region) setRegionChoice(regionsFor(country).includes(region) ? region : "other");
-    if (city) setCityChoice(citiesFor(country, region).includes(city) ? city : "other");
-  }, [city, region, country]);
+    let cancelled = false;
+    void loadPlaces(request).then(rows => {
+      if (!cancelled) setPlaces(rows);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [request]);
 
-  const regionLabel = countryChoice === "United States" ? "State" : countryChoice === "Canada" ? "Province" : "State / region";
+  // Before the catalog arrives, dropdown choices start blank; the effect
+  // below re-derives them once it loads.
+  const [countryChoice, setCountryChoice] = useState(() =>
+    placeCache ? (buildCountries(placeCache).includes(country) ? country : country ? "other" : "") : "",
+  );
+  const [regionChoice, setRegionChoice] = useState(() =>
+    placeCache ? (regionsFor(placeCache, country).includes(region) ? region : region ? "other" : "") : "",
+  );
+  const [cityChoice, setCityChoice] = useState(() =>
+    placeCache
+      ? citiesFor(placeCache, country, region).includes(city)
+        ? city
+        : city
+          ? "other"
+          : ""
+      : "",
+  );
+
+  // Once the catalog arrives (or props change programmatically), re-derive
+  // which choices are known so dropdowns reflect them.
+  useEffect(() => {
+    if (country) setCountryChoice(countries.includes(country) ? country : "other");
+    if (region) setRegionChoice(regionsFor(places, country).includes(region) ? region : "other");
+    if (city) setCityChoice(citiesFor(places, country, region).includes(city) ? city : "other");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [city, region, country, places]);
+
+  const regionLabel =
+    countryChoice === "United States" ? "State" : countryChoice === "Canada" ? "Province" : "State / region";
   const knownCountry = countryChoice !== "" && countryChoice !== "other";
   const knownRegion = regionChoice !== "" && regionChoice !== "other";
 
@@ -133,7 +151,7 @@ export function LocationPicker({
           onChange({ country, region: next === "other" ? "" : next, city: "" });
         }}>
           <option value="" disabled>{regionLabel}</option>
-          {regionsFor(countryChoice).map(option => <option key={option} value={option}>{option}</option>)}
+          {regionsFor(places, countryChoice).map(option => <option key={option} value={option}>{option}</option>)}
           <option value="other">Other {regionLabel.toLowerCase()}</option>
         </select>
         {regionChoice === "other" && <input aria-label={regionLabel} value={region} onChange={event => onChange({ country, region: event.target.value, city })} maxLength={100} autoComplete="address-level1" placeholder={regionLabel} required />}
@@ -149,7 +167,7 @@ export function LocationPicker({
           onChange({ country, region, city: next === "other" ? "" : next });
         }}>
           <option value="" disabled>{knownRegion ? "City" : `${regionLabel} first`}</option>
-          {citiesFor(countryChoice, regionChoice).map(option => <option key={option} value={option}>{option}</option>)}
+          {citiesFor(places, countryChoice, regionChoice).map(option => <option key={option} value={option}>{option}</option>)}
           {knownRegion && <option value="other">Other</option>}
         </select>
         {cityChoice === "other" && <input aria-label="City" value={city} onChange={event => onChange({ country, region, city: event.target.value })} maxLength={100} autoComplete="address-level2" placeholder="City" required />}
