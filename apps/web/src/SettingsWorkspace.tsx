@@ -265,7 +265,7 @@ export function SettingsWorkspace({ restaurant, request, active, onRestaurantCha
     {owner ? <form className="settings-form" onSubmit={saveRestaurant} noValidate>
       <div className="settings-fields">
         <label>Restaurant name<input required autoComplete="organization" maxLength={50} value={draft.name} onChange={event => setDraft({ ...draft, name: event.target.value })}/></label>
-        <LocationPicker id="settings-location" city={draft.city} region={draft.region} country={draft.country} onChange={location => setDraft({ ...draft, ...location })} />
+        <LocationPicker id="settings-location" request={request} city={draft.city} region={draft.region} country={draft.country} onChange={location => setDraft({ ...draft, ...location })} />
         <label>Service style<select value={draft.serviceStyle} onChange={event => setDraft({ ...draft, serviceStyle: event.target.value as ServiceStyle })}>{serviceStyles.map(style => <option key={style.value} value={style.value}>{style.label}</option>)}</select></label>
         <label>Timezone<select required value={draft.timezone} aria-describedby="timezone-help" onChange={event => setDraft({ ...draft, timezone: event.target.value })}>{timezoneOptions.map(timezone => <option key={timezone} value={timezone}>{timezone.replaceAll("_", " ")}</option>)}</select><small id="timezone-help">Choose the restaurant's local timezone. Future Today and weekly brief boundaries change; saved timestamps and records do not.</small></label>
       </div>

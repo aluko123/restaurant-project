@@ -229,7 +229,7 @@ function AuthenticatedApp() {
   if (appState.status === "loading") return <StatusPage message="Opening Parline…" />;
   if (appState.status === "error") return <ErrorPage message={appState.message} onRetry={loadApp} onSignOut={handleSignOut} />;
   if (!appState.restaurant) {
-    return <Onboarding onSignOut={handleSignOut} onCreate={(input) => request<Restaurant>("/v1/restaurants", { method: "POST", body: JSON.stringify(input) }).then((restaurant) => {
+    return <Onboarding request={request} onSignOut={handleSignOut} onCreate={(input) => request<Restaurant>("/v1/restaurants", { method: "POST", body: JSON.stringify(input) }).then((restaurant) => {
       setAppState({ status: "ready", restaurant });
       setSetupIncomplete(true);
       window.history.replaceState({}, "", "/sources");
@@ -951,7 +951,7 @@ function formatBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.max(1
 function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`)); }
 function formatMoney(value:string,currency:string){return new Intl.NumberFormat(undefined,{style:"currency",currency}).format(Number(value));}
 
-function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string; city: string; region: string; country: string; serviceStyle: ServiceStyle; timezone: string }) => Promise<void>; onSignOut: () => void }) {
+function Onboarding({ onCreate, onSignOut, request }: { onCreate: (input: { name: string; city: string; region: string; country: string; serviceStyle: ServiceStyle; timezone: string }) => Promise<void>; onSignOut: () => void; request: <T>(path: string, init?: RequestInit) => Promise<T> }) {
   const [name, setName] = useState("");
   const [city, setCity] = useState("");
   const [region, setRegion] = useState("");
@@ -977,7 +977,7 @@ function Onboarding({ onCreate, onSignOut }: { onCreate: (input: { name: string;
       <p className="brief-intro">Add the basics now. Next, choose whether you want Parline to prepare your records or guide you through setup.</p>
       <form className="onboarding-form" onSubmit={submit} noValidate>
         <div className="ledger-field"><label htmlFor="restaurant-name">Restaurant name</label><p id="name-help">Use the name your crew knows.</p><input id="restaurant-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={120} autoComplete="organization" aria-describedby="name-help form-error" required /></div>
-        <LocationPicker id="restaurant-location" className="ledger-field" city={city} region={region} country={country} onChange={location => { setCity(location.city); setRegion(location.region); setCountry(location.country); }} />
+        <LocationPicker id="restaurant-location" request={request} className="ledger-field" city={city} region={region} country={country} onChange={location => { setCity(location.city); setRegion(location.region); setCountry(location.country); }} />
         <div className="ledger-field"><label htmlFor="service-style">Service style</label><p id="style-help">Choose the closest fit. You can keep setup simple.</p><select id="service-style" value={serviceStyle} onChange={(event) => setServiceStyle(event.target.value as ServiceStyle)} aria-describedby="style-help form-error">{serviceStyles.map((style) => <option key={style.value} value={style.value}>{style.label}</option>)}</select></div>
         <div className="ledger-field"><label htmlFor="restaurant-timezone">Timezone</label><p id="timezone-help">Used for Today, count cadence, and weekly reporting.</p><select id="restaurant-timezone" value={timezone} onChange={event=>setTimezone(event.target.value)} aria-describedby="timezone-help form-error" required>{availableTimezones(timezone).map(value=><option key={value} value={value}>{value.replaceAll("_", " ")}</option>)}</select></div>
         {error && <p className="form-error" id="form-error" role="alert">{error}</p>}

@@ -4,6 +4,7 @@ mod extraction;
 mod inventory;
 mod inventory_imports;
 mod invoices;
+mod location_options;
 mod losses;
 mod menu;
 mod menu_imports;
@@ -382,6 +383,7 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/v1/order-guides/{id}/receive", post(order_guides::receive))
         .route("/v1/order-guides/{id}/cancel", post(order_guides::cancel))
         .route("/v1/loss-events", get(losses::list).post(losses::create))
+        .route("/v1/location-options", get(location_options::list))
         .route("/v1/inventory-counts/draft", get(inventory::draft))
         .route(
             "/v1/inventory-counts",
@@ -754,6 +756,13 @@ async fn create_restaurant(
         return Err(database_error(error));
     }
     tx.commit().await.map_err(database_error)?;
+    location_options::record(
+        &state,
+        input.country.as_deref().unwrap_or(""),
+        input.region.as_deref().unwrap_or(""),
+        &input.city,
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(Restaurant {

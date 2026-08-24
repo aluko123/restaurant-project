@@ -3358,3 +3358,98 @@ async fn sales_days_and_loss_events_page_with_keyset_cursors() {
 fn urlencoding_encode(value: &str) -> String {
     value.replace('+', "%2B").replace(':', "%3A")
 }
+
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn location_options_seed_and_capture_cities_added_via_other() {
+    let fixture = ApiFixture::create("location_options").await;
+    let owner_a = fixture.token("owner-a");
+    // A fresh signup: no user or membership rows exist yet.
+    let newcomer = fixture.token("owner-new");
+
+    // Sign-in required.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            None,
+            Method::GET,
+            "/v1/location-options",
+            None,
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The seeded catalog is served.
+    let options = request(
+        fixture.app.clone(),
+        Some(&owner_a),
+        Method::GET,
+        "/v1/location-options",
+        None,
+    )
+    .await;
+    assert_eq!(options.status, StatusCode::OK);
+    let rows = options.body.as_array().unwrap();
+    assert!(rows.len() >= 40);
+    assert!(rows.iter().any(|row| row["city"] == "Austin"
+        && row["region"] == "Texas"
+        && row["country"] == "United States"));
+
+    // A brand-new owner signs up with a city nobody seeded ("Other" flow).
+    let created = request(
+        fixture.app.clone(),
+        Some(&newcomer),
+        Method::POST,
+        "/v1/restaurants",
+        Some(json!({
+            "name": "Marfa Light",
+            "city": "Marfa",
+            "region": "Texas",
+            "country": "United States",
+            "serviceStyle": "fast_casual"
+        })),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+
+    // Settings path captures a custom city too.
+    let updated = request(
+        fixture.app.clone(),
+        Some(&owner_a),
+        Method::PUT,
+        "/v1/settings",
+        Some(json!({
+            "name": "Tenant A Kitchen",
+            "city": "Terlingua",
+            "region": "Texas",
+            "country": "United States",
+            "serviceStyle": "fast_casual",
+            "timezone": "America/Chicago"
+        })),
+    )
+    .await;
+    assert_eq!(updated.status, StatusCode::OK);
+
+    // Both captured cities are now visible in the dropdown data — each once.
+    let after = request(
+        fixture.app.clone(),
+        Some(&newcomer),
+        Method::GET,
+        "/v1/location-options",
+        None,
+    )
+    .await;
+    assert_eq!(after.status, StatusCode::OK);
+    let rows = after.body.as_array().unwrap();
+    for expected_city in ["Marfa", "Terlingua"] {
+        let matches = rows
+            .iter()
+            .filter(|row| row["city"] == expected_city)
+            .count();
+        assert_eq!(matches, 1, "{expected_city} should appear exactly once");
+    }
+
+    fixture.drop().await;
+}

@@ -172,6 +172,14 @@ pub(crate) async fn update(
     .map_err(database_error)?;
     transaction.commit().await.map_err(database_error)?;
 
+    crate::location_options::record(
+        &state,
+        input.country.as_deref().unwrap_or(""),
+        input.region.as_deref().unwrap_or(""),
+        &input.city,
+    )
+    .await;
+
     tracing::info!(
         restaurant_id = %actor.restaurant_id,
         actor_user_id = %actor.user_id,
