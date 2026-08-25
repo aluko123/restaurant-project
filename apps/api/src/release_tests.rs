@@ -4009,3 +4009,83 @@ async fn clover_sync_imports_menu_and_paid_orders_through_the_worker() {
 
     fixture.drop().await;
 }
+
+/// Regression for a production 500: the review endpoint must return the
+/// import (including its job's last_error) plus its extracted items.
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn menu_import_review_returns_items_and_last_error() {
+    let fixture = ApiFixture::create("menu_review").await;
+    let owner = fixture.token("owner-a");
+
+    let import_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO menu_imports
+         (id,restaurant_id,uploaded_by,original_filename,content_type,size_bytes,object_key,status)
+         VALUES($1,$2,
+           (SELECT id FROM users WHERE auth_subject='owner-a'),
+           'menu.jpg','image/jpeg',10,'unused','needs_review')",
+    )
+    .bind(import_id)
+    .bind(fixture.ids.restaurant_a)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO menu_import_jobs(menu_import_id,status) VALUES($1,'failed')")
+        .bind(import_id)
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE menu_import_jobs SET last_error='Extraction failed.' WHERE menu_import_id=$1",
+    )
+    .bind(import_id)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO menu_import_items
+         (id,menu_import_id,name,category,selling_price,currency,position)
+         VALUES($1,$2,'Cold Brew','Drinks',5.50,'USD',1)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(import_id)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+
+    // Tenant isolation first: another restaurant must not see it.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&fixture.token("owner-b")),
+            Method::GET,
+            &format!("/v1/menu-imports/{import_id}"),
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+
+    let review = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        &format!("/v1/menu-imports/{import_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(review.status, StatusCode::OK);
+    assert_eq!(review.body["import"]["status"], json!("needs_review"));
+    assert_eq!(
+        review.body["import"]["lastError"],
+        json!("Extraction failed.")
+    );
+    let items = review.body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], json!("Cold Brew"));
+    assert_eq!(items[0]["sellingPrice"], json!("5.5000"));
+
+    fixture.drop().await;
+}
