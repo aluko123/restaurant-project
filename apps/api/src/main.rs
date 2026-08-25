@@ -1,6 +1,7 @@
 mod auth;
 mod clover;
 mod costing;
+mod count_templates;
 mod extraction;
 mod inventory;
 mod inventory_imports;
@@ -405,6 +406,11 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/v1/order-guides/{id}/cancel", post(order_guides::cancel))
         .route("/v1/loss-events", get(losses::list).post(losses::create))
         .route("/v1/location-options", get(location_options::list))
+        .route(
+            "/v1/count-templates",
+            get(count_templates::list).post(count_templates::create),
+        )
+        .route("/v1/count-templates/{id}", delete(count_templates::delete))
         .route("/v1/inventory-counts/draft", get(inventory::draft))
         .route(
             "/v1/inventory-counts",

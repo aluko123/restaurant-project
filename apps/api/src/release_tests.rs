@@ -231,7 +231,12 @@ async fn request(
     let body = if bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes).expect("response was not JSON")
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "response was not JSON ({status}): {error}: {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
     };
     ApiResponse { status, body }
 }
@@ -4086,6 +4091,212 @@ async fn menu_import_review_returns_items_and_last_error() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["name"], json!("Cold Brew"));
     assert_eq!(items[0]["sellingPrice"], json!("5.5000"));
+
+    fixture.drop().await;
+}
+
+/// Count templates: manager-gated CRUD, unique names, tenant isolation, and
+/// starting a focused count straight from a saved template.
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn count_templates_seed_focused_counts_for_their_restaurant() {
+    let fixture = ApiFixture::create("count_templates").await;
+    let owner = fixture.token("owner-a");
+    let staff = fixture.token("staff-a");
+    let other = fixture.token("owner-b");
+
+    let item_ids: Vec<&str> = Vec::from(["Vodka", "Gin", "Limes"]);
+    let mut item_uuids: Vec<Uuid> = Vec::new();
+    for name in &item_ids {
+        let id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO inventory_items(id,restaurant_id,name,count_unit)
+             VALUES($1,$2,$3,'each') RETURNING id",
+        )
+        .bind(Uuid::now_v7())
+        .bind(fixture.ids.restaurant_a)
+        .bind(name)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        item_uuids.push(id);
+    }
+
+    // Staff cannot manage templates.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&staff),
+            Method::POST,
+            "/v1/count-templates",
+            Some(json!({"name": "Weekly bar", "itemIds": item_uuids})),
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    let created = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/count-templates",
+        Some(json!({"name": "  Weekly bar ", "itemIds": item_uuids})),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let template_id = created.body["id"].as_str().unwrap().to_owned();
+    assert_eq!(created.body["name"], json!("Weekly bar"));
+    assert_eq!(created.body["itemCount"], json!(3));
+
+    // Duplicate names are rejected case-insensitively.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::POST,
+            "/v1/count-templates",
+            Some(json!({"name": "weekly BAR", "itemIds": [item_uuids[0]]})),
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    // Inactive or foreign items are rejected at save time.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::POST,
+            "/v1/count-templates",
+            Some(json!({"name": "Ghost", "itemIds": [Uuid::now_v7()]})),
+        )
+        .await
+        .status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let list = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/count-templates",
+        None,
+    )
+    .await;
+    assert_eq!(list.status, StatusCode::OK);
+    let rows = list.body.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["itemCount"], json!(3));
+    assert_eq!(rows[0]["previewNames"], json!(["Vodka", "Gin", "Limes"]));
+    // Tenant isolation on the list.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&other),
+            Method::GET,
+            "/v1/count-templates",
+            None,
+        )
+        .await
+        .body
+        .as_array()
+        .unwrap()
+        .len(),
+        0
+    );
+
+    // Start a focused count straight from the template.
+    let started = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        Some(json!({"templateId": template_id})),
+    )
+    .await;
+    assert_eq!(started.status, StatusCode::CREATED);
+    assert_eq!(started.body["scope"], json!("focused"));
+    assert_eq!(started.body["entries"].as_array().unwrap().len(), 3);
+    // A template cannot be combined with explicit items.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::POST,
+            "/v1/inventory-counts",
+            Some(json!({"templateId": template_id, "itemIds": [item_uuids[0]]})),
+        )
+        .await
+        .status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    // Another tenant's template is invisible.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&other),
+            Method::POST,
+            "/v1/inventory-counts",
+            Some(json!({"templateId": template_id})),
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+
+    // Deactivating an item doesn't break the next template start; the count
+    // just covers what remains.
+    sqlx::query(
+        "UPDATE inventory_count_sessions
+         SET status='completed',completed_at=NOW(),
+             completed_by=(SELECT id FROM users WHERE auth_subject='owner-a')
+         WHERE restaurant_id=$1 AND status='draft'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE inventory_items SET active=false WHERE id=$1")
+        .bind(item_uuids[2])
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    let resumed = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::POST,
+        "/v1/inventory-counts",
+        Some(json!({"templateId": template_id})),
+    )
+    .await;
+    assert_eq!(resumed.status, StatusCode::CREATED);
+    assert_eq!(resumed.body["entries"].as_array().unwrap().len(), 2);
+
+    // Delete: owner can, other tenant gets a clean 404.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::DELETE,
+            &format!("/v1/count-templates/{template_id}"),
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&other),
+            Method::DELETE,
+            &format!("/v1/count-templates/{template_id}"),
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
 
     fixture.drop().await;
 }
