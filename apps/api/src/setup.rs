@@ -68,10 +68,12 @@ struct EvidenceRow {
 }
 
 #[derive(Clone, sqlx::FromRow)]
-struct SquareRow {
+struct ConnectorStatus {
     status: String,
     last_success_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
+    menu_last_success_at: Option<DateTime<Utc>>,
+    sales_last_success_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize)]
@@ -162,7 +164,7 @@ pub(crate) struct UpdateStream {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SelectSquare {
+pub(crate) struct SelectConnector {
     selected: bool,
 }
 
@@ -244,7 +246,7 @@ pub(crate) async fn put_connector(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(provider): Path<String>,
-    Json(input): Json<SelectSquare>,
+    Json(input): Json<SelectConnector>,
 ) -> Result<Json<SetupResponse>, ApiError> {
     if !CONNECTOR_PROVIDERS.contains(&provider.as_str()) {
         return Err(ApiError(StatusCode::NOT_FOUND, "Unknown connector."));
@@ -527,34 +529,25 @@ async fn load(state: &AppState, restaurant_id: Uuid) -> Result<SetupResponse, Ap
     .fetch_one(&state.pool)
     .await
     .map_err(database_error)?;
-    let square = sqlx::query_as::<_, SquareRow>(
-        "SELECT status,last_success_at,last_error FROM source_connections
-         WHERE restaurant_id=$1 AND provider='square' ORDER BY updated_at DESC LIMIT 1",
-    )
-    .bind(restaurant_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(database_error)?;
-    let square_selected = selections
-        .iter()
-        .filter(|row| {
-            matches!(row.stream.as_str(), "menu" | "sales")
-                && row.method == "connector"
-                && row.connector_provider.as_deref() == Some("square")
-        })
-        .count()
-        == 2;
+    let mut connections: std::collections::HashMap<&'static str, Option<ConnectorStatus>> =
+        std::collections::HashMap::new();
+    for provider in CONNECTOR_PROVIDERS {
+        let row = sqlx::query_as::<_, ConnectorStatus>(
+            "SELECT status,last_success_at,last_error,
+                    menu_last_success_at,sales_last_success_at
+             FROM source_connections
+             WHERE restaurant_id=$1 AND provider=$2",
+        )
+        .bind(restaurant_id)
+        .bind(provider)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(database_error)?;
+        connections.insert(provider, row);
+    }
     let streams = STREAMS
         .into_iter()
-        .map(|stream| {
-            build_stream(
-                stream,
-                &selections,
-                &evidence,
-                square.as_ref(),
-                state.square.is_some(),
-            )
-        })
+        .map(|stream| build_stream(stream, &selections, &evidence, &connections, state))
         .collect();
     let activation_state = if evidence.verified_count_count > 0 {
         "active"
@@ -599,32 +592,75 @@ async fn load(state: &AppState, restaurant_id: Uuid) -> Result<SetupResponse, Ap
         activation_state,
         first_count_handoff,
         streams,
-        connectors: vec![ConnectorView {
-            provider: "square",
-            supported: true,
-            configured: state.square.is_some(),
-            selected: square_selected,
-            capabilities: ["menu", "sales"],
-            status: square.map(|row| row.status),
-        }],
+        connectors: CONNECTOR_PROVIDERS
+            .iter()
+            .map(|provider| ConnectorView {
+                provider,
+                supported: true,
+                configured: server_configured(state, provider),
+                selected: connector_selected(&selections, provider),
+                capabilities: ["menu", "sales"],
+                status: connections
+                    .get(provider)
+                    .and_then(|row| row.as_ref())
+                    .map(|row| row.status.clone()),
+            })
+            .collect(),
     })
+}
+
+/// Whether this server has credentials for the given connector provider.
+fn server_configured(state: &AppState, provider: &str) -> bool {
+    match provider {
+        "square" => state.square.is_some(),
+        "clover" => state.clover.is_some(),
+        _ => false,
+    }
+}
+
+/// Both menu and sales streams are owned by this provider's connector.
+fn connector_selected(selections: &[SelectionRow], provider: &str) -> bool {
+    selections
+        .iter()
+        .filter(|row| {
+            matches!(row.stream.as_str(), "menu" | "sales")
+                && row.method == "connector"
+                && row.connector_provider.as_deref() == Some(provider)
+        })
+        .count()
+        == 2
 }
 
 fn build_stream(
     stream: &'static str,
     selections: &[SelectionRow],
     evidence: &EvidenceRow,
-    square: Option<&SquareRow>,
-    square_configured: bool,
+    connections: &std::collections::HashMap<&'static str, Option<ConnectorStatus>>,
+    state: &AppState,
 ) -> SetupStream {
     let row = selections.iter().find(|row| row.stream == stream);
-    let data = stream_evidence(stream, evidence, square);
-    let (lifecycle, issue) = lifecycle(row, &data, square, square_configured);
+    // The connector owning this stream (connector method only) determines
+    // whose connection status and sync outcomes the stream reports.
+    let provider = row
+        .filter(|row| row.method == "connector")
+        .and_then(|row| row.connector_provider.as_deref());
+    let connection: Option<&ConnectorStatus> = provider
+        .and_then(|provider| connections.get(provider))
+        .and_then(|row| row.as_ref());
+    let data = stream_evidence(stream, evidence, connection);
+    let (lifecycle, issue) = lifecycle(
+        row,
+        &data,
+        connection,
+        provider.is_some_and(|provider| server_configured(state, provider)),
+    );
     let next_action = match lifecycle {
         "not_started" => Some("select_method"),
         "needs_attention" => Some("resolve_issue"),
         "in_progress" if row.is_some_and(|row| row.owner == "parline") => Some("wait_for_parline"),
-        "in_progress" if row.is_some_and(|row| row.method == "connector") => Some("connect_square"),
+        "in_progress" if row.is_some_and(|row| row.method == "connector") => {
+            Some("connect_connector")
+        }
         "in_progress" => Some("add_records"),
         _ => None,
     };
@@ -647,13 +683,14 @@ fn build_stream(
 fn stream_evidence(
     stream: &str,
     evidence: &EvidenceRow,
-    square: Option<&SquareRow>,
+    connection: Option<&ConnectorStatus>,
 ) -> EvidenceView {
     match stream {
         "menu" => EvidenceView {
             record_count: evidence.menu_count,
             latest_at: evidence.menu_latest_at,
-            last_successful_sync_at: square.and_then(|row| row.last_success_at),
+            last_successful_sync_at: connection
+                .and_then(|row| row.menu_last_success_at.or(row.last_success_at)),
             backlog: BacklogView {
                 pending_count: evidence.menu_pending_count + evidence.source_sync_pending_count,
                 failed_count: evidence.menu_failed_count,
@@ -664,7 +701,8 @@ fn stream_evidence(
         "sales" => EvidenceView {
             record_count: evidence.sales_count,
             latest_business_date: evidence.last_sales_date,
-            last_successful_sync_at: square.and_then(|row| row.last_success_at),
+            last_successful_sync_at: connection
+                .and_then(|row| row.sales_last_success_at.or(row.last_success_at)),
             backlog: BacklogView {
                 pending_count: evidence.source_sync_pending_count,
                 ..Default::default()
@@ -701,8 +739,8 @@ fn stream_evidence(
 fn lifecycle(
     selection: Option<&SelectionRow>,
     evidence: &EvidenceView,
-    square: Option<&SquareRow>,
-    square_configured: bool,
+    connection: Option<&ConnectorStatus>,
+    configured: bool,
 ) -> (&'static str, Option<IssueView>) {
     let Some(selection) = selection else {
         return ("not_started", None);
@@ -720,19 +758,20 @@ fn lifecycle(
             None,
         );
     }
-    if !square_configured {
+    let label = provider_label(selection.connector_provider.as_deref().unwrap_or(""));
+    if !configured {
         return (
             "needs_attention",
             Some(IssueView {
                 code: "connector_unavailable",
-                message: "Square is unavailable.".into(),
+                message: format!("{label} is unavailable."),
             }),
         );
     }
     if evidence.backlog.pending_count > 0 {
         return ("in_progress", None);
     }
-    match square {
+    match connection {
         Some(row) if row.status == "connected" && row.last_success_at.is_some() => ("ready", None),
         Some(row)
             if matches!(
@@ -751,10 +790,11 @@ fn lifecycle(
                     message: row
                         .last_error
                         .clone()
-                        .unwrap_or_else(|| "Square needs attention.".into()),
+                        .unwrap_or_else(|| format!("{label} needs attention.")),
                 }),
             )
         }
+        // pending/importing/syncing and no-connection all mean work is owed.
         _ => ("in_progress", None),
     }
 }
@@ -779,7 +819,7 @@ fn validate_stream(stream: &str, mut input: UpdateStream) -> Result<UpdateStream
     if input.method == "connector" {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "Use Square selection.",
+            "Use connector selection.",
         ));
     }
     if input.connector_provider.is_some()

@@ -171,7 +171,7 @@ impl ApiFixture {
                 storage: ObjectStorage::inert_for_tests(),
                 gemini: crate::extraction::GeminiClient::inert_for_tests(),
                 workos: WorkosClient::mock(workos.clone()),
-                square: None,
+                square: crate::square::SquareConfig::from_env("http://localhost:5173"),
                 clover: crate::clover::CloverConfig::from_env("http://localhost:5173"),
             },
             HeaderValue::from_static("http://localhost:5173"),
@@ -3483,6 +3483,20 @@ async fn clover_oauth_connects_and_disconnects_a_merchant() {
     let owner = fixture.token("owner-a");
     let other = fixture.token("owner-b");
 
+    // The connector must own menu+sales before OAuth completes.
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            "/v1/setup/connectors/clover",
+            Some(json!({"selected": true})),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+
     assert_eq!(
         request(
             fixture.app.clone(),
@@ -3540,6 +3554,13 @@ async fn clover_oauth_connects_and_disconnects_a_merchant() {
     assert_eq!(connection.0, "connected");
     assert_eq!(connection.1, "MCH-1");
     assert!(connection.2);
+    // The OAuth state link is single-use.
+    let leftover_states: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_states WHERE provider='clover'")
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(leftover_states, 0);
 
     // Tenant isolation: another restaurant cannot see or disconnect it.
     assert_eq!(
@@ -3577,6 +3598,198 @@ async fn clover_oauth_connects_and_disconnects_a_merchant() {
     .unwrap();
     assert_eq!(after.0, "disconnected");
     assert!(after.1 && after.2);
+
+    fixture.drop().await;
+}
+
+/// Route-level Square lifecycle: selecting the connector, completing OAuth
+/// lands as `importing` (not `connected`) with a queued full sync, the setup
+/// payload reports both providers neutrally, and disconnect tears it down.
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn square_oauth_lands_importing_and_reports_both_connectors() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Sandbox-only override lets the connector talk to the mock server.
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe {
+        std::env::set_var("SQUARE_APPLICATION_ID", "test-app-id");
+        std::env::set_var("SQUARE_APPLICATION_SECRET", "test-app-secret");
+        std::env::set_var(
+            "SQUARE_REDIRECT_URI",
+            "http://localhost:8080/v1/connections/square/callback",
+        );
+        std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
+        std::env::set_var("CONNECTIONS_TOKEN_KEY", "release-test-token-key");
+    }
+    let server = MockServer::start().await;
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe {
+        std::env::set_var("SQUARE_API_BASE_URL", server.uri());
+    }
+
+    // Earlier release tests in this single-threaded binary may have configured
+    // Clover; this test asserts Clover starts unconfigured. Clear before the
+    // fixture snapshots connector configs into the router.
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe {
+        std::env::remove_var("CLOVER_APPLICATION_ID");
+        std::env::remove_var("CLOVER_APPLICATION_SECRET");
+        std::env::remove_var("CLOVER_REDIRECT_URI");
+        std::env::remove_var("CLOVER_API_BASE_URL");
+    }
+    let fixture = ApiFixture::create("square_oauth_lifecycle").await;
+    let owner = fixture.token("owner-a");
+
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            "/v1/setup/connectors/square",
+            Some(json!({"selected": true})),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "square-access",
+            "refresh_token": "square-refresh",
+            "merchant_id": "SQ-MERCH-1"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/locations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "locations": [{"id": "LOC-1", "status": "ACTIVE"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let authorize = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/connections/square/authorize",
+        None,
+    )
+    .await;
+    assert_eq!(authorize.status, StatusCode::OK);
+    let url = authorize.body["url"].as_str().unwrap().to_owned();
+    assert!(url.contains("/oauth2/authorize"));
+    // state= sits before redirect_uri= in the Square authorize URL.
+    let state = url
+        .split("state=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let callback = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        &format!("/v1/connections/square/callback?code=auth-code&state={state}"),
+        None,
+    )
+    .await;
+    // Success and failure both 307 back to /sources; the DB assertions below
+    // prove this one took the success path.
+    assert_eq!(callback.status, StatusCode::TEMPORARY_REDIRECT);
+    let connection = sqlx::query_as::<_, (String, String, bool, bool)>(
+        "SELECT status,external_merchant_id,(access_token_encrypted IS NOT NULL),
+                (refresh_token_encrypted IS NOT NULL)
+         FROM source_connections WHERE restaurant_id=$1 AND provider='square'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    // OAuth completion imports until the first sync succeeds.
+    assert_eq!(connection.0, "importing");
+    assert_eq!(connection.1, "SQ-MERCH-1");
+    assert!(connection.2 && connection.3);
+    let leftover_states: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_states WHERE provider='square'")
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(leftover_states, 0);
+    let queued_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM source_sync_runs run
+         JOIN source_connections connection ON connection.id=run.connection_id
+         WHERE connection.restaurant_id=$1 AND connection.provider='square'
+           AND run.kind='full' AND run.status='queued'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(queued_runs, 1);
+
+    // Provider-neutral setup payload: both connectors reported, Square's
+    // streams still owe their first sync.
+    let plan = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/setup",
+        None,
+    )
+    .await;
+    assert_eq!(plan.status, StatusCode::OK);
+    let connectors = plan.body["connectors"].as_array().unwrap();
+    assert_eq!(connectors.len(), 2);
+    let square = connectors
+        .iter()
+        .find(|c| c["provider"] == "square")
+        .unwrap();
+    assert_eq!(square["configured"], json!(true));
+    assert_eq!(square["selected"], json!(true));
+    assert_eq!(square["status"], json!("importing"));
+    let clover = connectors
+        .iter()
+        .find(|c| c["provider"] == "clover")
+        .unwrap();
+    assert_eq!(clover["configured"], json!(false));
+    assert_eq!(clover["selected"], json!(false));
+    let menu_stream = plan.body["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stream"] == "menu")
+        .unwrap();
+    assert_eq!(menu_stream["lifecycle"], json!("in_progress"));
+    assert_eq!(menu_stream["nextAction"], json!("connect_connector"));
+
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::POST,
+            "/v1/connections/square/disconnect",
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    let after: String = sqlx::query_scalar(
+        "SELECT status FROM source_connections WHERE restaurant_id=$1 AND provider='square'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(after, "disconnected");
 
     fixture.drop().await;
 }

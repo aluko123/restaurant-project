@@ -92,11 +92,11 @@ Bookkeeping systems are initially export destinations rather than equivalent POS
 
 ### Phase 3 — Connector boundary and Square lifecycle
 
-- [ ] Generalize provider-neutral connection APIs and frontend state.
-- [ ] Preserve Square authorization and sync behavior as the first adapter.
-- [ ] Report menu and sales sync outcomes separately.
-- [ ] Treat OAuth completion as importing until initial sync succeeds.
-- [ ] Remove server configuration messaging from unrelated restaurants.
+- [x] Generalize provider-neutral connection APIs and frontend state.
+- [x] Preserve Square authorization and sync behavior as the first adapter.
+- [x] Report menu and sales sync outcomes separately.
+- [x] Treat OAuth completion as importing until initial sync succeeds.
+- [x] Remove server configuration messaging from unrelated restaurants.
 
 ### Phase 4 — Invoice normalization
 
