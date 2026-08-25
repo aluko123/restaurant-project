@@ -205,7 +205,10 @@ async fn main() -> Result<()> {
     for worker_index in 0..3 {
         tokio::spawn(square::run_worker(
             pool.clone(),
-            square_config.clone(),
+            square::SyncConfigs {
+                square: square_config.clone(),
+                clover: clover_config.clone(),
+            },
             worker_index == 0,
         ));
     }
@@ -378,6 +381,7 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/v1/connections/clover/status", get(clover::status))
         .route("/v1/connections/clover/authorize", get(clover::authorize))
         .route("/v1/connections/clover/callback", get(clover::callback))
+        .route("/v1/connections/clover/sync", post(clover::sync_now))
         .route(
             "/v1/connections/clover/disconnect",
             post(clover::disconnect),

@@ -3551,9 +3551,21 @@ async fn clover_oauth_connects_and_disconnects_a_merchant() {
     .fetch_one(&fixture.database.pool)
     .await
     .unwrap();
-    assert_eq!(connection.0, "connected");
+    assert_eq!(connection.0, "importing");
     assert_eq!(connection.1, "MCH-1");
     assert!(connection.2);
+    // The queued first sync is what flips importing to connected later.
+    let queued_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM source_sync_runs run
+         JOIN source_connections connection ON connection.id=run.connection_id
+         WHERE connection.restaurant_id=$1 AND connection.provider='clover'
+           AND run.kind='full' AND run.status='queued'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(queued_runs, 1);
     // The OAuth state link is single-use.
     let leftover_states: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM oauth_states WHERE provider='clover'")
@@ -3790,6 +3802,210 @@ async fn square_oauth_lands_importing_and_reports_both_connectors() {
     .await
     .unwrap();
     assert_eq!(after, "disconnected");
+
+    fixture.drop().await;
+}
+
+/// Drives the full Clover pipeline through the shared worker: OAuth lands as
+/// `importing`, the queued full run claims, menu items and paid orders land
+/// with per-stream success stamps, and the connection flips to `connected`.
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn clover_sync_imports_menu_and_paid_orders_through_the_worker() {
+    use crate::square::{SyncConfigs, claim_job, process_job};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe {
+        std::env::set_var("CLOVER_APPLICATION_ID", "test-app-id");
+        std::env::set_var("CLOVER_APPLICATION_SECRET", "test-app-secret");
+        std::env::set_var(
+            "CLOVER_REDIRECT_URI",
+            "http://localhost:8080/v1/connections/clover/callback",
+        );
+        std::env::set_var("CLOVER_ENVIRONMENT", "sandbox");
+        std::env::set_var("CONNECTIONS_TOKEN_KEY", "release-test-token-key");
+    }
+    let server = MockServer::start().await;
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe {
+        std::env::set_var("CLOVER_API_BASE_URL", server.uri());
+    }
+
+    let fixture = ApiFixture::create("clover_sync_pipeline").await;
+    let owner = fixture.token("owner-a");
+
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::PUT,
+            "/v1/setup/connectors/clover",
+            Some(json!({"selected": true})),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/oauth/v2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "clover-access",
+            "refresh_token": "clover-refresh"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v3/merchants/MCH-1/categories"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "elements": [{"id": "CAT-1", "name": "Beverages"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v3/merchants/MCH-1/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "elements": [{
+                "id": "ITEM-1", "name": "Cold Brew", "price": 550,
+                "hidden": false,
+                "categories": [{"id": "CAT-1"}]
+            }]
+        })))
+        .mount(&server)
+        .await;
+    let created_ms = (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp_millis();
+    Mock::given(method("GET"))
+        .and(path("/v3/merchants/MCH-1/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "elements": [
+                {
+                    "id": "ORD-PAID", "state": "PAID", "createdTime": created_ms,
+                    "lineItems": {"elements": [
+                        {"item": {"id": "ITEM-1"}, "price": 550, "unitQty": "2"},
+                        {"item": {"id": "GONE-ITEM"}, "price": 300}
+                    ]}
+                },
+                {
+                    "id": "ORD-OPEN", "state": "OPEN", "createdTime": created_ms,
+                    "lineItems": {"elements": [
+                        {"item": {"id": "ITEM-1"}, "price": 550}
+                    ]}
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let authorize = request(
+        fixture.app.clone(),
+        Some(&owner),
+        Method::GET,
+        "/v1/connections/clover/authorize",
+        None,
+    )
+    .await;
+    assert_eq!(authorize.status, StatusCode::OK);
+    let url = authorize.body["url"].as_str().unwrap().to_owned();
+    let state = url.rsplit("state=").next().unwrap().to_owned();
+    assert_eq!(
+        request(
+            fixture.app.clone(),
+            Some(&owner),
+            Method::GET,
+            &format!(
+                "/v1/connections/clover/callback?merchant_id=MCH-1&code=auth-code&state={state}"
+            ),
+            None,
+        )
+        .await
+        .status,
+        StatusCode::TEMPORARY_REDIRECT
+    );
+    let (connection_id, status): (Uuid, String) = sqlx::query_as(
+        "SELECT id,status FROM source_connections
+         WHERE restaurant_id=$1 AND provider='clover'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "importing");
+
+    // The shared worker claims the queued full run and processes it against
+    // the mock Clover API.
+    let configs = SyncConfigs {
+        square: None,
+        clover: crate::clover::CloverConfig::from_env("http://localhost:5173"),
+    };
+    let job = claim_job(&fixture.database.pool)
+        .await
+        .unwrap()
+        .expect("queued Clover run should be claimable");
+    process_job(&fixture.database.pool, &configs, job)
+        .await
+        .unwrap();
+
+    let after = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >(
+        "SELECT status,menu_last_success_at,sales_last_success_at
+         FROM source_connections WHERE id=$1",
+    )
+    .bind(connection_id)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    // First sync succeeded: importing flips to connected and each stream
+    // reports its own success.
+    assert_eq!(after.0, "connected");
+    assert!(after.1.is_some() && after.2.is_some());
+
+    let item = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT name,category FROM menu_items
+         WHERE restaurant_id=$1 AND external_source='clover' AND external_id='ITEM-1'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(item.0, "Cold Brew");
+    assert_eq!(item.1.as_deref(), Some("Beverages"));
+
+    let run_stats: Value = sqlx::query_scalar(
+        "SELECT stats FROM source_sync_runs WHERE connection_id=$1 AND status='succeeded'",
+    )
+    .bind(connection_id)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(run_stats["menu"]["upserted"], json!(1));
+    assert_eq!(run_stats["sales"]["ordersSeen"], json!(2));
+    // The OPEN order's line is never counted; only the paid one is.
+    assert_eq!(run_stats["sales"]["linesMatched"], json!(1));
+    assert_eq!(run_stats["sales"]["linesSkipped"], json!(1));
+    assert_eq!(run_stats["sales"]["daysWritten"], json!(1));
+
+    let day = sqlx::query_as::<_, (String, BigDecimal, Option<BigDecimal>, Option<String>)>(
+        "SELECT day.external_source,line.quantity,line.reported_net_sales,line.currency
+         FROM sales_days day
+         JOIN sales_lines line ON line.sales_day_id=day.id
+         WHERE day.restaurant_id=$1 AND day.external_source='clover'",
+    )
+    .bind(fixture.ids.restaurant_a)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(day.0, "clover");
+    assert_eq!(day.1.to_string(), "2");
+    assert_eq!(day.2, Some(decimal("11")));
+    assert_eq!(day.3.as_deref(), Some("USD"));
 
     fixture.drop().await;
 }

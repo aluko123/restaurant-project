@@ -23,12 +23,13 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::setup::CONNECTOR_PROVIDERS;
 use crate::{ApiError, AppState, authenticated_subject, database_error};
 
 const PROVIDER: &str = "square";
 const SQUARE_VERSION: &str = "2025-01-23";
-const MENU_NAME_MAX: usize = 50;
-const MENU_CATEGORY_MAX: usize = 20;
+pub(crate) const MENU_NAME_MAX: usize = 50;
+pub(crate) const MENU_CATEGORY_MAX: usize = 20;
 const INITIAL_SALES_DAYS: i64 = 90;
 
 #[derive(Clone)]
@@ -152,7 +153,7 @@ pub(crate) fn encrypt_secret(key: &[u8; 32], plain: &str) -> Result<String, ApiE
     Ok(B64.encode(out))
 }
 
-fn decrypt_secret(key: &[u8; 32], encoded: &str) -> Result<String, ApiError> {
+pub(crate) fn decrypt_secret(key: &[u8; 32], encoded: &str) -> Result<String, ApiError> {
     let bytes = B64.decode(encoded).map_err(|_| encrypt_error())?;
     if bytes.len() < 13 {
         return Err(encrypt_error());
@@ -741,18 +742,20 @@ pub(crate) async fn disconnect(
 }
 
 #[derive(sqlx::FromRow)]
-struct ConnectionRow {
-    id: Uuid,
+pub(crate) struct ConnectionRow {
+    pub(crate) id: Uuid,
     #[allow(dead_code)]
-    restaurant_id: Uuid,
+    pub(crate) restaurant_id: Uuid,
+    pub(crate) provider: String,
     #[allow(dead_code)]
-    status: String,
-    external_location_id: Option<String>,
-    access_token_encrypted: Option<String>,
-    refresh_token_encrypted: Option<String>,
-    access_token_expires_at: Option<DateTime<Utc>>,
+    pub(crate) status: String,
+    pub(crate) external_merchant_id: Option<String>,
+    pub(crate) external_location_id: Option<String>,
+    pub(crate) access_token_encrypted: Option<String>,
+    pub(crate) refresh_token_encrypted: Option<String>,
+    pub(crate) access_token_expires_at: Option<DateTime<Utc>>,
     #[allow(dead_code)]
-    last_success_at: Option<DateTime<Utc>>,
+    pub(crate) last_success_at: Option<DateTime<Utc>>,
 }
 
 #[derive(sqlx::FromRow, Debug)]
@@ -769,9 +772,17 @@ const AUTO_SYNC_INTERVAL_MINUTES: i64 = 30;
 /// How often the worker looks for connections whose auto-sync is due.
 const AUTO_SYNC_TICK_SECS: u64 = 60;
 
-pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>, runs_scheduler: bool) {
-    let Some(config) = config else {
-        tracing::info!("Square sync worker idle (not configured)");
+/// Per-provider connector configs the sync workers need. A provider whose
+/// config is absent simply has no runs to process.
+#[derive(Clone, Default)]
+pub(crate) struct SyncConfigs {
+    pub(crate) square: Option<SquareConfig>,
+    pub(crate) clover: Option<crate::clover::CloverConfig>,
+}
+
+pub(crate) async fn run_worker(pool: PgPool, configs: SyncConfigs, runs_scheduler: bool) {
+    if configs.square.is_none() && configs.clover.is_none() {
+        tracing::info!("Sync worker idle (no connectors configured)");
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
@@ -789,21 +800,21 @@ pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>, runs_
             last_tick = tokio::time::Instant::now();
             match enqueue_due_auto_syncs(&pool).await {
                 Ok(count) if count > 0 => {
-                    tracing::info!(enqueued = count, "scheduled automatic Square syncs");
+                    tracing::info!(enqueued = count, "scheduled automatic source syncs");
                 }
                 Ok(_) => {}
-                Err(error) => tracing::error!(%error, "Square auto-sync scheduling failed"),
+                Err(error) => tracing::error!(%error, "auto-sync scheduling failed"),
             }
         }
         match claim_job(&pool).await {
             Ok(Some(job)) => {
-                if let Err(error) = process_job(&pool, &config, job).await {
-                    tracing::error!(%error, "Square sync job failed");
+                if let Err(error) = process_job(&pool, &configs, job).await {
+                    tracing::error!(%error, "sync job failed");
                 }
             }
             Ok(None) => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
             Err(error) => {
-                tracing::error!(%error, "Square sync claim failed");
+                tracing::error!(%error, "sync claim failed");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }
@@ -815,18 +826,22 @@ pub(crate) async fn run_worker(pool: PgPool, config: Option<SquareConfig>, runs_
 // most one queued-or-running run per connection, so overlapping worker ticks
 // cannot double-enqueue.
 async fn enqueue_due_auto_syncs(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let providers: Vec<String> = CONNECTOR_PROVIDERS
+        .iter()
+        .map(|p| (*p).to_owned())
+        .collect();
     let mut tx = pool.begin().await?;
     let inserted = sqlx::query(
         "INSERT INTO source_sync_runs(id,connection_id,restaurant_id,kind,status)
          SELECT gen_random_uuid(), connection.id, connection.restaurant_id, 'incremental', 'queued'
          FROM source_connections connection
-         WHERE connection.provider=$1
+         WHERE connection.provider = ANY($1)
            AND connection.status='connected'
            AND (SELECT COUNT(*) FROM restaurant_setup_streams setup
                 WHERE setup.restaurant_id=connection.restaurant_id
                   AND setup.stream IN ('menu','sales')
                   AND setup.method='connector'
-                  AND setup.connector_provider='square')=2
+                  AND setup.connector_provider=connection.provider)=2
            AND EXISTS (SELECT 1 FROM source_sync_runs done
                        WHERE done.connection_id=connection.id AND done.status='succeeded')
            AND COALESCE((SELECT MAX(run.created_at) FROM source_sync_runs run
@@ -834,7 +849,7 @@ async fn enqueue_due_auto_syncs(pool: &PgPool) -> Result<u64, sqlx::Error> {
                         '-infinity'::timestamptz) <= NOW() - make_interval(mins => $2::int)
          ON CONFLICT DO NOTHING",
     )
-    .bind(PROVIDER)
+    .bind(&providers)
     .bind(AUTO_SYNC_INTERVAL_MINUTES)
     .execute(&mut *tx)
     .await?
@@ -843,10 +858,10 @@ async fn enqueue_due_auto_syncs(pool: &PgPool) -> Result<u64, sqlx::Error> {
     Ok(inserted)
 }
 
-async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
+pub(crate) async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query(
-        "UPDATE source_sync_runs SET status='failed',error='Square sync timed out.',
+        "UPDATE source_sync_runs SET status='failed',error='The sync timed out.',
            finished_at=NOW(),claim_token=NULL,lease_expires_at=NULL
          WHERE status='running' AND claim_token IS NOT NULL AND lease_expires_at<NOW()",
     )
@@ -863,10 +878,9 @@ async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
                          AND run.status IN ('succeeded','failed')
                        ORDER BY run.finished_at DESC NULLS LAST LIMIT 1),
            updated_at=NOW()
-          WHERE connection.provider='square'
-            AND connection.status IN ('syncing','importing')
-            AND NOT EXISTS (SELECT 1 FROM source_sync_runs run
-                            WHERE run.connection_id=connection.id AND run.status='running')",
+         WHERE connection.status IN ('syncing','importing')
+           AND NOT EXISTS (SELECT 1 FROM source_sync_runs run
+                           WHERE run.connection_id=connection.id AND run.status='running')",
     )
     .execute(&mut *tx)
     .await?;
@@ -874,7 +888,7 @@ async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
         "SELECT run.id,run.restaurant_id FROM source_sync_runs run
          JOIN source_connections connection
            ON connection.id=run.connection_id AND connection.restaurant_id=run.restaurant_id
-         WHERE run.status='queued' AND connection.provider='square'
+         WHERE run.status='queued'
            AND NOT EXISTS (SELECT 1 FROM source_sync_runs active
                            WHERE active.connection_id=run.connection_id
                              AND active.status='running')
@@ -892,18 +906,18 @@ async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
         .await?;
     sqlx::query(
         "UPDATE source_sync_runs run SET status='failed',
-           error='Square is not active for setup.',finished_at=NOW()
+           error='The connector is no longer active for setup.',finished_at=NOW()
          FROM source_connections connection
          WHERE run.connection_id=connection.id
            AND run.restaurant_id=connection.restaurant_id
            AND run.restaurant_id=$1
-           AND run.status='queued' AND connection.provider='square'
+           AND run.status='queued'
            AND (connection.status='disconnected' OR
              (SELECT COUNT(*) FROM restaurant_setup_streams setup
               WHERE setup.restaurant_id=run.restaurant_id
                 AND setup.stream IN ('menu','sales')
                 AND setup.method='connector'
-                AND setup.connector_provider='square')<>2)",
+                AND setup.connector_provider=connection.provider)<>2)",
     )
     .bind(restaurant_id)
     .execute(&mut *tx)
@@ -914,13 +928,13 @@ async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
          FROM source_sync_runs run
          JOIN source_connections connection
            ON connection.id=run.connection_id AND connection.restaurant_id=run.restaurant_id
-         WHERE run.id=$1 AND run.status='queued' AND connection.provider='square'
+         WHERE run.id=$1 AND run.status='queued'
            AND connection.status<>'disconnected'
            AND (SELECT COUNT(*) FROM restaurant_setup_streams setup
                 WHERE setup.restaurant_id=run.restaurant_id
                   AND setup.stream IN ('menu','sales')
                   AND setup.method='connector'
-                  AND setup.connector_provider='square')=2
+                  AND setup.connector_provider=connection.provider)=2
          FOR UPDATE SKIP LOCKED
          ",
     )
@@ -952,11 +966,15 @@ async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
     Ok(Some(job))
 }
 
-async fn process_job(pool: &PgPool, config: &SquareConfig, job: SyncJob) -> Result<(), String> {
+pub(crate) async fn process_job(
+    pool: &PgPool,
+    configs: &SyncConfigs,
+    job: SyncJob,
+) -> Result<(), String> {
     let connection = sqlx::query_as::<_, ConnectionRow>(
-        "SELECT id,restaurant_id,status,external_location_id,access_token_encrypted,
-                refresh_token_encrypted,access_token_expires_at,last_success_at
-         FROM source_connections WHERE id=$1 AND restaurant_id=$2 AND provider='square'",
+        "SELECT id,restaurant_id,provider,status,external_merchant_id,external_location_id,
+                access_token_encrypted,refresh_token_encrypted,access_token_expires_at,last_success_at
+         FROM source_connections WHERE id=$1 AND restaurant_id=$2",
     )
     .bind(job.connection_id)
     .bind(job.restaurant_id)
@@ -971,12 +989,23 @@ async fn process_job(pool: &PgPool, config: &SquareConfig, job: SyncJob) -> Resu
         .await
         .map_err(|e| e.to_string())?;
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(15 * 60),
-        run_sync(pool, config, &connection, &job, &timezone),
-    )
-    .await
-    .unwrap_or_else(|_| Err("Square sync timed out.".to_owned()));
+    let result = match connection.provider.as_str() {
+        "clover" => match configs.clover.as_ref() {
+            Some(config) => {
+                crate::clover::run_sync(pool, config, &connection, &job, &timezone).await
+            }
+            None => Err("Clover is not configured.".to_owned()),
+        },
+        _ => match configs.square.as_ref() {
+            Some(config) => tokio::time::timeout(
+                std::time::Duration::from_secs(15 * 60),
+                run_sync(pool, config, &connection, &job, &timezone),
+            )
+            .await
+            .unwrap_or_else(|_| Err("The sync timed out.".to_owned())),
+            None => Err("Square is not configured.".to_owned()),
+        },
+    };
     match result {
         Ok(stats) => {
             let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
@@ -1263,16 +1292,19 @@ async fn fetch_category_names(
 }
 
 /// One menu row ready for a bulk upsert.
-struct CatalogUpsertRow {
-    external_id: String,
-    name: String,
-    category: Option<String>,
-    price: BigDecimal,
-    currency: String,
-    active: bool,
+pub(crate) struct CatalogUpsertRow {
+    pub(crate) external_id: String,
+    pub(crate) name: String,
+    pub(crate) category: Option<String>,
+    pub(crate) price: BigDecimal,
+    pub(crate) currency: String,
+    pub(crate) active: bool,
 }
 
-async fn load_menu_name_set(pool: &PgPool, restaurant_id: Uuid) -> Result<HashSet<String>, String> {
+pub(crate) async fn load_menu_name_set(
+    pool: &PgPool,
+    restaurant_id: Uuid,
+) -> Result<HashSet<String>, String> {
     let rows: Vec<String> =
         sqlx::query_scalar("SELECT LOWER(name) FROM menu_items WHERE restaurant_id=$1")
             .bind(restaurant_id)
@@ -1285,9 +1317,10 @@ async fn load_menu_name_set(pool: &PgPool, restaurant_id: Uuid) -> Result<HashSe
 /// Inserts or refreshes every variation in one statement. The partial unique
 /// index on (restaurant_id, external_source, external_id) arbitrates insert
 /// vs update; name collisions were resolved by the caller beforehand.
-async fn bulk_upsert_menu_items(
+pub(crate) async fn bulk_upsert_menu_items(
     pool: &PgPool,
     restaurant_id: Uuid,
+    provider: &str,
     rows: &[CatalogUpsertRow],
 ) -> Result<(), String> {
     if rows.is_empty() {
@@ -1305,7 +1338,7 @@ async fn bulk_upsert_menu_items(
             .push_bind(&row.price)
             .push_bind(&row.currency)
             .push_bind(row.active)
-            .push_bind("square")
+            .push_bind(provider)
             .push_bind(&row.external_id);
     });
     builder.push(
@@ -1438,12 +1471,12 @@ pub(crate) async fn sync_catalog(
                 });
             }
         }
-        match bulk_upsert_menu_items(pool, restaurant_id, &rows).await {
+        match bulk_upsert_menu_items(pool, restaurant_id, PROVIDER, &rows).await {
             Ok(()) => upserted += rows.len() as u64,
             Err(error) => {
                 tracing::warn!(%error, "bulk menu upsert failed; falling back per row");
                 for row in &rows {
-                    match upsert_menu_item(pool, restaurant_id, row).await {
+                    match upsert_menu_item(pool, restaurant_id, PROVIDER, row).await {
                         Ok(true) => upserted += 1,
                         _ => skipped += 1,
                     }
@@ -1461,9 +1494,10 @@ pub(crate) async fn sync_catalog(
     Ok(json!({ "upserted": upserted, "skipped": skipped }))
 }
 
-async fn upsert_menu_item(
+pub(crate) async fn upsert_menu_item(
     pool: &PgPool,
     restaurant_id: Uuid,
+    provider: &str,
     row: &CatalogUpsertRow,
 ) -> Result<bool, String> {
     let CatalogUpsertRow {
@@ -1476,9 +1510,10 @@ async fn upsert_menu_item(
     } = row;
     let existing = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM menu_items
-         WHERE restaurant_id=$1 AND external_source='square' AND external_id=$2",
+         WHERE restaurant_id=$1 AND external_source=$2 AND external_id=$3",
     )
     .bind(restaurant_id)
+    .bind(provider)
     .bind(external_id)
     .fetch_optional(pool)
     .await
@@ -1522,7 +1557,7 @@ async fn upsert_menu_item(
     let result = sqlx::query(
         "INSERT INTO menu_items
          (id,restaurant_id,name,category,selling_price,currency,active,external_source,external_id)
-         VALUES($1,$2,$3,$4,$5,$6,$7,'square',$8)",
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
     )
     .bind(id)
     .bind(restaurant_id)
@@ -1531,6 +1566,7 @@ async fn upsert_menu_item(
     .bind(price)
     .bind(currency)
     .bind(active)
+    .bind(provider)
     .bind(external_id)
     .execute(pool)
     .await;
@@ -1548,7 +1584,7 @@ async fn upsert_menu_item(
     }
 }
 
-fn cents_to_decimal(amount: i64) -> BigDecimal {
+pub(crate) fn cents_to_decimal(amount: i64) -> BigDecimal {
     let whole = amount / 100;
     let frac = (amount % 100).unsigned_abs();
     format!("{whole}.{frac:02}")
@@ -1556,7 +1592,7 @@ fn cents_to_decimal(amount: i64) -> BigDecimal {
         .unwrap_or_else(|_| BigDecimal::from(0))
 }
 
-fn truncate_chars(value: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(value: &str, max: usize) -> String {
     value
         .chars()
         .take(max)
@@ -1591,7 +1627,7 @@ pub(crate) async fn sync_orders(
             .unwrap_or_else(|| end - Duration::days(INITIAL_SALES_DAYS))
     };
 
-    let menu_map = load_square_menu_map(pool, job.restaurant_id).await?;
+    let menu_map = load_provider_menu_map(pool, job.restaurant_id, PROVIDER).await?;
     let mut cursor: Option<String> = None;
     // business_date -> (menu_item_id -> (qty, net_sales cents, currency))
     let mut days: HashMap<NaiveDate, HashMap<Uuid, SalesLineTotal>> = HashMap::new();
@@ -1702,7 +1738,15 @@ pub(crate) async fn sync_orders(
         if lines.is_empty() {
             continue;
         }
-        write_sales_day(pool, job.restaurant_id, business_date, &lines, system_user).await?;
+        write_sales_day(
+            pool,
+            job.restaurant_id,
+            PROVIDER,
+            business_date,
+            &lines,
+            system_user,
+        )
+        .await?;
         days_written += 1;
     }
 
@@ -1714,24 +1758,27 @@ pub(crate) async fn sync_orders(
     }))
 }
 
-async fn load_square_menu_map(
+pub(crate) async fn load_provider_menu_map(
     pool: &PgPool,
     restaurant_id: Uuid,
+    provider: &str,
 ) -> Result<HashMap<String, Uuid>, String> {
     let rows = sqlx::query_as::<_, (String, Uuid)>(
         "SELECT external_id,id FROM menu_items
-         WHERE restaurant_id=$1 AND external_source='square' AND external_id IS NOT NULL",
+         WHERE restaurant_id=$1 AND external_source=$2 AND external_id IS NOT NULL",
     )
     .bind(restaurant_id)
+    .bind(provider)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
     Ok(rows.into_iter().collect())
 }
 
-async fn write_sales_day(
+pub(crate) async fn write_sales_day(
     pool: &PgPool,
     restaurant_id: Uuid,
+    provider: &str,
     business_date: NaiveDate,
     lines: &HashMap<Uuid, (BigDecimal, Option<i64>, Option<String>)>,
     user_id: Uuid,
@@ -1748,7 +1795,7 @@ async fn write_sales_day(
     .map_err(|e| e.to_string())?;
 
     let day_id = match existing {
-        Some((id, Some(source))) if source == "square" => {
+        Some((id, Some(source))) if source == provider => {
             sqlx::query("DELETE FROM sales_lines WHERE sales_day_id=$1 AND restaurant_id=$2")
                 .bind(id)
                 .bind(restaurant_id)
@@ -1777,12 +1824,13 @@ async fn write_sales_day(
             sqlx::query(
                 "INSERT INTO sales_days
                  (id,restaurant_id,business_date,created_by,updated_by,external_source)
-                 VALUES($1,$2,$3,$4,$4,'square')",
+                 VALUES($1,$2,$3,$4,$4,$5)",
             )
             .bind(id)
             .bind(restaurant_id)
             .bind(business_date)
             .bind(user_id)
+            .bind(provider)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;

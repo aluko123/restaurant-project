@@ -223,10 +223,7 @@ export function SourcesWorkspace({
         setNotice(
           `${label} authorized. Menu and sales are syncing in the background.`,
         );
-        if (provider === "square") {
-          // Only Square has a sync pipeline today; Clover reports once its sync lands.
-          setSyncingProvider("square");
-        }
+        setSyncingProvider(provider);
         window.history.replaceState({}, "", "/sources");
         void load();
       } else if (result === "error") {
@@ -337,25 +334,27 @@ export function SourcesWorkspace({
     }
   }
 
-  async function syncSquare() {
+  async function syncConnector(provider: ConnectorProvider, label: string) {
     setBusy(true);
     setError("");
     setNotice("");
     try {
-      await request("/v1/connections/square/sync", { method: "POST", body: "{}" });
-      setSyncingProvider("square");
-      setNotice("Square sync started. Menu and sales will update when it finishes.");
+      await request(`/v1/connections/${provider}/sync`, { method: "POST", body: "{}" });
+      setSyncingProvider(provider);
+      setNotice(`${label} sync started. Menu and sales will update when it finishes.`);
       const connections = await load({ quiet: true });
-      const square = connections?.square ?? null;
-      if (square && square.status !== "syncing") {
+      const current = connections?.[provider] ?? null;
+      if (current && current.status !== "syncing") {
         // queued → may still read connected until a worker claims the run
         setConnectionsByProvider((current) =>
-          current.square ? { ...current, square: { ...current.square!, status: "syncing" } } : current,
+          current[provider]
+            ? { ...current, [provider]: { ...current[provider]!, status: "syncing" } }
+            : current,
         );
       }
     } catch (cause) {
       setSyncingProvider(null);
-      setError(cause instanceof Error ? cause.message : "Square sync couldn't start.");
+      setError(cause instanceof Error ? cause.message : `${label} sync couldn't start.`);
     } finally {
       setBusy(false);
     }
@@ -505,7 +504,7 @@ export function SourcesWorkspace({
               posPicked={posSystem === label}
               onConnect={() => void connectConnector(provider, label)}
               onDisconnect={() => void disconnectProvider(provider, label)}
-              onSync={() => void syncSquare()}
+              onSync={() => void syncConnector(provider, label)}
             />
           ))}
 
@@ -739,7 +738,6 @@ function ConnectorPanel({
   // The panel itself stays discoverable when the restaurant picked this POS.
   if (!(posPicked || selected || Boolean(connection))) return null;
   const active = Boolean(connection && connection.status !== "disconnected");
-  const hasSyncPipeline = provider === "square";
   const menuSyncedAt = connection?.menuLastSuccessAt ?? connection?.lastSuccessAt ?? null;
   const salesSyncedAt = connection?.salesLastSuccessAt ?? connection?.lastSuccessAt ?? null;
   const stats = connection?.lastSyncStats ?? null;
@@ -789,14 +787,12 @@ function ConnectorPanel({
             <p>
               {!selected
                 ? `Select ${label} as your menu and sales source to sync.`
-                : !hasSyncPipeline
-                ? `${label} fills menu items and recent sales automatically once syncing is enabled. Inventory counts and supplier invoices stay in Parline.`
                 : connection.status === "error" || connection.status === "needs_reauth"
                 ? `${label} needs attention before menu and sales can update again. Synced records stay in Parline.`
                 : `${label} fills menu items and recent sales automatically. Inventory counts and supplier invoices stay in Parline.`}
             </p>
             <div className="card-actions">
-              {hasSyncPipeline && selected && connection.status !== "needs_reauth" && connection.status !== "error" && (
+              {selected && connection.status !== "needs_reauth" && connection.status !== "error" && (
                 <button
                   className="ledger-button"
                   type="button"
@@ -806,8 +802,7 @@ function ConnectorPanel({
                   {busy || syncing || connection.status === "syncing" ? "Syncing…" : "Sync now"}
                 </button>
               )}
-              {hasSyncPipeline &&
-                selected &&
+              {selected &&
                 (connection.status === "needs_reauth" || connection.status === "error") && (
                   <button className="ledger-button" type="button" disabled={busy} onClick={onConnect}>
                     Reconnect
