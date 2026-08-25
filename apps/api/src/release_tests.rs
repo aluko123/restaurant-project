@@ -3497,7 +3497,7 @@ async fn clover_oauth_connects_and_disconnects_a_merchant() {
     );
 
     Mock::given(method("POST"))
-        .and(path("/oauth_v2/token"))
+        .and(path("/oauth/v2/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "clover-access",
             "refresh_token": "clover-refresh"
@@ -3515,7 +3515,7 @@ async fn clover_oauth_connects_and_disconnects_a_merchant() {
     .await;
     assert_eq!(authorize.status, StatusCode::OK);
     let url = authorize.body["url"].as_str().unwrap().to_owned();
-    assert!(url.contains("/oauth_v2/authorize"));
+    assert!(url.contains("/oauth/v2/authorize"));
     let state = url.rsplit("state=").next().unwrap().to_owned();
 
     let callback = request(

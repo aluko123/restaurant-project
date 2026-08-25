@@ -53,14 +53,32 @@ impl CloverConfig {
     }
 
     /// Clover's OAuth v2 endpoints issue refresh tokens; the legacy flow does not.
+    /// REST host: token exchange lives here, not on the OAuth host.
+    fn api_base(&self) -> String {
+        if let Some(base) = self.test_base_override() {
+            return base;
+        }
+        if self.environment.eq_ignore_ascii_case("production") {
+            "https://api.clover.com".to_owned()
+        } else {
+            "https://apisandbox.dev.clover.com".to_owned()
+        }
+    }
+
+    /// Sandbox-only override so integration tests can point the connector
+    /// at a local mock server. Production always talks to Clover directly.
+    fn test_base_override(&self) -> Option<String> {
+        if self.environment.eq_ignore_ascii_case("production") {
+            return None;
+        }
+        let base = std::env::var("CLOVER_API_BASE_URL").ok()?;
+        let base = base.trim().trim_end_matches('/').to_owned();
+        (!base.is_empty()).then_some(base)
+    }
+
     fn oauth_base(&self) -> String {
-        if let Ok(base) = std::env::var("CLOVER_API_BASE_URL")
-            && !self.environment.eq_ignore_ascii_case("production")
-        {
-            let base = base.trim().trim_end_matches('/').to_owned();
-            if !base.is_empty() {
-                return base;
-            }
+        if let Some(base) = self.test_base_override() {
+            return base;
         }
         if self.environment.eq_ignore_ascii_case("production") {
             "https://clover.com".to_owned()
@@ -133,7 +151,7 @@ pub(crate) async fn authorize(
     .await
     .map_err(database_error)?;
     let url = format!(
-        "{}/oauth_v2/authorize?client_id={}&redirect_uri={}&state={}",
+        "{}/oauth/v2/authorize?client_id={}&redirect_uri={}&state={}",
         config.oauth_base(),
         urlencoding_encode(&config.application_id),
         urlencoding_encode(&config.redirect_uri),
@@ -243,7 +261,7 @@ async fn obtain_token(config: &CloverConfig, code: &str) -> Result<TokenResponse
         .build()
         .map_err(|_| ())?;
     let response = client
-        .post(format!("{}/oauth_v2/token", config.oauth_base()))
+        .post(format!("{}/oauth/v2/token", config.api_base()))
         .header("accept", "application/json")
         .form(&[
             ("client_id", config.application_id.as_str()),
