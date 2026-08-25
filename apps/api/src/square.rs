@@ -183,19 +183,19 @@ pub(crate) struct Member {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConnectionView {
     id: Uuid,
-    provider: String,
-    status: String,
-    external_merchant_id: Option<String>,
-    external_location_id: Option<String>,
-    last_sync_at: Option<DateTime<Utc>>,
-    last_success_at: Option<DateTime<Utc>>,
-    last_error: Option<String>,
+    pub(crate) provider: String,
+    pub(crate) status: String,
+    pub(crate) external_merchant_id: Option<String>,
+    pub(crate) external_location_id: Option<String>,
+    pub(crate) last_sync_at: Option<DateTime<Utc>>,
+    pub(crate) last_success_at: Option<DateTime<Utc>>,
+    pub(crate) last_error: Option<String>,
     /// Stats JSON from the newest succeeded run, so the UI can surface
     /// unmatched order lines instead of silently under-counting sales.
-    last_sync_stats: Option<Value>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    configured: bool,
+    pub(crate) last_sync_stats: Option<Value>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
+    pub(crate) configured: bool,
 }
 
 #[derive(Serialize)]
@@ -255,9 +255,16 @@ pub(crate) async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ConnectionView>>, ApiError> {
-    let m = member(&state, &headers).await?;
-    manager(&m)?;
-    let configured = state.square.is_some();
+    connections_list(&state, &headers, PROVIDER, state.square.is_some()).await
+}
+
+pub(crate) async fn connections_list(
+    state: &AppState,
+    headers: &HeaderMap,
+    provider: &str,
+    configured: bool,
+) -> Result<Json<Vec<ConnectionView>>, ApiError> {
+    let m = member(state, headers).await?;
     let mut rows = sqlx::query_as::<_, ConnectionView>(
         "SELECT connection.id,connection.provider,connection.status,
                 connection.external_merchant_id,connection.external_location_id,
@@ -272,7 +279,7 @@ pub(crate) async fn list(
          ORDER BY connection.updated_at DESC",
     )
     .bind(m.restaurant_id)
-    .bind(PROVIDER)
+    .bind(provider)
     .fetch_all(&state.pool)
     .await
     .map_err(database_error)?;

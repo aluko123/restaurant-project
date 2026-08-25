@@ -374,6 +374,7 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/v1/suppliers/{id}", axum::routing::put(suppliers::update))
         .route("/v1/suppliers/{id}/archive", post(suppliers::archive))
         .route("/v1/connections", get(square::list))
+        .route("/v1/connections/clover", get(clover::list))
         .route("/v1/connections/clover/status", get(clover::status))
         .route("/v1/connections/clover/authorize", get(clover::authorize))
         .route("/v1/connections/clover/callback", get(clover::callback))

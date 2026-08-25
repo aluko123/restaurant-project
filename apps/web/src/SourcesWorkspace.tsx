@@ -44,7 +44,7 @@ type SetupPlan = {
     issue: { code: string; message: string } | null;
     supportedMethods: string[];
   }>;
-  connectors: Array<{ provider: "square"; supported: boolean; configured: boolean; selected: boolean; capabilities: ["menu", "sales"]; status: string | null }>;
+  connectors: Array<{ provider: string; supported: boolean; configured: boolean; selected: boolean; capabilities: ["menu", "sales"]; status: string | null }>;
 };
 
 const posOptions = ["Toast", "Square", "Clover", "Lightspeed", "SpotOn", "TouchBistro", "Revel"];
@@ -130,6 +130,8 @@ export function SourcesWorkspace({
   const [accountingSystem, setAccountingSystem] = useState("");
   const [squareConfigured, setSquareConfigured] = useState(false);
   const [squareConnection, setSquareConnection] = useState<SquareConnection | null>(null);
+  const [cloverConfigured, setCloverConfigured] = useState(false);
+  const [cloverConnection, setCloverConnection] = useState<SquareConnection | null>(null);
   const [squareSyncPending, setSquareSyncPending] = useState(false);
   const priorSquareStatus = useRef<string | null>(null);
   const toolsDirtyRef = useRef(false);
@@ -146,8 +148,12 @@ export function SourcesWorkspace({
         configured: false,
       })),
       request<SquareConnection[]>("/v1/connections").catch(() => [] as SquareConnection[]),
+      request<{ configured: boolean }>("/v1/connections/clover/status").catch(() => ({
+        configured: false,
+      })),
+      request<SquareConnection[]>("/v1/connections/clover").catch(() => [] as SquareConnection[]),
     ])
-      .then(([next, plan, status, connections]) => {
+      .then(([next, plan, status, connections, cloverStatus, cloverConnections]) => {
         setSetup(next);
         setSetupPlan(plan);
         if (!toolsDirtyRef.current) {
@@ -157,6 +163,8 @@ export function SourcesWorkspace({
         setSquareConfigured(status.configured);
         const square = connections.find((c) => c.provider === "square") ?? null;
         setSquareConnection(square);
+        setCloverConfigured(cloverStatus.configured);
+        setCloverConnection(cloverConnections.find((c) => c.provider === "clover") ?? null);
         return square;
       })
       .catch((cause: unknown) => {
@@ -272,6 +280,46 @@ export function SourcesWorkspace({
       window.location.href = url;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Square connect couldn't start.");
+      setBusy(false);
+    }
+  }
+
+  async function connectClover() {
+    if (!setup) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await request<MigrationSetup>("/v1/migration-setup", {
+        method: "PUT",
+        body: JSON.stringify({
+          posSystem: posSystem.trim() || "Clover",
+          accountingSystem: accountingSystem.trim() || null,
+          setupApproach: setup.setupApproach,
+          markComplete: false,
+        }),
+      });
+      toolsDirtyRef.current = false;
+      const { url } = await request<{ url: string }>("/v1/connections/clover/authorize");
+      window.location.href = url;
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Clover connect couldn't start.");
+      setBusy(false);
+    }
+  }
+
+  async function disconnectClover() {
+    if (!window.confirm("Disconnect Clover? Synced menu and sales stay in Parline.")) return;
+    setBusy(true);
+    setError("");
+    try {
+      await request("/v1/connections/clover/disconnect", { method: "POST", body: "{}" });
+      setNotice("Clover disconnected.");
+      setCloverConnection(null);
+      void load();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Clover couldn't be disconnected.");
+    } finally {
       setBusy(false);
     }
   }
@@ -396,7 +444,8 @@ export function SourcesWorkspace({
     : 0;
   const incomplete = Boolean(setup && !setup.completedAt);
   const activated = setupPlan?.activationState === "active";
-  const squareSelected = setupPlan?.connectors.some(connector => connector.selected) ?? false;
+  const squareSelected = setupPlan?.connectors.some(connector => connector.selected && connector.provider === "square") ?? false;
+  const cloverSelected = setupPlan?.connectors.some(connector => connector.selected && connector.provider === "clover") ?? false;
 
   return (
     <section
@@ -535,6 +584,60 @@ export function SourcesWorkspace({
             ) : (
               <p>
                 Square connect is not configured on this server yet. You can still import menu and
+                sales with CSV, or ask for setup help.
+              </p>
+            )}
+          </section>}
+
+          {(posSystem === "Clover" || cloverSelected || Boolean(cloverConnection)) && <section className="sources-tools square-connect-panel" aria-labelledby="clover-connect-heading">
+            <div className="list-heading">
+              <h2 id="clover-connect-heading">Clover</h2>
+            </div>
+            {cloverConfigured ? (
+              cloverConnection && cloverConnection.status !== "disconnected" ? (
+                <>
+                  <p>
+                    Status: <strong>{cloverSelected ? squareStatusLabel(cloverConnection.status) : "Not selected"}</strong>
+                    {cloverConnection.lastSuccessAt
+                      ? ` · Last successful sync ${recencyLabel(cloverConnection.lastSuccessAt, "sync")}`
+                      : cloverConnection.lastSyncAt
+                        ? ` · Last attempt ${recencyLabel(cloverConnection.lastSyncAt, "sync")}`
+                        : " · Waiting for first sync"}
+                  </p>
+                  {cloverConnection.lastError && (
+                    <p className="form-error" role="alert">
+                      {cloverConnection.lastError}
+                    </p>
+                  )}
+                  <p>
+                    {!cloverSelected
+                      ? "Select Clover as your menu and sales source to sync."
+                      : "Clover fills menu items and recent sales automatically once syncing is enabled. Inventory counts and supplier invoices stay in Parline."}
+                  </p>
+                  <div className="card-actions">
+                    <button className="text-button" type="button" disabled={busy} onClick={() => void disconnectClover()}>
+                      Disconnect
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p>
+                    Connect Clover to pull your menu and recent sales — no CSV export required.
+                  </p>
+                  <button
+                    className="ledger-button"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void connectClover()}
+                  >
+                    {busy ? "Opening Clover…" : "Connect Clover"}
+                  </button>
+                </>
+              )
+            ) : (
+              <p>
+                Clover connect is not configured on this server yet. You can still import menu and
                 sales with CSV, or ask for setup help.
               </p>
             )}

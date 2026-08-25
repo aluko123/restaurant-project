@@ -294,3 +294,10 @@ fn base64_url(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
+
+pub(crate) async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::square::ConnectionView>>, ApiError> {
+    crate::square::connections_list(&state, &headers, PROVIDER, state.clover.is_some()).await
+}
