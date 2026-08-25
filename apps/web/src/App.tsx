@@ -134,7 +134,15 @@ function AuthenticatedApp() {
   }, [isLoading, signIn, user]);
 
   const request: ApiRequest = useCallback(async <T,>(path: string, init?: RequestInit): Promise<T> => {
-    const token = await getAccessToken();
+    // When the browser session can no longer mint an access token, AuthKit
+    // throws LoginRequiredError on every call. Redirect to sign-in instead of
+    // surfacing the raw SDK error from every workspace.
+    const token = await getAccessToken().catch((cause: unknown) => {
+      if (cause instanceof Error && /no access token/i.test(cause.message)) {
+        void signIn();
+      }
+      throw new Error("Your session expired. Signing you in again…");
+    });
     const headers = new Headers(init?.headers);
     if (!(init?.body instanceof FormData)) headers.set("Content-Type", "application/json");
     headers.set("Authorization", `Bearer ${token}`);
@@ -150,7 +158,7 @@ function AuthenticatedApp() {
       throw error;
     }
     return body as T;
-  }, [apiUrl, getAccessToken]);
+  }, [apiUrl, getAccessToken, signIn]);
 
   const loadApp = useCallback(() => {
     if (!user) return;

@@ -151,7 +151,7 @@ pub(crate) async fn review(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Review>, ApiError> {
     let m = membership(&s, &headers).await?;
-    let import=sqlx::query_as("SELECT id,original_filename,status,status='processing' AND updated_at<NOW()-INTERVAL '5 minutes' AS delayed,created_at FROM menu_imports WHERE id=$1 AND restaurant_id=$2").bind(id).bind(m.restaurant_id).fetch_optional(&s.pool).await.map_err(crate::database_error)?.ok_or(ApiError(StatusCode::NOT_FOUND,"Menu import not found."))?;
+    let import=sqlx::query_as("SELECT i.id,i.original_filename,i.status,i.status='processing' AND i.updated_at<NOW()-INTERVAL '5 minutes' AS delayed,j.last_error,i.created_at FROM menu_imports i LEFT JOIN menu_import_jobs j ON j.menu_import_id=i.id WHERE i.id=$1 AND i.restaurant_id=$2").bind(id).bind(m.restaurant_id).fetch_optional(&s.pool).await.map_err(crate::database_error)?.ok_or(ApiError(StatusCode::NOT_FOUND,"Menu import not found."))?;
     let items=sqlx::query_as("SELECT id,name,category,selling_price::text selling_price,currency,has_warnings FROM menu_import_items WHERE menu_import_id=$1 ORDER BY position").bind(id).fetch_all(&s.pool).await.map_err(crate::database_error)?;
     Ok(Json(Review { import, items }))
 }
