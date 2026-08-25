@@ -401,6 +401,7 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/v1/order-guides/{id}/cancel", post(order_guides::cancel))
         .route("/v1/loss-events", get(losses::list).post(losses::create))
         .route("/v1/location-options", get(location_options::list))
+        .route("/v1/me/active-restaurant", post(switch_restaurant))
         .route("/v1/inventory-counts/draft", get(inventory::draft))
         .route(
             "/v1/inventory-counts",
@@ -440,8 +441,17 @@ async fn me(
     let subject = authenticated_subject(&state, &headers).await?;
     let mut restaurant = sqlx::query_as::<_, Restaurant>(
         "SELECT r.id, r.name, r.city, r.region, r.country, r.service_style, r.timezone, m.role
-         FROM users u JOIN restaurant_memberships m ON m.user_id = u.id
-         JOIN restaurants r ON r.id = m.restaurant_id WHERE u.auth_subject = $1",
+         FROM users u
+         JOIN restaurant_memberships m ON m.user_id = u.id
+         JOIN restaurants r ON r.id = m.restaurant_id
+         WHERE u.auth_subject = $1
+           AND m.restaurant_id = COALESCE(
+               (SELECT p.restaurant_id FROM user_active_restaurants p
+                WHERE p.user_id = u.id),
+               (SELECT MIN(m2.restaurant_id) FROM restaurant_memberships m2
+                WHERE m2.user_id = u.id)
+           )
+         LIMIT 1",
     )
     .bind(&subject)
     .fetch_optional(&state.pool)
@@ -465,6 +475,55 @@ async fn me(
         .map_err(database_error)?;
     }
     Ok(Json(MeResponse { restaurant }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SwitchRestaurantInput {
+    restaurant_id: uuid::Uuid,
+}
+
+async fn switch_restaurant(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<SwitchRestaurantInput>,
+) -> Result<Json<MeResponse>, ApiError> {
+    let subject = authenticated_subject(&state, &headers).await?;
+    let mut tx = state.pool.begin().await.map_err(database_error)?;
+    let user_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE auth_subject=$1")
+        .bind(&subject)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(database_error)?
+        .ok_or(ApiError(
+            StatusCode::FORBIDDEN,
+            "A restaurant membership is required.",
+        ))?;
+    let member: uuid::Uuid = sqlx::query_scalar(
+        "SELECT restaurant_id FROM restaurant_memberships
+         WHERE user_id=$1 AND restaurant_id=$2",
+    )
+    .bind(user_id)
+    .bind(input.restaurant_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(database_error)?
+    .ok_or(ApiError(
+        StatusCode::NOT_FOUND,
+        "You aren't a member of that restaurant.",
+    ))?;
+    sqlx::query(
+        "INSERT INTO user_active_restaurants(user_id,restaurant_id)
+         VALUES($1,$2)
+         ON CONFLICT (user_id) DO UPDATE SET restaurant_id=$2,updated_at=NOW()",
+    )
+    .bind(user_id)
+    .bind(member)
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    tx.commit().await.map_err(database_error)?;
+    me(State(state), headers).await
 }
 
 async fn migration_setup(
@@ -802,6 +861,47 @@ async fn authenticated_subject(state: &AppState, headers: &HeaderMap) -> Result<
             "Your session could not be verified. Please sign in again.",
         )
     })
+}
+
+/// The membership a multi-restaurant user is currently working in. Siloed:
+/// the persisted preference wins; otherwise the oldest membership is
+/// deterministic. Every module's membership lookup must use this so all
+/// workspaces agree on which restaurant a request targets.
+#[allow(dead_code)] // sweep of module membership queries lands next
+pub(crate) async fn active_membership(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ActiveMembership, ApiError> {
+    let subject = authenticated_subject(state, headers).await?;
+    sqlx::query_as::<_, ActiveMembership>(
+        "SELECT m.restaurant_id, m.role, u.id AS user_id
+         FROM users u
+         JOIN restaurant_memberships m ON m.user_id = u.id
+         WHERE u.auth_subject = $1
+           AND m.restaurant_id = COALESCE(
+               (SELECT p.restaurant_id FROM user_active_restaurants p
+                WHERE p.user_id = u.id),
+               (SELECT MIN(m2.restaurant_id) FROM restaurant_memberships m2
+                WHERE m2.user_id = u.id)
+           )
+         LIMIT 1",
+    )
+    .bind(&subject)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(database_error)?
+    .ok_or(ApiError(
+        StatusCode::FORBIDDEN,
+        "A restaurant membership is required.",
+    ))
+}
+
+#[allow(dead_code)]
+#[derive(sqlx::FromRow)]
+pub(crate) struct ActiveMembership {
+    pub(crate) restaurant_id: uuid::Uuid,
+    pub(crate) user_id: uuid::Uuid,
+    pub(crate) role: String,
 }
 
 fn database_error(_: sqlx::Error) -> ApiError {
