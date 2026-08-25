@@ -173,7 +173,7 @@ pub(crate) async fn callback(
                 .map(|c| c.web_origin.as_str())
                 .unwrap_or("http://localhost:5173");
             let path = format!(
-                "{origin}/sources?square=error&message={}",
+                "{origin}/sources?clover=error&message={}",
                 urlencoding_encode(message)
             );
             axum::response::Redirect::temporary(&path).into_response()
@@ -224,6 +224,64 @@ async fn complete_callback(state: &AppState, query: CallbackQuery) -> Result<Str
         ),
         None => None,
     };
+    let merchant = merchant_id.to_owned();
+    // Same lifecycle guards as the Square adapter: one use per state link,
+    // restaurant locked against concurrent connector changes, connector still
+    // selected, and no silent merchant swaps.
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| "We couldn't save the Clover connection.")?;
+    sqlx::query("SELECT id FROM restaurants WHERE id=$1 FOR UPDATE")
+        .bind(restaurant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "We couldn't save the Clover connection.")?;
+    let consumed = sqlx::query(
+        "DELETE FROM oauth_states
+         WHERE state=$1 AND provider=$2 AND restaurant_id=$3 AND user_id=$4
+           AND expires_at > NOW()",
+    )
+    .bind(state_token)
+    .bind(PROVIDER)
+    .bind(restaurant_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| "We couldn't verify the connection request.")?
+    .rows_affected();
+    if consumed != 1 {
+        return Err("This connection link expired. Try Connect Clover again.");
+    }
+    let selected = sqlx::query_scalar::<_, bool>(
+        "SELECT COUNT(*)=2 FROM restaurant_setup_streams
+         WHERE restaurant_id=$1 AND stream IN ('menu','sales')
+           AND method='connector' AND connector_provider='clover'",
+    )
+    .bind(restaurant_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| "We couldn't verify the connection request.")?;
+    if !selected {
+        return Err("Clover is no longer selected.");
+    }
+    let existing_merchant = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT external_merchant_id FROM source_connections
+         WHERE restaurant_id=$1 AND provider=$2",
+    )
+    .bind(restaurant_id)
+    .bind(PROVIDER)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| "We couldn't verify the Clover account.")?
+    .flatten();
+    if existing_merchant.is_some() && existing_merchant.as_deref() != Some(merchant.as_str()) {
+        return Err("This restaurant is linked to a different Clover account.");
+    }
+    // 'connected' rather than 'importing': Clover has no sync pipeline yet, so
+    // claiming an import in progress would be false. Flip to 'importing' when
+    // Clover menu/sales sync lands.
     sqlx::query(
         "INSERT INTO source_connections
          (id,restaurant_id,provider,status,external_merchant_id,
@@ -238,14 +296,17 @@ async fn complete_callback(state: &AppState, query: CallbackQuery) -> Result<Str
     .bind(Uuid::now_v7())
     .bind(restaurant_id)
     .bind(PROVIDER)
-    .bind(merchant_id)
+    .bind(merchant)
     .bind(access_enc)
     .bind(refresh_enc)
     .bind(user_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|_| "We couldn't save the Clover connection.")?;
-    Ok(format!("{}/sources?square=connected", config.web_origin))
+    tx.commit()
+        .await
+        .map_err(|_| "We couldn't save the Clover connection.")?;
+    Ok(format!("{}/sources?clover=connected", config.web_origin))
 }
 
 #[derive(Deserialize, Debug)]

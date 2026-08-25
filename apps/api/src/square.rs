@@ -64,11 +64,21 @@ impl SquareConfig {
         })
     }
 
-    fn oauth_base(&self) -> &'static str {
+    fn oauth_base(&self) -> String {
+        // Same sandbox-only override as api_base() so integration tests can
+        // point the whole connector, OAuth included, at a local mock server.
+        if !self.environment.eq_ignore_ascii_case("production")
+            && let Ok(base) = std::env::var("SQUARE_API_BASE_URL")
+        {
+            let base = base.trim().trim_end_matches('/').to_owned();
+            if !base.is_empty() {
+                return base;
+            }
+        }
         if self.environment.eq_ignore_ascii_case("production") {
-            "https://connect.squareup.com"
+            "https://connect.squareup.com".to_owned()
         } else {
-            "https://connect.squareupsandbox.com"
+            "https://connect.squareupsandbox.com".to_owned()
         }
     }
 
@@ -189,6 +199,9 @@ pub(crate) struct ConnectionView {
     pub(crate) external_location_id: Option<String>,
     pub(crate) last_sync_at: Option<DateTime<Utc>>,
     pub(crate) last_success_at: Option<DateTime<Utc>>,
+    /// Per-stream outcomes so menu and sales can report separately.
+    pub(crate) menu_last_success_at: Option<DateTime<Utc>>,
+    pub(crate) sales_last_success_at: Option<DateTime<Utc>>,
     pub(crate) last_error: Option<String>,
     /// Stats JSON from the newest succeeded run, so the UI can surface
     /// unmatched order lines instead of silently under-counting sales.
@@ -268,7 +281,9 @@ pub(crate) async fn connections_list(
     let mut rows = sqlx::query_as::<_, ConnectionView>(
         "SELECT connection.id,connection.provider,connection.status,
                 connection.external_merchant_id,connection.external_location_id,
-                connection.last_sync_at,connection.last_success_at,connection.last_error,
+                connection.last_sync_at,connection.last_success_at,
+                connection.menu_last_success_at,connection.sales_last_success_at,
+                connection.last_error,
                 (SELECT run.stats FROM source_sync_runs run
                   WHERE run.connection_id=connection.id AND run.status='succeeded'
                   ORDER BY run.finished_at DESC LIMIT 1) AS last_sync_stats,
@@ -465,9 +480,9 @@ async fn complete_callback(state: &AppState, query: CallbackQuery) -> Result<Str
         "INSERT INTO source_connections
          (id,restaurant_id,provider,status,external_merchant_id,external_location_id,
           access_token_encrypted,refresh_token_encrypted,access_token_expires_at,scopes,created_by)
-         VALUES($1,$2,$3,'connected',$4,$5,$6,$7,$8,$9,$10)
+          VALUES($1,$2,$3,'importing',$4,$5,$6,$7,$8,$9,$10)
          ON CONFLICT (restaurant_id,provider) DO UPDATE SET
-           status='connected',
+           status='importing',
            external_merchant_id=EXCLUDED.external_merchant_id,
            external_location_id=EXCLUDED.external_location_id,
            access_token_encrypted=EXCLUDED.access_token_encrypted,
@@ -622,7 +637,8 @@ pub(crate) async fn sync_now(
     }
     let connection_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM source_connections
-         WHERE restaurant_id=$1 AND provider=$2 AND status IN ('connected','error','needs_reauth','syncing')",
+         WHERE restaurant_id=$1 AND provider=$2
+           AND status IN ('importing','connected','error','needs_reauth','syncing')",
     )
     .bind(m.restaurant_id)
     .bind(PROVIDER)
@@ -847,9 +863,10 @@ async fn claim_job(pool: &PgPool) -> Result<Option<SyncJob>, sqlx::Error> {
                          AND run.status IN ('succeeded','failed')
                        ORDER BY run.finished_at DESC NULLS LAST LIMIT 1),
            updated_at=NOW()
-         WHERE connection.provider='square' AND connection.status='syncing'
-           AND NOT EXISTS (SELECT 1 FROM source_sync_runs run
-                           WHERE run.connection_id=connection.id AND run.status='running')",
+          WHERE connection.provider='square'
+            AND connection.status IN ('syncing','importing')
+            AND NOT EXISTS (SELECT 1 FROM source_sync_runs run
+                            WHERE run.connection_id=connection.id AND run.status='running')",
     )
     .execute(&mut *tx)
     .await?;
@@ -1116,7 +1133,21 @@ async fn run_sync(
     }
 
     let menu_stats = sync_catalog(pool, config, &access, job.restaurant_id).await?;
+    sqlx::query(
+        "UPDATE source_connections SET menu_last_success_at=NOW(),updated_at=NOW() WHERE id=$1",
+    )
+    .bind(connection.id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
     let sales_stats = sync_orders(pool, config, &access, job, &location_id, timezone).await?;
+    sqlx::query(
+        "UPDATE source_connections SET sales_last_success_at=NOW(),updated_at=NOW() WHERE id=$1",
+    )
+    .bind(connection.id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(json!({
         "menu": menu_stats,
         "sales": sales_stats,

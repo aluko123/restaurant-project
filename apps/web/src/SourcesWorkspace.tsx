@@ -32,7 +32,7 @@ type SetupPlan = {
     stream: "menu" | "sales" | "inventory" | "purchases" | "bookkeeping_export";
     selection: { method: string; owner: string; connectorProvider: string | null; updatedAt: string } | null;
     lifecycle: "not_started" | "deferred" | "in_progress" | "ready" | "needs_attention";
-    nextAction: "select_method" | "resolve_issue" | "wait_for_parline" | "connect_square" | "add_records" | null;
+    nextAction: "select_method" | "resolve_issue" | "wait_for_parline" | "connect_connector" | "add_records" | null;
     evidence: {
       recordCount: number;
       latestAt: string | null;
@@ -90,12 +90,14 @@ function recencyLabel(value: string | null, unit: string) {
   return `${days} days ago`;
 }
 
-type SquareConnection = {
+type ProviderConnection = {
   id: string;
   provider: string;
   status: string;
   lastSyncAt: string | null;
   lastSuccessAt: string | null;
+  menuLastSuccessAt?: string | null;
+  salesLastSuccessAt?: string | null;
   lastError: string | null;
   lastSyncStats: {
     ordersSeen?: number;
@@ -106,6 +108,13 @@ type SquareConnection = {
   } | null;
   configured: boolean;
 };
+
+const CONNECTORS = [
+  { provider: "square", label: "Square" },
+  { provider: "clover", label: "Clover" },
+] as const;
+
+type ConnectorProvider = (typeof CONNECTORS)[number]["provider"];
 
 export function SourcesWorkspace({
   request,
@@ -128,12 +137,14 @@ export function SourcesWorkspace({
   const [notice, setNotice] = useState("");
   const [posSystem, setPosSystem] = useState("");
   const [accountingSystem, setAccountingSystem] = useState("");
-  const [squareConfigured, setSquareConfigured] = useState(false);
-  const [squareConnection, setSquareConnection] = useState<SquareConnection | null>(null);
-  const [cloverConfigured, setCloverConfigured] = useState(false);
-  const [cloverConnection, setCloverConnection] = useState<SquareConnection | null>(null);
-  const [squareSyncPending, setSquareSyncPending] = useState(false);
-  const priorSquareStatus = useRef<string | null>(null);
+  const [connectionsByProvider, setConnectionsByProvider] = useState<
+    Record<ConnectorProvider, ProviderConnection | null>
+  >({ square: null, clover: null });
+  const [configuredByProvider, setConfiguredByProvider] = useState<
+    Record<ConnectorProvider, boolean>
+  >({ square: false, clover: false });
+  const [syncingProvider, setSyncingProvider] = useState<ConnectorProvider | null>(null);
+  const priorStatuses = useRef<Record<string, string | null>>({});
   const toolsDirtyRef = useRef(false);
 
   const load = useCallback((opts?: { quiet?: boolean }) => {
@@ -144,28 +155,43 @@ export function SourcesWorkspace({
     return Promise.all([
       request<MigrationSetup>("/v1/migration-setup"),
       request<SetupPlan>("/v1/setup"),
-      request<{ configured: boolean }>("/v1/connections/square/status").catch(() => ({
-        configured: false,
-      })),
-      request<SquareConnection[]>("/v1/connections").catch(() => [] as SquareConnection[]),
-      request<{ configured: boolean }>("/v1/connections/clover/status").catch(() => ({
-        configured: false,
-      })),
-      request<SquareConnection[]>("/v1/connections/clover").catch(() => [] as SquareConnection[]),
+      ...CONNECTORS.map((connector) =>
+        Promise.all([
+          request<{ configured: boolean }>(`/v1/connections/${connector.provider}/status`).catch(
+            () => ({ configured: false }),
+          ),
+          request<ProviderConnection[]>(`/v1/connections/${connector.provider === "square" ? "" : connector.provider}`).catch(
+            () => [] as ProviderConnection[],
+          ),
+        ]).then(([status, list]) => ({
+          provider: connector.provider,
+          configured: status.configured,
+          connection: list.find((c) => c.provider === connector.provider) ?? null,
+        })),
+      ),
     ])
-      .then(([next, plan, status, connections, cloverStatus, cloverConnections]) => {
+      .then(([next, plan, ...connectorStates]) => {
         setSetup(next);
         setSetupPlan(plan);
         if (!toolsDirtyRef.current) {
           setPosSystem(next.posSystem ?? "");
           setAccountingSystem(next.accountingSystem ?? "");
         }
-        setSquareConfigured(status.configured);
-        const square = connections.find((c) => c.provider === "square") ?? null;
-        setSquareConnection(square);
-        setCloverConfigured(cloverStatus.configured);
-        setCloverConnection(cloverConnections.find((c) => c.provider === "clover") ?? null);
-        return square;
+        const nextConnections = { square: null, clover: null } as Record<
+          ConnectorProvider,
+          ProviderConnection | null
+        >;
+        const nextConfigured = { square: false, clover: false } as Record<
+          ConnectorProvider,
+          boolean
+        >;
+        for (const state of connectorStates) {
+          nextConnections[state.provider as ConnectorProvider] = state.connection;
+          nextConfigured[state.provider as ConnectorProvider] = state.configured;
+        }
+        setConnectionsByProvider(nextConnections);
+        setConfiguredByProvider(nextConfigured);
+        return nextConnections;
       })
       .catch((cause: unknown) => {
         if (!opts?.quiet) {
@@ -191,24 +217,29 @@ export function SourcesWorkspace({
   useEffect(() => {
     if (!active) return;
     const params = new URLSearchParams(window.location.search);
-    const square = params.get("square");
-    if (square === "connected") {
-      setNotice("Square authorized. Menu and sales are syncing in the background.");
-      setSquareSyncPending(true);
-      window.history.replaceState({}, "", "/sources");
-      void load();
-    } else if (square === "error") {
-      setError(params.get("message") || "Square connection failed. Try again.");
-      window.history.replaceState({}, "", "/sources");
+    for (const { provider, label } of CONNECTORS) {
+      const result = params.get(provider);
+      if (result === "connected") {
+        setNotice(
+          `${label} authorized. Menu and sales are syncing in the background.`,
+        );
+        if (provider === "square") {
+          // Only Square has a sync pipeline today; Clover reports once its sync lands.
+          setSyncingProvider("square");
+        }
+        window.history.replaceState({}, "", "/sources");
+        void load();
+      } else if (result === "error") {
+        setError(params.get("message") || `${label} connection failed. Try again.`);
+        window.history.replaceState({}, "", "/sources");
+      }
     }
   }, [active, load]);
 
-  // Poll while a Square sync is in flight so the button resets and status survives tab switches.
+  // Poll while a sync is awaited so the button resets and status survives tab switches.
   useEffect(() => {
-    if (!active) return;
-    const status = squareConnection?.status ?? null;
-    const shouldPoll = squareSyncPending || status === "syncing";
-    if (!shouldPoll) return;
+    if (!active || !syncingProvider) return;
+    const provider = syncingProvider;
 
     let cancelled = false;
     let ticks = 0;
@@ -216,20 +247,21 @@ export function SourcesWorkspace({
     const timer = window.setInterval(() => {
       if (cancelled) return;
       ticks += 1;
-      void load({ quiet: true }).then((square) => {
-        if (cancelled || !square) return;
-        if (square.status === "syncing") return;
-        setSquareSyncPending(false);
-        if (square.status === "connected") {
-          setNotice("Square sync finished. Check Menu and Sales for updates.");
+      void load({ quiet: true }).then((connections) => {
+        if (cancelled || !connections) return;
+        const current = connections[provider];
+        if (!current || current.status === "syncing") return;
+        setSyncingProvider(null);
+        if (current.status === "connected") {
+          setNotice("Sync finished. Check Menu and Sales for updates.");
           setError("");
-        } else if (square.status === "error" || square.status === "needs_reauth") {
-          setError(square.lastError || "Square sync failed. Try again or reconnect.");
+        } else if (current.status === "error" || current.status === "needs_reauth") {
+          setError(current.lastError || "Sync failed. Try again or reconnect.");
           setNotice("");
         }
       });
       if (ticks >= maxTicks) {
-        setSquareSyncPending(false);
+        setSyncingProvider(null);
         setNotice("Sync is taking longer than expected. Refresh Sources in a moment.");
         window.clearInterval(timer);
       }
@@ -239,28 +271,31 @@ export function SourcesWorkspace({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [active, squareSyncPending, squareConnection?.status, load]);
+  }, [active, syncingProvider, load]);
 
   useEffect(() => {
-    const prev = priorSquareStatus.current;
-    const next = squareConnection?.status ?? null;
-    if (
-      prev === "syncing" &&
-      next &&
-      next !== "syncing" &&
-      (next === "connected" || next === "error" || next === "needs_reauth")
-    ) {
-      setSquareSyncPending(false);
-      if (next === "connected") {
-        setNotice((current) => current || "Square sync finished. Check Menu and Sales for updates.");
-      } else if (squareConnection?.lastError) {
-        setError(squareConnection.lastError);
+    const nextStatuses: Record<string, string | null> = {};
+    for (const { provider } of CONNECTORS) {
+      const prev = priorStatuses.current[provider] ?? null;
+      const next = connectionsByProvider[provider]?.status ?? null;
+      if (
+        prev === "syncing" &&
+        next &&
+        next !== "syncing" &&
+        (next === "connected" || next === "error" || next === "needs_reauth")
+      ) {
+        if (next === "connected") {
+          setNotice((current) => current || "Sync finished. Check Menu and Sales for updates.");
+        } else if (connectionsByProvider[provider]?.lastError) {
+          setError(connectionsByProvider[provider]?.lastError ?? "");
+        }
       }
+      nextStatuses[provider] = next;
     }
-    priorSquareStatus.current = next;
-  }, [squareConnection?.status, squareConnection?.lastError]);
+    priorStatuses.current = nextStatuses;
+  }, [connectionsByProvider]);
 
-  async function connectSquare() {
+  async function connectConnector(provider: ConnectorProvider, label: string) {
     if (!setup) return;
     setBusy(true);
     setError("");
@@ -269,56 +304,34 @@ export function SourcesWorkspace({
       await request<MigrationSetup>("/v1/migration-setup", {
         method: "PUT",
         body: JSON.stringify({
-          posSystem: posSystem.trim() || "Square",
+          posSystem: posSystem.trim() || label,
           accountingSystem: accountingSystem.trim() || null,
           setupApproach: setup.setupApproach,
           markComplete: false,
         }),
       });
       toolsDirtyRef.current = false;
-      const { url } = await request<{ url: string }>("/v1/connections/square/authorize");
+      const { url } = await request<{ url: string }>(
+        `/v1/connections/${provider}/authorize`,
+      );
       window.location.href = url;
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Square connect couldn't start.");
+      setError(cause instanceof Error ? cause.message : `${label} connect couldn't start.`);
       setBusy(false);
     }
   }
 
-  async function connectClover() {
-    if (!setup) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await request<MigrationSetup>("/v1/migration-setup", {
-        method: "PUT",
-        body: JSON.stringify({
-          posSystem: posSystem.trim() || "Clover",
-          accountingSystem: accountingSystem.trim() || null,
-          setupApproach: setup.setupApproach,
-          markComplete: false,
-        }),
-      });
-      toolsDirtyRef.current = false;
-      const { url } = await request<{ url: string }>("/v1/connections/clover/authorize");
-      window.location.href = url;
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Clover connect couldn't start.");
-      setBusy(false);
-    }
-  }
-
-  async function disconnectClover() {
-    if (!window.confirm("Disconnect Clover? Synced menu and sales stay in Parline.")) return;
+  async function disconnectProvider(provider: ConnectorProvider, label: string) {
+    if (!window.confirm(`Disconnect ${label}? Synced menu and sales stay in Parline.`)) return;
     setBusy(true);
     setError("");
     try {
-      await request("/v1/connections/clover/disconnect", { method: "POST", body: "{}" });
-      setNotice("Clover disconnected.");
-      setCloverConnection(null);
+      await request(`/v1/connections/${provider}/disconnect`, { method: "POST", body: "{}" });
+      setNotice(`${label} disconnected.`);
+      setConnectionsByProvider((current) => ({ ...current, [provider]: null }));
       void load();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Clover couldn't be disconnected.");
+      setError(cause instanceof Error ? cause.message : `${label} couldn't be disconnected.`);
     } finally {
       setBusy(false);
     }
@@ -330,34 +343,19 @@ export function SourcesWorkspace({
     setNotice("");
     try {
       await request("/v1/connections/square/sync", { method: "POST", body: "{}" });
-      setSquareSyncPending(true);
+      setSyncingProvider("square");
       setNotice("Square sync started. Menu and sales will update when it finishes.");
-      const square = await load({ quiet: true });
-      if (square && square.status !== "syncing" && square.status !== "connected") {
-        // queued → may still be connected until worker claims
-        setSquareConnection((current) =>
-          current ? { ...current, status: "syncing" } : current,
+      const connections = await load({ quiet: true });
+      const square = connections?.square ?? null;
+      if (square && square.status !== "syncing") {
+        // queued → may still read connected until a worker claims the run
+        setConnectionsByProvider((current) =>
+          current.square ? { ...current, square: { ...current.square!, status: "syncing" } } : current,
         );
       }
     } catch (cause) {
-      setSquareSyncPending(false);
+      setSyncingProvider(null);
       setError(cause instanceof Error ? cause.message : "Square sync couldn't start.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function disconnectSquare() {
-    if (!window.confirm("Disconnect Square? Synced menu and sales stay in Parline.")) return;
-    setBusy(true);
-    setError("");
-    try {
-      await request("/v1/connections/square/disconnect", { method: "POST", body: "{}" });
-      setNotice("Square disconnected.");
-      setSquareConnection(null);
-      void load();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Square couldn't be disconnected.");
     } finally {
       setBusy(false);
     }
@@ -444,8 +442,6 @@ export function SourcesWorkspace({
     : 0;
   const incomplete = Boolean(setup && !setup.completedAt);
   const activated = setupPlan?.activationState === "active";
-  const squareSelected = setupPlan?.connectors.some(connector => connector.selected && connector.provider === "square") ?? false;
-  const cloverSelected = setupPlan?.connectors.some(connector => connector.selected && connector.provider === "clover") ?? false;
 
   return (
     <section
@@ -492,156 +488,26 @@ export function SourcesWorkspace({
               <button className="text-button" type="button" disabled={busy} onClick={() => void chooseApproach(setup.setupApproach === "assisted" ? "self_service" : "assisted")}>{setup.setupApproach === "assisted" ? "Cancel help and set it up myself" : "Request setup help"}</button>
             </section>
           )}
-          {(posSystem === "Square" || squareSelected || Boolean(squareConnection)) && <section className="sources-tools square-connect-panel" aria-labelledby="square-connect-heading">
-            <div className="list-heading">
-              <h2 id="square-connect-heading">Square</h2>
-            </div>
-            {squareConfigured ? (
-              squareConnection && squareConnection.status !== "disconnected" ? (
-                <>
-                  <p>
-                    Status: <strong>{squareSelected ? squareStatusLabel(squareConnection.status) : "Not selected"}</strong>
-                    {squareConnection.lastSuccessAt
-                      ? ` · Last successful sync ${recencyLabel(squareConnection.lastSuccessAt, "sync")}`
-                      : squareConnection.lastSyncAt
-                        ? ` · Last attempt ${recencyLabel(squareConnection.lastSyncAt, "sync")}`
-                        : " · Waiting for first sync"}
-                  </p>
-                  {squareConnection.lastError && (
-                    <p className="form-error" role="alert">
-                      {squareConnection.lastError}
-                    </p>
-                  )}
-                  {(squareConnection.lastSyncStats?.linesSkipped ?? 0) > 0 && (
-                    <p className="review-warning" role="status">
-                      {squareConnection.lastSyncStats?.linesSkipped} order line
-                      {(squareConnection.lastSyncStats?.linesSkipped ?? 0) === 1 ? "" : "s"}{" "}
-                      couldn't be matched to menu items and weren't counted in sales. Review Menu —
-                      custom or removed Square items are usually the cause.
-                    </p>
-                  )}
-                  <p>
-                    {!squareSelected
-                      ? "Select Square as your menu and sales source to sync."
-                      : squareConnection.status === "error" || squareConnection.status === "needs_reauth"
-                      ? "Square needs attention before menu and sales can update again. Synced records stay in Parline."
-                      : "Square fills menu items and recent sales automatically. Inventory counts and supplier invoices stay in Parline."}
-                  </p>
-                  <div className="card-actions">
-                    {squareSelected && squareConnection.status !== "needs_reauth" && squareConnection.status !== "error" && <button
-                      className="ledger-button"
-                      type="button"
-                      disabled={
-                        busy ||
-                        squareSyncPending ||
-                        squareConnection.status === "syncing"
-                      }
-                      onClick={() => void syncSquare()}
-                    >
-                      {busy ||
-                      squareSyncPending ||
-                      squareConnection.status === "syncing"
-                        ? "Syncing…"
-                        : "Sync now"}
-                    </button>}
-                    {squareSelected && (squareConnection.status === "needs_reauth" ||
-                      squareConnection.status === "error") && (
-                      <button
-                        className="ledger-button"
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void connectSquare()}
-                      >
-                        Reconnect
-                      </button>
-                    )}
-                    <button
-                      className="text-button"
-                      type="button"
-                      disabled={busy}
-                      onClick={() => void disconnectSquare()}
-                    >
-                      Disconnect
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <p>
-                    Connect Square to pull your menu and about 90 days of sales — no CSV export
-                    required.
-                  </p>
-                  <button
-                    className="ledger-button"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void connectSquare()}
-                  >
-                    {busy ? "Opening Square…" : "Connect Square"}
-                  </button>
-                </>
-              )
-            ) : (
-              <p>
-                Square connect is not configured on this server yet. You can still import menu and
-                sales with CSV, or ask for setup help.
-              </p>
-            )}
-          </section>}
-
-          {(posSystem === "Clover" || cloverSelected || Boolean(cloverConnection)) && <section className="sources-tools square-connect-panel" aria-labelledby="clover-connect-heading">
-            <div className="list-heading">
-              <h2 id="clover-connect-heading">Clover</h2>
-            </div>
-            {cloverConfigured ? (
-              cloverConnection && cloverConnection.status !== "disconnected" ? (
-                <>
-                  <p>
-                    Status: <strong>{cloverSelected ? squareStatusLabel(cloverConnection.status) : "Not selected"}</strong>
-                    {cloverConnection.lastSuccessAt
-                      ? ` · Last successful sync ${recencyLabel(cloverConnection.lastSuccessAt, "sync")}`
-                      : cloverConnection.lastSyncAt
-                        ? ` · Last attempt ${recencyLabel(cloverConnection.lastSyncAt, "sync")}`
-                        : " · Waiting for first sync"}
-                  </p>
-                  {cloverConnection.lastError && (
-                    <p className="form-error" role="alert">
-                      {cloverConnection.lastError}
-                    </p>
-                  )}
-                  <p>
-                    {!cloverSelected
-                      ? "Select Clover as your menu and sales source to sync."
-                      : "Clover fills menu items and recent sales automatically once syncing is enabled. Inventory counts and supplier invoices stay in Parline."}
-                  </p>
-                  <div className="card-actions">
-                    <button className="text-button" type="button" disabled={busy} onClick={() => void disconnectClover()}>
-                      Disconnect
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <p>
-                    Connect Clover to pull your menu and recent sales — no CSV export required.
-                  </p>
-                  <button
-                    className="ledger-button"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void connectClover()}
-                  >
-                    {busy ? "Opening Clover…" : "Connect Clover"}
-                  </button>
-                </>
-              )
-            ) : (
-              <p>
-                Clover connect is not configured on this server yet. You can still import menu and
-                sales with CSV, or ask for setup help.
-              </p>
-            )}
-          </section>}
+          {CONNECTORS.map(({ provider, label }) => (
+            <ConnectorPanel
+              key={provider}
+              provider={provider}
+              label={label}
+              busy={busy}
+              syncing={syncingProvider === provider}
+              connection={connectionsByProvider[provider]}
+              configured={configuredByProvider[provider]}
+              selected={Boolean(
+                setupPlan?.connectors.some(
+                  (connector) => connector.selected && connector.provider === provider,
+                ),
+              )}
+              posPicked={posSystem === label}
+              onConnect={() => void connectConnector(provider, label)}
+              onDisconnect={() => void disconnectProvider(provider, label)}
+              onSync={() => void syncSquare()}
+            />
+          ))}
 
           <form className="sources-tools" onSubmit={saveTools}>
             <div className="list-heading">
@@ -824,10 +690,12 @@ function SetupApproachChoice({ busy, onChoose }: { busy: boolean; onChoose: (app
   </section>;
 }
 
-function squareStatusLabel(status: string) {
+function connectionStatusLabel(status: string) {
   switch (status) {
     case "connected":
       return "Connected";
+    case "importing":
+      return "Importing";
     case "syncing":
       return "Syncing";
     case "needs_reauth":
@@ -839,6 +707,135 @@ function squareStatusLabel(status: string) {
     default:
       return status;
   }
+}
+
+/// One provider-neutral connect panel. Square-specific controls (sync now,
+/// reconnect on error) stay gated to the provider that has a sync pipeline.
+function ConnectorPanel({
+  provider,
+  label,
+  busy,
+  syncing,
+  connection,
+  configured,
+  selected,
+  posPicked,
+  onConnect,
+  onDisconnect,
+  onSync,
+}: {
+  provider: ConnectorProvider;
+  label: string;
+  busy: boolean;
+  syncing: boolean;
+  connection: ProviderConnection | null;
+  configured: boolean;
+  selected: boolean;
+  posPicked: boolean;
+  onConnect: () => void;
+  onDisconnect: () => void;
+  onSync: () => void;
+}) {
+  // The panel itself stays discoverable when the restaurant picked this POS.
+  if (!(posPicked || selected || Boolean(connection))) return null;
+  const active = Boolean(connection && connection.status !== "disconnected");
+  const hasSyncPipeline = provider === "square";
+  const menuSyncedAt = connection?.menuLastSuccessAt ?? connection?.lastSuccessAt ?? null;
+  const salesSyncedAt = connection?.salesLastSuccessAt ?? connection?.lastSuccessAt ?? null;
+  const stats = connection?.lastSyncStats ?? null;
+
+  return (
+    <section className="sources-tools square-connect-panel" aria-labelledby={`${provider}-connect-heading`}>
+      <div className="list-heading">
+        <h2 id={`${provider}-connect-heading`}>{label}</h2>
+      </div>
+      {configured ? (
+        active && connection ? (
+          <>
+            <p>
+              Status: <strong>{selected ? connectionStatusLabel(connection.status) : "Not selected"}</strong>
+              {connection.lastSuccessAt
+                ? ` · Last successful sync ${recencyLabel(connection.lastSuccessAt, "sync")}`
+                : connection.lastSyncAt
+                  ? ` · Last attempt ${recencyLabel(connection.lastSyncAt, "sync")}`
+                  : " · Waiting for first sync"}
+            </p>
+            {(menuSyncedAt || salesSyncedAt) && (
+              <p className="source-recency">
+                Menu synced {recencyLabel(menuSyncedAt, "menu sync")} · Sales synced{" "}
+                {recencyLabel(salesSyncedAt, "sales sync")}
+              </p>
+            )}
+            {connection.lastError && (
+              <p className="form-error" role="alert">
+                {connection.lastError}
+              </p>
+            )}
+            {(stats?.menu?.upserted != null || stats?.daysWritten != null) && (
+              <p>
+                Last sync brought {stats?.menu?.upserted ?? 0} menu item
+                {(stats?.menu?.upserted ?? 0) === 1 ? "" : "s"} and {stats?.daysWritten ?? 0} sales
+                day{(stats?.daysWritten ?? 0) === 1 ? "" : "s"}.
+              </p>
+            )}
+            {(stats?.linesSkipped ?? 0) > 0 && (
+              <p className="review-warning" role="status">
+                {stats?.linesSkipped} order line
+                {(stats?.linesSkipped ?? 0) === 1 ? "" : "s"} couldn't be matched to menu items and
+                weren't counted in sales. Review Menu — custom or removed {label} items are usually
+                the cause.
+              </p>
+            )}
+            <p>
+              {!selected
+                ? `Select ${label} as your menu and sales source to sync.`
+                : !hasSyncPipeline
+                ? `${label} fills menu items and recent sales automatically once syncing is enabled. Inventory counts and supplier invoices stay in Parline.`
+                : connection.status === "error" || connection.status === "needs_reauth"
+                ? `${label} needs attention before menu and sales can update again. Synced records stay in Parline.`
+                : `${label} fills menu items and recent sales automatically. Inventory counts and supplier invoices stay in Parline.`}
+            </p>
+            <div className="card-actions">
+              {hasSyncPipeline && selected && connection.status !== "needs_reauth" && connection.status !== "error" && (
+                <button
+                  className="ledger-button"
+                  type="button"
+                  disabled={busy || syncing || connection.status === "syncing"}
+                  onClick={onSync}
+                >
+                  {busy || syncing || connection.status === "syncing" ? "Syncing…" : "Sync now"}
+                </button>
+              )}
+              {hasSyncPipeline &&
+                selected &&
+                (connection.status === "needs_reauth" || connection.status === "error") && (
+                  <button className="ledger-button" type="button" disabled={busy} onClick={onConnect}>
+                    Reconnect
+                  </button>
+                )}
+              <button className="text-button" type="button" disabled={busy} onClick={onDisconnect}>
+                Disconnect
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p>
+              Connect {label} to pull your menu and recent sales — no CSV export required.
+            </p>
+            <button className="ledger-button" type="button" disabled={busy} onClick={onConnect}>
+              {busy ? `Opening ${label}…` : `Connect ${label}`}
+            </button>
+          </>
+        )
+      ) : selected || connection ? (
+        <p>
+          {label} connect is not configured on this server yet. You can still import menu and sales
+          with CSV, or ask for setup help.
+        </p>
+      ) : null}
+    </section>
+  );
 }
 
 function SourceHealthCard({
