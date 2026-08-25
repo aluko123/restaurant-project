@@ -22,6 +22,10 @@ const RETRY_DELAYS_SECS: [u64; 5] = [30, 5 * 60, 60 * 60, 6 * 60 * 60, 18 * 60 *
 const MAX_ROWS: usize = 2000;
 #[cfg(test)]
 const MAX_ERRORS: usize = 25;
+/// Spreadsheet imports parse deterministically in production too, so their
+/// limits are not test-only.
+const SPREADSHEET_MAX_ROWS: usize = 2000;
+const SPREADSHEET_MAX_ERRORS: usize = 25;
 #[derive(sqlx::FromRow)]
 struct Member {
     restaurant_id: Uuid,
@@ -101,15 +105,32 @@ pub(crate) async fn create(
     }
     let (name, b) = file.ok_or(ApiError(
         StatusCode::UNPROCESSABLE_ENTITY,
-        "Attach one CSV file in the file field.",
+        "Attach one CSV or spreadsheet file in the file field.",
     ))?;
     if b.is_empty() || b.len() > MAX_BYTES {
         return Err(ApiError(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "CSV files must be between 1 byte and 1 MiB.",
+            "Inventory files must be between 1 byte and 1 MiB.",
         ));
     }
     let hash = format!("{:x}", Sha256::digest(&b));
+
+    // Spreadsheets have a fixed grid, so they parse deterministically right
+    // here — no extraction model, and the preview is ready immediately.
+    if is_spreadsheet(&name) {
+        let parsed = parse_spreadsheet(&b)?;
+        // The original is kept for audit only; nothing re-reads it, so a
+        // storage hiccup must not fail an already-parsed import.
+        let key = format!(
+            "restaurants/{}/inventory-imports/{}/original.xlsx",
+            m.restaurant_id,
+            Uuid::now_v7()
+        );
+        if let Err(error) = s.storage.put(&key, "application/vnd.ms-excel", b).await {
+            tracing::error!(%error, "inventory spreadsheet archive upload failed");
+        }
+        return insert_import_sync(&s, &m, name, hash, parsed).await;
+    }
 
     // Re-uploading the same file returns the existing import so retries are
     // safe and never duplicate records.
@@ -214,7 +235,6 @@ pub(crate) async fn create(
     }
 }
 
-#[cfg(test)]
 async fn insert_import_sync(
     s: &AppState,
     m: &Member,
@@ -849,6 +869,147 @@ fn parse(b: &[u8]) -> Result<Vec<(Row, Vec<String>)>, ApiError> {
     }
     Ok(out)
 }
+
+fn is_spreadsheet(filename: &str) -> bool {
+    let lower = filename.to_lowercase();
+    lower.ends_with(".xlsx") || lower.ends_with(".xlsm") || lower.ends_with(".xls")
+}
+
+/// Renders a cell the way a CSV export would have: trimmed text, whole
+/// numbers without a decimal tail, decimals without float noise.
+fn cell_text(cell: &calamine::Data) -> String {
+    match cell {
+        calamine::Data::Empty => String::new(),
+        calamine::Data::String(value) => value.trim().to_owned(),
+        calamine::Data::Float(value) => format_number(*value),
+        calamine::Data::Int(value) => value.to_string(),
+        calamine::Data::Bool(value) => value.to_string(),
+        calamine::Data::DateTime(value) => format_number(value.as_f64()),
+        calamine::Data::DateTimeIso(value) | calamine::Data::DurationIso(value) => {
+            value.trim().to_owned()
+        }
+        calamine::Data::Error(_) => String::new(),
+    }
+}
+
+fn format_number(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 9e15 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
+/// Same v1 rules as the CSV parser — exact header set, unique columns,
+/// required name/count_unit — applied to the workbook's first sheet.
+fn parse_spreadsheet(b: &[u8]) -> Result<Vec<(Row, Vec<String>)>, ApiError> {
+    use calamine::Reader as _;
+    let mut workbook =
+        calamine::open_workbook_auto_from_rs(std::io::Cursor::new(b)).map_err(|_| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "We couldn't read this spreadsheet. Try exporting it again.",
+            )
+        })?;
+    let range = workbook
+        .worksheet_range_at(0)
+        .ok_or(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The spreadsheet has no sheets.",
+        ))?
+        .map_err(|_| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "We couldn't read this spreadsheet. Try exporting it again.",
+            )
+        })?;
+    let mut rows = range.rows();
+    let headers = rows.next().ok_or(ApiError(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "The spreadsheet must have a header row.",
+    ))?;
+    let allowed = ["name", "count_unit", "category", "par_level"];
+    let mut index = std::collections::HashMap::new();
+    for (i, header) in headers.iter().enumerate() {
+        let header = cell_text(header);
+        if !allowed.contains(&header.as_str()) || index.insert(header.clone(), i).is_some() {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Spreadsheet headers must be unique v1 inventory headers.",
+            ));
+        }
+    }
+    if !index.contains_key("name") || !index.contains_key("count_unit") {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Spreadsheets require name and count_unit headers.",
+        ));
+    }
+
+    let mut out = vec![];
+    let mut errors = 0;
+    for (n, record) in rows.enumerate() {
+        if n >= SPREADSHEET_MAX_ROWS {
+            return Err(ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "A spreadsheet may contain no more than 2000 rows.",
+            ));
+        }
+        let value = |key: &str| -> String {
+            index
+                .get(key)
+                .and_then(|i| record.get(*i))
+                .map(cell_text)
+                .unwrap_or_default()
+        };
+        let name = value("name");
+        let count_unit = value("count_unit");
+        let category = Some(value("category")).filter(|v| !v.is_empty());
+        let par_level = Some(value("par_level")).filter(|v| !v.is_empty());
+        let input = ItemInput {
+            name: name.clone(),
+            count_unit: count_unit.clone(),
+            category: category.clone(),
+            par_level: par_level.clone(),
+            storage_area_id: None,
+            shelf_order: 0,
+            preferred_supplier_id: None,
+            active: true,
+        };
+        let mut row_errors = vec![];
+        if let Err(e) = input.validated() {
+            row_errors.push(e.1.into());
+            errors += 1;
+        }
+        if errors > SPREADSHEET_MAX_ERRORS {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "The spreadsheet has too many validation errors.",
+            ));
+        }
+        out.push((
+            Row {
+                id: Uuid::nil(),
+                row_number: (n + 2) as i32,
+                name,
+                category,
+                count_unit,
+                par_level,
+                validation_errors: serde_json::json!([]),
+                selected: None,
+                created_inventory_item_id: None,
+            },
+            row_errors,
+        ));
+    }
+    if out.is_empty() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The spreadsheet must contain at least one row.",
+        ));
+    }
+    Ok(out)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,5 +1036,86 @@ mod tests {
         assert!(parse(b"name,count_unit,category,par_level\nFlour,bag,Dry,2.5\n").is_ok());
         assert!(parse(b"name,quantity\nFlour,2\n").is_err());
         assert!(parse(b"name,count_unit,quantity\nFlour,bag,2\n").is_err());
+    }
+
+    mod cell {
+        pub enum Cell {
+            Text(&'static str),
+            Number(f64),
+        }
+    }
+
+    fn build_xlsx(headers: &[&'static str], rows: &[Vec<cell::Cell>]) -> Vec<u8> {
+        use rust_xlsxwriter::Workbook;
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        for (col, header) in headers.iter().enumerate() {
+            sheet.write(0, col as u16, *header).unwrap();
+        }
+        for (i, row) in rows.iter().enumerate() {
+            for (col, value) in row.iter().enumerate() {
+                match value {
+                    cell::Cell::Text(v) => {
+                        sheet.write(i as u32 + 1, col as u16, *v).unwrap();
+                    }
+                    cell::Cell::Number(v) => {
+                        sheet.write_number(i as u32 + 1, col as u16, *v).unwrap();
+                    }
+                }
+            }
+        }
+        workbook.save_to_buffer().unwrap()
+    }
+
+    #[test]
+    fn spreadsheet_v1_validation() {
+        let valid = build_xlsx(
+            &["name", "count_unit", "category", "par_level"],
+            &[vec![
+                cell::Cell::Text("Flour"),
+                cell::Cell::Text("bag"),
+                cell::Cell::Text("Dry"),
+                cell::Cell::Number(2.5),
+            ]],
+        );
+        let parsed = parse_spreadsheet(&valid).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.name, "Flour");
+        // Numeric par levels read like a CSV export would have written them.
+        assert_eq!(parsed[0].0.par_level.as_deref(), Some("2.5"));
+        assert!(parsed[0].1.is_empty());
+
+        // Only name and count_unit are required headers.
+        let minimal = parse_spreadsheet(&build_xlsx(
+            &["name", "count_unit"],
+            &[vec![cell::Cell::Text("Flour"), cell::Cell::Number(12.0)]],
+        ))
+        .unwrap();
+        assert_eq!(minimal.len(), 1);
+        assert_eq!(minimal[0].0.count_unit, "12");
+        assert!(
+            parse_spreadsheet(&build_xlsx(
+                &["name", "count_unit", "quantity"],
+                &[vec![
+                    cell::Cell::Text("Flour"),
+                    cell::Cell::Text("bag"),
+                    cell::Cell::Number(2.0)
+                ]]
+            ))
+            .is_err()
+        );
+        assert!(parse_spreadsheet(&build_xlsx(&["name", "count_unit"], &[],)).is_err());
+
+        // Whole numbers keep no decimal tail.
+        let whole = parse_spreadsheet(&build_xlsx(
+            &["name", "count_unit", "par_level"],
+            &[vec![
+                cell::Cell::Text("Onions"),
+                cell::Cell::Text("case"),
+                cell::Cell::Number(4.0),
+            ]],
+        ))
+        .unwrap();
+        assert_eq!(whole[0].0.par_level.as_deref(), Some("4"));
     }
 }
