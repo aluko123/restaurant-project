@@ -129,7 +129,7 @@ fn token_key_from_env() -> Result<[u8; 32], ()> {
     Ok(key)
 }
 
-fn encrypt_secret(key: &[u8; 32], plain: &str) -> Result<String, ApiError> {
+pub(crate) fn encrypt_secret(key: &[u8; 32], plain: &str) -> Result<String, ApiError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| encrypt_error())?;
     let mut nonce_bytes = [0u8; 12];
     getrandom::getrandom(&mut nonce_bytes).map_err(|_| encrypt_error())?;
@@ -171,10 +171,10 @@ fn http_client() -> reqwest::Client {
 }
 
 #[derive(sqlx::FromRow)]
-struct Member {
-    restaurant_id: Uuid,
-    user_id: Uuid,
-    role: String,
+pub(crate) struct Member {
+    pub(crate) restaurant_id: Uuid,
+    pub(crate) user_id: Uuid,
+    pub(crate) role: String,
     #[allow(dead_code)]
     timezone: String,
 }
@@ -183,19 +183,19 @@ struct Member {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConnectionView {
     id: Uuid,
-    provider: String,
-    status: String,
-    external_merchant_id: Option<String>,
-    external_location_id: Option<String>,
-    last_sync_at: Option<DateTime<Utc>>,
-    last_success_at: Option<DateTime<Utc>>,
-    last_error: Option<String>,
+    pub(crate) provider: String,
+    pub(crate) status: String,
+    pub(crate) external_merchant_id: Option<String>,
+    pub(crate) external_location_id: Option<String>,
+    pub(crate) last_sync_at: Option<DateTime<Utc>>,
+    pub(crate) last_success_at: Option<DateTime<Utc>>,
+    pub(crate) last_error: Option<String>,
     /// Stats JSON from the newest succeeded run, so the UI can surface
     /// unmatched order lines instead of silently under-counting sales.
-    last_sync_stats: Option<Value>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    configured: bool,
+    pub(crate) last_sync_stats: Option<Value>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
+    pub(crate) configured: bool,
 }
 
 #[derive(Serialize)]
@@ -214,7 +214,7 @@ pub(crate) struct CallbackQuery {
     error_description: Option<String>,
 }
 
-async fn member(state: &AppState, headers: &HeaderMap) -> Result<Member, ApiError> {
+pub(crate) async fn member(state: &AppState, headers: &HeaderMap) -> Result<Member, ApiError> {
     let subject = authenticated_subject(state, headers).await?;
     sqlx::query_as(
         "SELECT m.restaurant_id,u.id user_id,m.role,r.timezone
@@ -233,7 +233,7 @@ async fn member(state: &AppState, headers: &HeaderMap) -> Result<Member, ApiErro
     ))
 }
 
-fn manager(m: &Member) -> Result<(), ApiError> {
+pub(crate) fn manager(m: &Member) -> Result<(), ApiError> {
     if matches!(m.role.as_str(), "owner" | "manager") {
         Ok(())
     } else {
@@ -255,9 +255,16 @@ pub(crate) async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ConnectionView>>, ApiError> {
-    let m = member(&state, &headers).await?;
-    manager(&m)?;
-    let configured = state.square.is_some();
+    connections_list(&state, &headers, PROVIDER, state.square.is_some()).await
+}
+
+pub(crate) async fn connections_list(
+    state: &AppState,
+    headers: &HeaderMap,
+    provider: &str,
+    configured: bool,
+) -> Result<Json<Vec<ConnectionView>>, ApiError> {
+    let m = member(state, headers).await?;
     let mut rows = sqlx::query_as::<_, ConnectionView>(
         "SELECT connection.id,connection.provider,connection.status,
                 connection.external_merchant_id,connection.external_location_id,
@@ -272,7 +279,7 @@ pub(crate) async fn list(
          ORDER BY connection.updated_at DESC",
     )
     .bind(m.restaurant_id)
-    .bind(PROVIDER)
+    .bind(provider)
     .fetch_all(&state.pool)
     .await
     .map_err(database_error)?;
@@ -329,7 +336,7 @@ pub(crate) async fn authorize(
     }))
 }
 
-fn urlencoding_encode(value: &str) -> String {
+pub(crate) fn urlencoding_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len() * 3);
     for byte in value.bytes() {
         match byte {

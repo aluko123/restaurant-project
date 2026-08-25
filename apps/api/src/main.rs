@@ -1,4 +1,5 @@
 mod auth;
+mod clover;
 mod costing;
 mod extraction;
 mod inventory;
@@ -55,6 +56,7 @@ struct AppState {
     gemini: extraction::GeminiClient,
     workos: WorkosClient,
     square: Option<square::SquareConfig>,
+    clover: Option<clover::CloverConfig>,
 }
 
 #[derive(Serialize)]
@@ -189,6 +191,12 @@ async fn main() -> Result<()> {
         gemini.clone(),
     ));
     let square_config = square::SquareConfig::from_env(&web_origin);
+    let clover_config = clover::CloverConfig::from_env(&web_origin);
+    if clover_config.is_some() {
+        info!("Clover connect configured");
+    } else {
+        info!("Clover connect not configured (set CLOVER_* env vars to enable)");
+    }
     if square_config.is_some() {
         info!("Square connect configured");
     } else {
@@ -210,6 +218,7 @@ async fn main() -> Result<()> {
             gemini,
             workos,
             square: square_config,
+            clover: clover_config,
         },
         web_origin
             .parse::<HeaderValue>()
@@ -255,8 +264,8 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
             axum::routing::put(setup::put_stream).delete(setup::delete_stream),
         )
         .route(
-            "/v1/setup/connectors/square",
-            axum::routing::put(setup::put_square),
+            "/v1/setup/connectors/{provider}",
+            axum::routing::put(setup::put_connector),
         )
         .route("/v1/settings", get(settings::get).put(settings::update))
         .route("/v1/settings/invitations", post(settings::invite))
@@ -365,6 +374,14 @@ fn router(state: AppState, web_origin: HeaderValue) -> Router {
         .route("/v1/suppliers/{id}", axum::routing::put(suppliers::update))
         .route("/v1/suppliers/{id}/archive", post(suppliers::archive))
         .route("/v1/connections", get(square::list))
+        .route("/v1/connections/clover", get(clover::list))
+        .route("/v1/connections/clover/status", get(clover::status))
+        .route("/v1/connections/clover/authorize", get(clover::authorize))
+        .route("/v1/connections/clover/callback", get(clover::callback))
+        .route(
+            "/v1/connections/clover/disconnect",
+            post(clover::disconnect),
+        )
         .route("/v1/connections/square/status", get(square::square_status))
         .route("/v1/connections/square/authorize", get(square::authorize))
         .route("/v1/connections/square/callback", get(square::callback))
