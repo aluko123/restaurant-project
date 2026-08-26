@@ -47,6 +47,7 @@ jobs:
         env:
           VITE_API_URL: https://parline-api.fly.dev
           VITE_WORKOS_CLIENT_ID: ${{ secrets.VITE_WORKOS_CLIENT_ID }}
+          VITE_SETUP_BOOKING_URL: https://cal.com/fola-aluko-7tzoaq/parline-setup
         run: |
           if [ -z "$VITE_WORKOS_CLIENT_ID" ]; then
             echo "VITE_WORKOS_CLIENT_ID secret is required" >&2
