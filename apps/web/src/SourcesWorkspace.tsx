@@ -486,6 +486,7 @@ export function SourcesWorkspace({
               <p className="section-code">{setup.setupApproach === "assisted" ? "Setup help requested" : "You are leading setup"}</p>
               <h2 id="setup-path-heading">{setup.setupApproach === "assisted" ? "Launch with Parline" : "Self-service setup"}</h2>
               <p>{firstCountSummary(setup.setupApproach, setupPlan?.firstCountHandoff)}</p>
+              {setup.setupApproach === "assisted" && <SetupContactActions />}
               <button className="text-button" type="button" disabled={busy} onClick={() => void chooseApproach(setup.setupApproach === "assisted" ? "self_service" : "assisted")}>{setup.setupApproach === "assisted" ? "Cancel help and set it up myself" : "Request setup help"}</button>
             </section>
           )}
@@ -689,6 +690,35 @@ function firstCountSummary(
     : "Import inventory to begin.";
 }
 
+/// Concierge contact targets, set at build time so they can change without
+/// code edits. Empty values hide their UI instead of showing dead links.
+const SETUP_BOOKING_URL = import.meta.env.VITE_SETUP_BOOKING_URL?.trim() ?? "";
+const SETUP_PHONE = import.meta.env.VITE_SETUP_PHONE?.trim() ?? "";
+
+function SetupContactActions() {
+  if (!SETUP_BOOKING_URL && !SETUP_PHONE) return null;
+  return (
+    <>
+      {SETUP_BOOKING_URL && (
+        <a
+          className="ledger-button"
+          href={SETUP_BOOKING_URL}
+          target="_blank"
+          rel="noreferrer noopener"
+        >
+          Book your setup call
+        </a>
+      )}
+      {SETUP_PHONE && (
+        <p>
+          Prefer to talk first? Call{" "}
+          <a href={`tel:${SETUP_PHONE.replace(/[^+\d]/g, "")}`}>{SETUP_PHONE}</a>.
+        </p>
+      )}
+    </>
+  );
+}
+
 function SetupApproachChoice({ busy, onChoose }: { busy: boolean; onChoose: (approach: "assisted" | "self_service") => Promise<void> }) {
   return <section className="setup-approach" aria-labelledby="setup-approach-heading">
     <p className="section-code">Choose how to launch</p>
@@ -697,8 +727,9 @@ function SetupApproachChoice({ busy, onChoose }: { busy: boolean; onChoose: (app
       <article className="setup-approach-card setup-approach-recommended">
         <p className="invoice-status">Recommended</p>
         <h3>Launch with Parline</h3>
-        <p>Request a setup handoff with the Parline team. We coordinate with you, prepare imports and mappings, and get the first count ready. You authorize accounts and confirm restaurant-specific decisions.</p>
-        <button className="ledger-button" type="button" disabled={busy} onClick={() => void onChoose("assisted")}>{busy ? "Sending request…" : "Request guided setup"}</button>
+        <p>Get on a call with us and we'll do the heavy lifting together — imports, mappings, and your first count, ready to go. A one-time setup fee covers it; you stay in control of every decision.</p>
+        <SetupContactActions />
+        <button className="text-button" type="button" disabled={busy} onClick={() => void onChoose("assisted")}>{busy ? "Sending request…" : "Leave a request in Parline instead"}</button>
       </article>
       <article className="setup-approach-card">
         <h3>Set it up myself</h3>
