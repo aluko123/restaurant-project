@@ -237,10 +237,30 @@ async fn request(
 }
 
 async fn multipart_csv(app: Router, token: &str, csv: &str) -> ApiResponse {
+    multipart_file(
+        app,
+        token,
+        "inventory.csv",
+        "text/csv",
+        bytes::Bytes::from(csv.to_owned()),
+    )
+    .await
+}
+
+async fn multipart_file(
+    app: Router,
+    token: &str,
+    filename: &str,
+    content_type: &str,
+    payload: bytes::Bytes,
+) -> ApiResponse {
     let boundary = "release-test-inventory-boundary";
     let body = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"inventory.csv\"\r\nContent-Type: text/csv\r\n\r\n{csv}\r\n--{boundary}--\r\n"
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
     );
+    let mut parts: Vec<u8> = body.into_bytes();
+    parts.extend_from_slice(&payload);
+    parts.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     let response = app
         .oneshot(
             Request::builder()
@@ -251,7 +271,7 @@ async fn multipart_csv(app: Router, token: &str, csv: &str) -> ApiResponse {
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={boundary}"),
                 )
-                .body(Body::from(body))
+                .body(Body::from(parts))
                 .unwrap(),
         )
         .await
@@ -4086,6 +4106,73 @@ async fn menu_import_review_returns_items_and_last_error() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["name"], json!("Cold Brew"));
     assert_eq!(items[0]["sellingPrice"], json!("5.5000"));
+
+    fixture.drop().await;
+}
+
+/// Spreadsheets parse deterministically at upload — no extraction model and
+/// no background job — so the preview is ready immediately.
+#[tokio::test]
+#[ignore = "run by scripts/release-gate.sh with disposable PostgreSQL databases"]
+async fn inventory_xlsx_imports_parse_immediately_for_review() {
+    use rust_xlsxwriter::Workbook;
+
+    let fixture = ApiFixture::create("inventory_xlsx").await;
+    let owner = fixture.token("owner-a");
+
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_worksheet();
+    for (col, header) in ["name", "count_unit", "category", "par_level"]
+        .iter()
+        .enumerate()
+    {
+        sheet.write(0, col as u16, *header).unwrap();
+    }
+    sheet.write(1, 0, "Flour").unwrap();
+    sheet.write(1, 1, "bag").unwrap();
+    sheet.write(1, 2, "Dry goods").unwrap();
+    sheet.write_number(1, 3, 2.5).unwrap();
+    let bytes = bytes::Bytes::from(workbook.save_to_buffer().unwrap());
+
+    let upload = multipart_file(
+        fixture.app.clone(),
+        &owner,
+        "inventory.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        bytes.clone(),
+    )
+    .await;
+    assert_eq!(upload.status, StatusCode::CREATED);
+    assert_eq!(upload.body["status"], json!("needs_review"));
+    let import_id = upload.body["id"].as_str().unwrap().to_owned();
+    let rows = upload.body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], json!("Flour"));
+    assert_eq!(rows[0]["parLevel"], json!("2.5"));
+    assert_eq!(rows[0]["validationErrors"], json!([]));
+
+    // Re-uploading the same file returns the existing import.
+    let duplicate = multipart_file(
+        fixture.app.clone(),
+        &owner,
+        "inventory.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        bytes,
+    )
+    .await;
+    assert_eq!(duplicate.status, StatusCode::OK);
+    assert_eq!(duplicate.body["id"].as_str().unwrap(), &import_id);
+
+    // A corrupt spreadsheet is a clean 422, not a 500 or a stuck job.
+    let corrupt = multipart_file(
+        fixture.app.clone(),
+        &owner,
+        "inventory.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        bytes::Bytes::from_static(b"not really a zip"),
+    )
+    .await;
+    assert_eq!(corrupt.status, StatusCode::UNPROCESSABLE_ENTITY);
 
     fixture.drop().await;
 }
