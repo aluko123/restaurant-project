@@ -47,8 +47,6 @@ type SetupPlan = {
   connectors: Array<{ provider: string; supported: boolean; configured: boolean; selected: boolean; capabilities: ["menu", "sales"]; status: string | null }>;
 };
 
-const posOptions = ["Toast", "Square", "Clover", "Lightspeed", "SpotOn", "TouchBistro", "Revel"];
-
 function formatWhen(value: string | null, timezone?: string) {
   if (!value) return "Not yet";
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
@@ -136,6 +134,7 @@ export function SourcesWorkspace({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [posSystem, setPosSystem] = useState("");
+  const [otherPos, setOtherPos] = useState("");
   const [accountingSystem, setAccountingSystem] = useState("");
   const [connectionsByProvider, setConnectionsByProvider] = useState<
     Record<ConnectorProvider, ProviderConnection | null>
@@ -175,6 +174,8 @@ export function SourcesWorkspace({
         setSetupPlan(plan);
         if (!toolsDirtyRef.current) {
           setPosSystem(next.posSystem ?? "");
+          const stored = next.posSystem ?? "";
+          setOtherPos(stored === "Square" || stored === "Clover" ? "" : stored);
           setAccountingSystem(next.accountingSystem ?? "");
         }
         const nextConnections = { square: null, clover: null } as Record<
@@ -301,7 +302,7 @@ export function SourcesWorkspace({
       await request<MigrationSetup>("/v1/migration-setup", {
         method: "PUT",
         body: JSON.stringify({
-          posSystem: posSystem.trim() || label,
+          posSystem: label,
           accountingSystem: accountingSystem.trim() || null,
           setupApproach: setup.setupApproach,
           markComplete: false,
@@ -370,13 +371,14 @@ export function SourcesWorkspace({
       const next = await request<MigrationSetup>("/v1/migration-setup", {
         method: "PUT",
         body: JSON.stringify({
-          posSystem: posSystem.trim() || null,
+          posSystem: otherPos.trim() || null,
           accountingSystem: accountingSystem.trim() || null,
           setupApproach: setup.setupApproach,
           markComplete: false,
         }),
       });
       setSetup(next);
+      setPosSystem(otherPos.trim() || "");
       setSetupPlan(await request<SetupPlan>("/v1/setup"));
       toolsDirtyRef.current = false;
       setNotice("Saved your menu and sales source.");
@@ -396,7 +398,7 @@ export function SourcesWorkspace({
       const next = await request<MigrationSetup>("/v1/migration-setup", {
         method: "PUT",
         body: JSON.stringify({
-          posSystem: posSystem.trim() || null,
+          posSystem: otherPos.trim() || null,
           accountingSystem: accountingSystem.trim() || null,
           setupApproach: approach,
           markComplete: false,
@@ -420,7 +422,7 @@ export function SourcesWorkspace({
       const next = await request<MigrationSetup>("/v1/migration-setup", {
         method: "PUT",
         body: JSON.stringify({
-          posSystem: posSystem.trim() || null,
+          posSystem: otherPos.trim() || null,
           accountingSystem: accountingSystem.trim() || null,
           setupApproach: setup.setupApproach,
           markComplete: true,
@@ -514,30 +516,48 @@ export function SourcesWorkspace({
               <h2>Menu and sales source</h2>
             </div>
             <p>
-              Choose the POS or ordering system that holds your menu and sales. Square can connect
-              directly; other systems use a guided export for now.
+              Square and Clover connect directly — menu items and recent sales fill themselves.
+              On another system, name it below and bring your records in as CSV exports instead.
             </p>
+            <div className="setup-approach-options">
+              <article className="setup-approach-card">
+                <h3>Square</h3>
+                <p>Connect once to pull your menu and recent sales automatically.</p>
+                <button
+                  className="ledger-button"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void connectConnector("square", "Square")}
+                >
+                  {busy ? "Opening Square…" : "Connect Square"}
+                </button>
+              </article>
+              <article className="setup-approach-card">
+                <h3>Clover</h3>
+                <p>Connect once to pull your menu and recent sales automatically.</p>
+                <button
+                  className="ledger-button"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void connectConnector("clover", "Clover")}
+                >
+                  {busy ? "Opening Clover…" : "Connect Clover"}
+                </button>
+              </article>
+            </div>
             <div className="inventory-form-fields">
               <label>
-                POS <span>Optional</span>
-                <select
-                  value={posSystem}
+                Other POS or ordering system <span>Optional · context only</span>
+                <input
+                  value={otherPos}
+                  placeholder="e.g. Toast"
                   onChange={(e) => {
                     toolsDirtyRef.current = true;
-                    setPosSystem(e.target.value);
+                    setOtherPos(e.target.value);
                   }}
-                >
-                  <option value="">Not set</option>
-                  {posOptions.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                  {posSystem && !posOptions.includes(posSystem) && (
-                    <option value={posSystem}>{posSystem}</option>
-                  )}
-                </select>
+                />
               </label>
+              <small>Saved for context only. CSV import covers every system.</small>
             </div>
             <button className="file-button" type="submit" disabled={busy}>
               {busy ? "Saving…" : "Save source"}
