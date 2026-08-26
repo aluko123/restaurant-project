@@ -14,10 +14,10 @@ use uuid::Uuid;
 use crate::{ApiError, AppState, authenticated_subject, database_error, invoices::strict_decimal};
 
 #[derive(sqlx::FromRow)]
-struct Membership {
-    restaurant_id: Uuid,
-    user_id: Uuid,
-    role: String,
+pub(crate) struct Membership {
+    pub(crate) restaurant_id: Uuid,
+    pub(crate) user_id: Uuid,
+    pub(crate) role: String,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -164,6 +164,8 @@ pub(crate) struct StartInput {
     storage_area_ids: Option<Vec<Uuid>>,
     #[serde(default)]
     item_ids: Option<Vec<Uuid>>,
+    #[serde(default)]
+    template_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -576,7 +578,31 @@ pub(crate) async fn start(
     let m = membership(&state, &headers).await?;
     let input = body.map(|Json(input)| input).unwrap_or_default();
     let area_ids = input.storage_area_ids.unwrap_or_default();
-    let item_ids = input.item_ids.unwrap_or_default();
+    let mut item_ids = input.item_ids.unwrap_or_default();
+    if input.template_id.is_some() && (!item_ids.is_empty() || !area_ids.is_empty()) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Start from a template or pick items, not both.",
+        ));
+    }
+    if let Some(template_id) = input.template_id {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM count_templates WHERE id=$1 AND restaurant_id=$2)",
+        )
+        .bind(template_id)
+        .bind(m.restaurant_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(database_error)?;
+        if !exists {
+            return Err(ApiError(
+                StatusCode::NOT_FOUND,
+                "This template doesn't exist.",
+            ));
+        }
+        item_ids =
+            crate::count_templates::template_item_ids(&state, m.restaurant_id, template_id).await?;
+    }
     let mut unique_areas = Vec::new();
     let mut seen = HashSet::new();
     for id in area_ids {
@@ -1050,7 +1076,10 @@ async fn validate_area(
     Ok(Some(name))
 }
 
-async fn membership(state: &AppState, headers: &HeaderMap) -> Result<Membership, ApiError> {
+pub(crate) async fn membership(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Membership, ApiError> {
     let subject = authenticated_subject(state, headers).await?;
     sqlx::query_as(
         "SELECT m.restaurant_id,u.id user_id,m.role FROM users u JOIN restaurant_memberships m ON m.user_id=u.id WHERE u.auth_subject=$1",
@@ -1065,7 +1094,7 @@ async fn membership(state: &AppState, headers: &HeaderMap) -> Result<Membership,
     ))
 }
 
-fn require_manager(m: &Membership) -> Result<(), ApiError> {
+pub(crate) fn require_manager(m: &Membership) -> Result<(), ApiError> {
     if matches!(m.role.as_str(), "owner" | "manager") {
         Ok(())
     } else {

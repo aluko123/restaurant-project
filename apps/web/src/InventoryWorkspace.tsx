@@ -23,6 +23,14 @@ export type InventoryItem = {
   lowStock: boolean;
 };
 
+type CountTemplate = {
+  id: string;
+  name: string;
+  itemCount: number;
+  previewNames: string[];
+  createdAt: string;
+};
+
 type Supplier = SupplierOption & {
   archivedAt: string | null;
   createdAt: string;
@@ -117,6 +125,11 @@ type Props = {
 export function InventoryWorkspace({ restaurant, request }: Props) {
   const manager = restaurant.role === "owner" || restaurant.role === "manager";
   const [items, setItems] = useState<InventoryItem[]>([]);
+  const [templates, setTemplates] = useState<CountTemplate[]>([]);
+  const [selectedItemIds, setSelectedItemIds] = useState<string[]>([]);
+  const [itemFilter, setItemFilter] = useState("");
+  const [templateName, setTemplateName] = useState("");
+  const [templateSaving, setTemplateSaving] = useState(false);
   const [areas, setAreas] = useState<StorageArea[]>([]);
   const [count, setCount] = useState<InventoryCount | null>(null);
   const [mode, setMode] = useState<Mode>("overview");
@@ -432,6 +445,85 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
       showError(reason instanceof Error ? reason.message : "The count couldn't start.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function loadTemplates() {
+    try {
+      setTemplates(await request<CountTemplate[]>("/v1/count-templates"));
+    } catch {
+      // Templates are optional sugar; a failed load shouldn't block counting.
+      setTemplates([]);
+    }
+  }
+
+  useEffect(() => {
+    if (mode === "start") void loadTemplates();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  async function startFromTemplate(templateId: string) {
+    setBusy(true);
+    clearFeedback();
+    try {
+      const value = await request<InventoryCount>("/v1/inventory-counts", {
+        method: "POST",
+        body: JSON.stringify({ templateId }),
+      });
+      adoptCount(value);
+      setMode("count");
+    } catch (reason) {
+      showError(reason instanceof Error ? reason.message : "The count couldn't start.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startFromSelectedItems() {
+    setBusy(true);
+    clearFeedback();
+    try {
+      const value = await request<InventoryCount>("/v1/inventory-counts", {
+        method: "POST",
+        body: JSON.stringify({ itemIds: selectedItemIds }),
+      });
+      setSelectedItemIds([]);
+      setItemFilter("");
+      adoptCount(value);
+      setMode("count");
+    } catch (reason) {
+      showError(reason instanceof Error ? reason.message : "The count couldn't start.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveSelectionAsTemplate() {
+    if (!templateName.trim()) return;
+    setTemplateSaving(true);
+    clearFeedback();
+    try {
+      await request("/v1/count-templates", {
+        method: "POST",
+        body: JSON.stringify({ name: templateName.trim(), itemIds: selectedItemIds }),
+      });
+      setTemplateName("");
+      await loadTemplates();
+      showNotice("Template saved. Start it from here anytime.");
+    } catch (reason) {
+      showError(reason instanceof Error ? reason.message : "The template couldn't be saved.");
+    } finally {
+      setTemplateSaving(false);
+    }
+  }
+
+  async function removeTemplate(id: string) {
+    if (!window.confirm("Delete this template?")) return;
+    try {
+      await request(`/v1/count-templates/${id}`, { method: "DELETE" });
+      setTemplates((current) => current.filter((template) => template.id !== id));
+    } catch (reason) {
+      showError(reason instanceof Error ? reason.message : "The template couldn't be deleted.");
     }
   }
 
@@ -1037,6 +1129,109 @@ export function InventoryWorkspace({ restaurant, request }: Props) {
                 onClick={() => void startCount(startAreaIds)}
               >
                 {busy ? "Starting…" : `Count ${startAreaIds.length || ""} selected`}
+              </button>
+            </div>
+          )}
+          {templates.length > 0 && (
+            <div className="area-picker">
+              <h2>Saved templates</h2>
+              {templates.map((template) => (
+                <div className="active-toggle template-row" key={template.id}>
+                  <div>
+                    <strong>{template.name}</strong>{" "}
+                    <span>
+                      {template.itemCount} {template.itemCount === 1 ? "item" : "items"}
+                      {template.previewNames.length
+                        ? ` · ${template.previewNames.join(", ")}`
+                        : ""}
+                    </span>
+                  </div>
+                  <div className="card-actions">
+                    <button
+                      className="file-button"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void startFromTemplate(template.id)}
+                    >
+                      Count
+                    </button>
+                    {manager && (
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() => void removeTemplate(template.id)}
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          {active.length > 0 && (
+            <div className="area-picker">
+              <h2>Or pick items</h2>
+              {active.length > 12 && (
+                <input
+                  type="search"
+                  value={itemFilter}
+                  placeholder="Search items…"
+                  onChange={(event) => setItemFilter(event.target.value)}
+                />
+              )}
+              {active
+                .filter((item) =>
+                  itemFilter.trim()
+                    ? item.name.toLowerCase().includes(itemFilter.trim().toLowerCase())
+                    : true,
+                )
+                .slice(0, 60)
+                .map((item) => {
+                  const checked = selectedItemIds.includes(item.id);
+                  return (
+                    <label className="active-toggle" key={item.id}>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() =>
+                          setSelectedItemIds((current) =>
+                            checked
+                              ? current.filter((id) => id !== item.id)
+                              : [...current, item.id],
+                          )
+                        }
+                      />
+                      {item.name}
+                      <span>{item.storageAreaName ?? ""}</span>
+                    </label>
+                  );
+                })}
+              {selectedItemIds.length > 0 && manager && (
+                <div className="save-template-row">
+                  <input
+                    value={templateName}
+                    placeholder="Save this selection as… (e.g. Weekly bar)"
+                    maxLength={60}
+                    onChange={(event) => setTemplateName(event.target.value)}
+                  />
+                  <button
+                    className="text-button"
+                    type="button"
+                    disabled={templateSaving || !templateName.trim()}
+                    onClick={() => void saveSelectionAsTemplate()}
+                  >
+                    {templateSaving ? "Saving…" : "Save as template"}
+                  </button>
+                </div>
+              )}
+              <button
+                className="file-button"
+                type="button"
+                disabled={busy || selectedItemIds.length === 0}
+                onClick={() => void startFromSelectedItems()}
+              >
+                {busy ? "Starting…" : `Count ${selectedItemIds.length || ""} selected`}
               </button>
             </div>
           )}
